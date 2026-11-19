@@ -121,6 +121,20 @@ pub enum OverlayKind {
     },
 }
 
+impl OverlayKind {
+    /// Whether `other` carries the same network: the same kind, and for VXLAN the
+    /// same VNI (the remote ends may differ).
+    #[must_use]
+    pub fn same_network(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Vxlan { vni: a, .. }, Self::Vxlan { vni: b, .. }) => a == b,
+            (Self::EtherIp { .. }, Self::EtherIp { .. })
+            | (Self::Srv6L2 { .. }, Self::Srv6L2 { .. }) => true,
+            _ => false,
+        }
+    }
+}
+
 impl Overlay {
     /// The remote ends: where a frame of an unknown destination goes.
     #[must_use]
@@ -133,8 +147,8 @@ impl Overlay {
         }
     }
 
-    /// Whether it is a VXLAN interface: a frame flooded from one is not sent to
-    /// another (every VTEP sends its own frames to all the others).
+    /// Whether it is a VXLAN interface: a frame flooded from one is not sent back to
+    /// its VTEPs (every VTEP sends its own frames to all the others).
     #[must_use]
     pub fn is_vxlan(&self) -> bool {
         matches!(self.kind, OverlayKind::Vxlan { .. })

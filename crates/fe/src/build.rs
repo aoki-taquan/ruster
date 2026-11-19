@@ -921,6 +921,19 @@ pub(crate) fn build(
                     "{name} is more than one of an EtherIP, VXLAN and SRv6 L2 interface"
                 ));
             }
+            // A received packet finds its VXLAN interface by the local address and
+            // the VNI.
+            if let ruster_core::OverlayKind::Vxlan { vni, .. } = &kind {
+                let same = |o: &ruster_core::Overlay| {
+                    o.local == local
+                        && matches!(o.kind, ruster_core::OverlayKind::Vxlan { vni: v, .. } if v == *vni)
+                };
+                if overlays.iter().any(same) {
+                    return Err(format!(
+                        "VXLAN interface {name}: another has the same local address and VNI"
+                    ));
+                }
+            }
             let id = ids.take(name)?;
             interfaces.push(Interface {
                 id,
@@ -1026,6 +1039,24 @@ pub(crate) fn build(
     }
     for (at, member) in members {
         bridges[at].1.members.push(member);
+    }
+    // A bridge's VXLAN members share no remote VTEP: frames flooded from one go to
+    // the others, so a VTEP behind two would get them back (a loop between two
+    // routers joined that way).
+    for (name, bridge) in &bridges {
+        let mut vteps: BTreeSet<IpAddr> = BTreeSet::new();
+        for overlay in overlays
+            .iter()
+            .filter(|o| bridge.members.contains(&o.interface))
+        {
+            if let ruster_core::OverlayKind::Vxlan { remotes, .. } = &overlay.kind {
+                if let Some(vtep) = remotes.iter().find(|r| !vteps.insert(**r)) {
+                    return Err(format!(
+                        "bridge {name}: VTEP {vtep} is a remote of two of its VXLAN interfaces"
+                    ));
+                }
+            }
+        }
     }
     for (key, value) in store.table(sid::BRIDGE_MAC) {
         if let (Key::BridgeMac { bridge, mac }, Value::BridgeMac { interface }) = (key, value) {

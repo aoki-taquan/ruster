@@ -113,13 +113,24 @@ fn bad_vxlan_interfaces_are_refused() {
         let error = parse(&with(vxlan, bridge)).unwrap_err();
         assert!(error.contains(says), "{vxlan}: {error}");
     }
-    // Two in one bridge.
     let text = format!(
-        "{}\n[[interface]]\nname = \"vx1\"\nvxlan = {{ vni = 200, local = \"192.0.2.1\", remote = [\"198.51.100.2\"] }}\n\n[[interface]]\nname = \"br0\"\nbridge = {{ members = [\"p1\", \"vx0\", \"vx1\"] }}\n",
+        "{}\n[[interface]]\nname = \"vx1\"\nvxlan = {{ vni = 200, local = \"192.0.2.1\", remote = [\"198.51.100.3\"] }}\n\n[[interface]]\nname = \"br0\"\nbridge = {{ members = [\"p1\", \"vx0\", \"vx1\"] }}\n",
         with(good, MEMBERS).split("\n[[interface]]\nname = \"br0\"").next().unwrap()
     );
-    let error = parse(&text).unwrap_err();
-    assert!(error.contains("already has VXLAN"), "{error}");
+    // Two in one bridge (VNIs 100 and 200 joined): taken.
+    assert!(parse(&text).is_ok(), "{:?}", parse(&text).err());
+    // Two that share a remote VTEP are not: frames would loop between the routers.
+    let shared = text.replacen(
+        "vni = 200, local = \"192.0.2.1\", remote = [\"198.51.100.3\"]",
+        "vni = 200, local = \"192.0.2.1\", remote = [\"198.51.100.2\"]",
+        1,
+    );
+    let error = parse(&shared).unwrap_err();
+    assert!(error.contains("also one of"), "{error}");
+    // Two with the same local address and VNI are not.
+    let same = text.replacen("vni = 200", "vni = 100", 1);
+    let error = parse(&same).unwrap_err();
+    assert!(error.contains("same local and vni"), "{error}");
     // RFC 7348 section 5: the largest 24-bit VNI is taken.
     let top = r#"vxlan = { vni = 16777215, local = "192.0.2.1", remote = ["198.51.100.2"] }"#;
     assert!(parse(&with(top, MEMBERS)).is_ok());
