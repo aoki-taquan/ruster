@@ -80,7 +80,7 @@ ipv4 = []
 ipv4-from = []
 ipv6 = []
 ipv6-from = []
-kind = { vxlan = { vni = 100, local = "192.0.2.1", remote = ["198.51.100.2"], port = 4789 } }
+kind = { vxlan = { vni = 100, local = "192.0.2.1", remote = ["198.51.100.2"], port = 4789, underlay-vrf = "default" } }
 
 [[interface]]
 name = "sr0"

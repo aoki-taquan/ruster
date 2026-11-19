@@ -52,9 +52,10 @@
 //! - SRv6: a packet to an End.DX2 SID with segments left, or whose upper-layer
 //!   header is not 143, is dropped without an ICMPv6 error (RFC 8986 4.9 S01 to
 //!   S04 would send Parameter Problem); its source is not checked.
-//! - The outer packets are always routed in the default VRF, only out of a port or a
-//!   VLAN sub-interface (not a tunnel, PPPoE session or bridge), and only those
-//!   arriving on an interface of the default VRF are unwrapped.
+//! - The outer packets are routed in the default VRF (a VXLAN interface's in the VRF
+//!   it is given), only out of a port or a VLAN sub-interface (not a tunnel, PPPoE
+//!   session or bridge), and only those arriving on an interface of that VRF are
+//!   unwrapped.
 
 use std::net::IpAddr;
 
@@ -99,6 +100,10 @@ pub struct Overlay {
     /// The router's address the outer packets come from and go to.
     pub local: IpAddr,
     pub kind: OverlayKind,
+    /// The VRF the outer packets are routed in and arrive in (an index into the
+    /// snapshots of [`with_vrfs`](crate::ForwardingSnapshot::with_vrfs)); 0, the
+    /// default VRF's, but for VXLAN, which may take another.
+    pub vrf: u16,
 }
 
 /// What carries the frames. The remote ends are of the family of `local`.
@@ -281,10 +286,14 @@ pub(crate) fn receive<S: PacketSlot>(
         return Ok(received);
     }
     let bytes = packet.bytes_mut();
+    // Only in the VRF the overlay's outer packets are in.
+    let in_vrf = snapshot.vrf_of(ingress);
     let etherip = || {
-        overlays
-            .iter()
-            .any(|o| o.local == outer.destination && matches!(o.kind, OverlayKind::EtherIp { .. }))
+        overlays.iter().any(|o| {
+            o.local == outer.destination
+                && o.vrf == in_vrf
+                && matches!(o.kind, OverlayKind::EtherIp { .. })
+        })
     };
     let to_port = bytes
         .get(outer.payload + 2..outer.payload + 4)
@@ -292,6 +301,7 @@ pub(crate) fn receive<S: PacketSlot>(
     let vxlan_port = |port: u16| {
         overlays.iter().any(|o| {
             o.local == outer.destination
+                && o.vrf == in_vrf
                 && matches!(o.kind, OverlayKind::Vxlan { port: p, .. } if p == port)
         })
     };
@@ -304,11 +314,7 @@ pub(crate) fn receive<S: PacketSlot>(
     if outer.source.is_ipv4() {
         check_ipv4(bytes, outer.payload)?;
     }
-    // Only through the default VRF, as the outer packets are sent, and to the
-    // receiving interface itself.
-    if snapshot.for_ingress(ingress).authority() != snapshot.authority() {
-        return Err(DropReason::OverlayUnknownPeer);
-    }
+    // Only to the receiving interface itself (its VRF is the overlay's, above).
     let interface = snapshot
         .interface(ingress)
         .ok_or(DropReason::OverlayUnknownPeer)?;
@@ -329,6 +335,7 @@ pub(crate) fn receive<S: PacketSlot>(
             .iter()
             .find(|o| {
                 o.local == outer.destination
+                    && o.vrf == in_vrf
                     && matches!(&o.kind, OverlayKind::Vxlan { vni: v, remotes, port }
                         if *v == vni && Some(*port) == to_port && remotes.contains(&outer.source))
             })
@@ -344,6 +351,7 @@ pub(crate) fn receive<S: PacketSlot>(
             .iter()
             .find(|o| {
                 o.local == outer.destination
+                    && o.vrf == in_vrf
                     && matches!(o.kind, OverlayKind::EtherIp { remote } if remote == outer.source)
             })
             .ok_or(DropReason::OverlayUnknownPeer)?;
@@ -469,6 +477,7 @@ fn add_words(sum: u64, bytes: &[u8]) -> u64 {
 /// missing from the neighbor table is recorded in `trace`.
 pub(crate) fn header<T: TraceSink>(
     snapshot: &crate::ForwardingSnapshot<'_>,
+    underlay: &crate::ForwardingSnapshot<'_>,
     overlay: &Overlay,
     remote: IpAddr,
     inner: &[u8],
@@ -492,7 +501,8 @@ pub(crate) fn header<T: TraceSink>(
         OverlayKind::EtherIp { .. } => None,
         OverlayKind::Srv6L2 { .. } => None,
     };
-    let (egress, mac) = route(snapshot, remote, trace)?;
+    // Routed in the overlay's VRF.
+    let (egress, mac) = route(underlay, remote, trace)?;
     if irb(egress) || snapshot.wraps_frames(egress) || of(snapshot.overlays, egress).is_some() {
         return Err(DropReason::OverlayUnderlayUnsupported);
     }
@@ -741,7 +751,16 @@ pub(crate) fn transmit_member<S: PacketSlot, T: TraceSink>(
                 (OverlayKind::Vxlan { .. }, None) => return Err(DropReason::OverlayNoRoute),
                 (OverlayKind::Srv6L2 { segments, .. }, _) => segments[0],
             };
-            let outer = header(snapshot, overlay, remote, packet.bytes_mut(), irb, trace)?;
+            let underlay = snapshot.for_vrf(overlay.vrf);
+            let outer = header(
+                snapshot,
+                underlay,
+                overlay,
+                remote,
+                packet.bytes_mut(),
+                irb,
+                trace,
+            )?;
             let len = outer.len;
             if !packet.resize_front(-(len as isize)) {
                 return Err(DropReason::OverlayNoRoom);
@@ -846,6 +865,7 @@ mod tests {
             overlays: vec![Overlay {
                 interface: MEMBER,
                 local,
+                vrf: 0,
                 kind: OverlayKind::EtherIp { remote },
             }],
             ipv6: crate::Ipv6Fib::new(
@@ -882,6 +902,7 @@ mod tests {
         let frame = inner();
         let h = header(
             &s,
+            &s,
             &t.overlays[0],
             t.overlays[0].remotes()[0],
             &frame,
@@ -917,6 +938,7 @@ mod tests {
         let frame = inner();
         let h = header(
             &s,
+            &s,
             &t.overlays[0],
             t.overlays[0].remotes()[0],
             &frame,
@@ -946,6 +968,7 @@ mod tests {
         frame.resize(1478, 0);
         assert!(header(
             &s,
+            &s,
             &t.overlays[0],
             t.overlays[0].remotes()[0],
             &frame,
@@ -956,6 +979,7 @@ mod tests {
         frame.push(0);
         assert_eq!(
             header(
+                &s,
                 &s,
                 &t.overlays[0],
                 t.overlays[0].remotes()[0],
@@ -969,6 +993,7 @@ mod tests {
         // Nor out of a bridge's own interface.
         assert_eq!(
             header(
+                &s,
                 &s,
                 &t.overlays[0],
                 t.overlays[0].remotes()[0],
@@ -1121,6 +1146,7 @@ mod tests {
         let frame = udp_ipv4(&inner());
         let h = header(
             &s,
+            &s,
             &t.overlays[0],
             REMOTE4.into(),
             &frame,
@@ -1145,6 +1171,7 @@ mod tests {
         // The same flow, the same port; another flow, most likely another.
         let again = header(
             &s,
+            &s,
             &t.overlays[0],
             other.into(),
             &frame,
@@ -1156,6 +1183,7 @@ mod tests {
         let mut moved = frame.clone();
         moved[14 + 20 + 1] = 0x3a;
         let elsewhere = header(
+            &s,
             &s,
             &t.overlays[0],
             REMOTE4.into(),
@@ -1170,6 +1198,7 @@ mod tests {
         assert_eq!(
             header(
                 &s,
+                &s,
                 &t.overlays[0],
                 stranger,
                 &frame,
@@ -1183,6 +1212,7 @@ mod tests {
         tagged[12..14].copy_from_slice(&[0x81, 0x00]);
         assert_eq!(
             header(
+                &s,
                 &s,
                 &t.overlays[0],
                 REMOTE4.into(),
@@ -1203,6 +1233,7 @@ mod tests {
         let s = snapshot(&t);
         let frame = inner();
         let h = header(
+            &s,
             &s,
             &t.overlays[0],
             remote.into(),
@@ -1327,6 +1358,7 @@ mod tests {
         let frame = inner();
         let h = header(
             &s,
+            &s,
             &t.overlays[0],
             REMOTE4.into(),
             &frame,
@@ -1356,6 +1388,7 @@ mod tests {
             frame[14 + 20] = i;
             frame[14 + 19] = i.wrapping_mul(7);
             let h = header(
+                &s,
                 &s,
                 &t.overlays[0],
                 REMOTE4.into(),

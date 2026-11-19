@@ -195,11 +195,13 @@ struct PppoeEntry {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
 struct VxlanEntry {
     vni: u32,
     local: String,
     remote: Vec<String>,
     port: Option<u16>,
+    underlay_vrf: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -286,6 +288,7 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
                     local: vxlan.local,
                     remote: vxlan.remote,
                     port: vxlan.port.unwrap_or(crate::VXLAN_PORT),
+                    underlay_vrf: default_vrf(vxlan.underlay_vrf),
                 }
             }
             _ if entry.vxlan.is_some() => {

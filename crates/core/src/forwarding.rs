@@ -2007,8 +2007,36 @@ impl<'a> ForwardingSnapshot<'a> {
     ) -> Option<Result<crate::OverlayHeader, DropReason>> {
         let overlay = crate::overlay::of(self.overlays, member)?;
         Some(crate::overlay::header(
-            self, overlay, remote, frame, irb, trace,
+            self,
+            self.for_vrf(overlay.vrf),
+            overlay,
+            remote,
+            frame,
+            irb,
+            trace,
         ))
+    }
+
+    /// [`Self::overlay_header`], with the outer packet routed by `underlays[i]` for
+    /// an overlay in VRF `i` (the snapshots of every VRF, in their order), when this
+    /// snapshot was not given them with [`Self::with_vrfs`].
+    pub fn overlay_header_in<T: TraceSink>(
+        &self,
+        underlays: &[ForwardingSnapshot<'_>],
+        member: IfId,
+        remote: std::net::IpAddr,
+        frame: &[u8],
+        irb: impl Fn(IfId) -> bool,
+        trace: &mut T,
+    ) -> Option<Result<crate::OverlayHeader, DropReason>> {
+        let overlay = crate::overlay::of(self.overlays, member)?;
+        let underlay = underlays.get(usize::from(overlay.vrf));
+        Some(match underlay {
+            Some(underlay) => {
+                crate::overlay::header(self, underlay, overlay, remote, frame, irb, trace)
+            }
+            None => Err(DropReason::OverlayNoRoute),
+        })
     }
 
     /// Sends packets routed to a PPPoE session's interface in that session and

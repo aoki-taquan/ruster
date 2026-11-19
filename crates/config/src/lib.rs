@@ -75,7 +75,8 @@
 //! [[interface]]                # a VXLAN network (RFC 7348), only as a bridge member
 //! name = "vx100"
 //! vxlan = { vni = 100, local = "192.0.2.1", remote = ["198.51.100.2", "198.51.100.3"] }
-//!                              # port = 4789 by default
+//!                              # port = 4789 by default; underlay-vrf = "red" routes
+//!                              # the outer packets in VRF red (local is an address of it)
 //!                              # the remote VTEPs get every broadcast (UDP, 4789 unless port says)
 //! # mac is 02:00:00:00:00:fe and mtu 1450 (IPv4) or 1430 (IPv6) when left out
 //!
@@ -611,7 +612,7 @@ pub const VERSION: u32 = 1;
 ///
 /// A new key also goes into `tests/data/every-key.lock` (the test reads it with every
 /// key required, and checks that every list in it has an item).
-pub const LOCK_SHAPE: u64 = 0x5169_3d49_6ac1_5b98;
+pub const LOCK_SHAPE: u64 = 0x305a_11b9_5c30_e544;
 
 /// A bridge's ageing time, in seconds (IEEE 802.1Q 8.8.3, the recommended value).
 pub const BRIDGE_AGING_TIME: u32 = 300;
@@ -639,6 +640,10 @@ pub const VXLAN_PORT: u16 = 4789;
 
 fn vxlan_port() -> u16 {
     VXLAN_PORT
+}
+
+fn default_vrf() -> String {
+    ruster_proto::table::DEFAULT_VRF.to_owned()
 }
 
 /// What an SRv6 L2 interface's outer headers take from the MTU of the link below
@@ -954,6 +959,10 @@ pub enum Kind {
         remote: Vec<String>,
         #[serde(default = "vxlan_port")]
         port: u16,
+        /// The VRF the outer packets are routed in and arrive in. A lock written
+        /// before it was added has none: the default VRF.
+        #[serde(default = "default_vrf", rename = "underlay-vrf")]
+        underlay_vrf: String,
     },
     /// Frames over SRv6 (RFC 8986): wrapped toward `segments` (H.Encaps.L2, or
     /// H.Encaps.L2.Red with `reduced`) from `[srv6]`'s source, and brought in by

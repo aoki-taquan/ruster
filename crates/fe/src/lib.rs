@@ -2237,6 +2237,9 @@ struct Members<'f, 't, B> {
     vlans: &'f [VlanBinding],
     bridges: &'f ruster_core::Bridges,
     outer: ruster_core::ForwardingSnapshot<'f>,
+    /// Each VRF's snapshot, in their order: an overlay's outer packets are routed in
+    /// its VRF.
+    underlays: Vec<ruster_core::ForwardingSnapshot<'f>>,
     trace: &'t mut FeTrace,
 }
 
@@ -2257,19 +2260,23 @@ impl<'f, 't, B: GeneratedPacketIo> Members<'f, 't, B> {
             unreachable,
             ..
         } = &**tables;
-        let outer = vrfs[0]
-            .owner
-            .snapshot()
-            .with_ipv6(&vrfs[0].ipv6)
-            .with_tunnels(tunnels)
-            .with_pppoe(pppoe)
-            .with_overlays(overlays)
-            .with_unreachable_neighbors(unreachable);
+        let snapshot = |vrf: &'f build::Vrf| {
+            vrf.owner
+                .snapshot()
+                .with_ipv6(&vrf.ipv6)
+                .with_tunnels(tunnels)
+                .with_pppoe(pppoe)
+                .with_overlays(overlays)
+                .with_unreachable_neighbors(unreachable)
+        };
+        let outer = snapshot(&vrfs[0]);
+        let underlays = vrfs.iter().map(snapshot).collect();
         Self {
             io,
             vlans,
             bridges,
             outer,
+            underlays,
             trace,
         }
     }
@@ -2289,10 +2296,14 @@ impl<'f, 't, B: GeneratedPacketIo> Members<'f, 't, B> {
         let mut sent = false;
         for &remote in remotes {
             let irb = |id: IfId| bridges.irb_of(id).is_some();
-            match self
-                .outer
-                .overlay_header(member, remote, frame, irb, self.trace)
-            {
+            match self.outer.overlay_header_in(
+                &self.underlays,
+                member,
+                remote,
+                frame,
+                irb,
+                self.trace,
+            ) {
                 Some(Ok(header)) => {
                     sent |= send_parts(self.io, self.vlans, header.egress, header.bytes(), frame);
                 }
