@@ -191,6 +191,7 @@ struct VxlanEntry {
     vni: u32,
     local: String,
     remote: Vec<String>,
+    port: Option<u16>,
 }
 
 #[derive(Deserialize)]
@@ -276,6 +277,7 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
                     vni: vxlan.vni,
                     local: vxlan.local,
                     remote: vxlan.remote,
+                    port: vxlan.port.unwrap_or(crate::VXLAN_PORT),
                 }
             }
             _ if entry.vxlan.is_some() => {

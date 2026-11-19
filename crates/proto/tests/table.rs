@@ -1558,6 +1558,7 @@ fn vxlan_entries_round_trip_and_are_checked() {
                 vni,
                 local: ip(local),
                 remotes: remotes.iter().map(|r| ip(r)).collect(),
+                port: ruster_proto::table::VXLAN_PORT,
             },
         )
     };

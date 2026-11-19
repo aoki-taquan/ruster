@@ -263,8 +263,19 @@ pub fn config(lock: Lock) -> Result<Config, String> {
             Kind::EtherIp { local, remote } => {
                 etherip.push((entry.name.clone(), local.clone(), remote.clone()));
             }
-            Kind::Vxlan { vni, local, remote } => {
-                vxlan.push((entry.name.clone(), *vni, local.clone(), remote.clone()));
+            Kind::Vxlan {
+                vni,
+                local,
+                remote,
+                port,
+            } => {
+                vxlan.push((
+                    entry.name.clone(),
+                    *vni,
+                    local.clone(),
+                    remote.clone(),
+                    *port,
+                ));
             }
             Kind::Srv6L2 {
                 sid,

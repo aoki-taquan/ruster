@@ -77,11 +77,12 @@ pings() { nsx "$1" ping -c 1 -W 1 "$2" >/dev/null 2>&1; }
 counter() { { grep -o "$1: [0-9]*" "$work/ruster-fe.log" || true; } | tail -1 | awk '{print $2}'; }
 
 for outer in 4 6; do
-  if [[ $outer == 4 ]]; then l=10.0.0.1 r=10.0.0.2 mtu=1450; else l=2001:db8::1 r=2001:db8::2 mtu=1430; fi
+  # IPv6 also on another UDP port than IANA's 4789.
+  if [[ $outer == 4 ]]; then l=10.0.0.1 r=10.0.0.2 mtu=1450 port=4789; else l=2001:db8::1 r=2001:db8::2 mtu=1430 port=8472; fi
   nsx "$linux" ip link del vxl 2>/dev/null || true
   # Linux checks the UDP checksum over IPv6 (ruster computes it) and sends none
   # over IPv4 (ruster takes 0).
-  nsx "$linux" ip link add vxl type vxlan id 100 local "$r" remote "$l" dstport 4789 dev wan
+  nsx "$linux" ip link add vxl type vxlan id 100 local "$r" remote "$l" dstport "$port" dev wan
   nsx "$linux" ip link set vxl master brl
   nsx "$linux" ip link set vxl up
   cat > "$work/router.toml" <<TOML
@@ -97,7 +98,7 @@ ipv6 = ["2001:db8::1/64"]
 
 [[interface]]
 name = "vx0"
-vxlan = { vni = 100, local = "$l", remote = ["$r"] }
+vxlan = { vni = 100, local = "$l", remote = ["$r"], port = $port }
 
 [[interface]]
 name = "br0"
@@ -116,7 +117,7 @@ TOML
   out=$(nsx "$a" ping -c 3 -i 0.2 -W 1 192.0.2.20) || fail "a to b in IPv$outer: $out"
   grep -q "ttl=64" <<<"$out" || fail "a to b was not bridged (TTL changed): $out"
   nsx "$b" ping -c 2 -i 0.2 -W 1 192.0.2.10 >/dev/null || fail "b to a in IPv$outer"
-  echo "ok: a and b reach each other at L2 over VXLAN in IPv$outer"
+  echo "ok: a and b reach each other at L2 over VXLAN in IPv$outer (UDP port $port)"
 
   # The largest frame that fits: the VXLAN interface's MTU is the inner IP
   # packet, 28 of which are IPv4 and ICMP.

@@ -30,6 +30,7 @@ pub struct Vxlan {
     pub vni: u32,
     pub local: IpAddr,
     pub remotes: Vec<IpAddr>,
+    pub port: u16,
 }
 
 /// The most remote VTEPs of one interface.
@@ -38,13 +39,16 @@ const REMOTES_MAX: usize = 64;
 /// Checks the VXLAN interfaces (name, VNI, local, remotes) against the interfaces
 /// and the bridges.
 pub(crate) fn check(
-    entries: Vec<(String, u32, String, Vec<String>)>,
+    entries: Vec<(String, u32, String, Vec<String>, u16)>,
     interfaces: &[InterfaceConfig],
     bridges: &[crate::bridge::Bridge],
 ) -> Result<Vec<Vxlan>, String> {
     let mut out: Vec<Vxlan> = Vec::with_capacity(entries.len());
-    for (name, vni, local, remote) in entries {
+    for (name, vni, local, remote, port) in entries {
         let at = format!("interface {name:?}");
+        if port == 0 {
+            return Err(format!("{at}: vxlan port must be 1 to 65535"));
+        }
         if !(1..=VXLAN_VNI_MAX).contains(&vni) {
             return Err(format!("{at}: vni must be 1 to {VXLAN_VNI_MAX}"));
         }
@@ -111,7 +115,8 @@ pub(crate) fn check(
                 LINK_MTU - overhead
             ));
         }
-        // A received packet finds its interface by the local address and the VNI.
+        // A received packet finds its interface by the local address and the VNI
+        // (on any port: one VNI is one network).
         if out.iter().any(|v| v.local == local && v.vni == vni) {
             return Err(format!(
                 "{at}: another VXLAN interface has the same local and vni"
@@ -122,6 +127,7 @@ pub(crate) fn check(
             vni,
             local,
             remotes,
+            port,
         });
     }
     Ok(out)
@@ -138,6 +144,7 @@ pub(crate) fn tables(vxlan: &[Vxlan], out: &mut BTreeMap<Key, Value>) {
                 vni: interface.vni,
                 local: interface.local,
                 remotes: interface.remotes.clone(),
+                port: interface.port,
             },
         );
     }

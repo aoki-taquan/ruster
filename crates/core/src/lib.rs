@@ -166,7 +166,7 @@ pub use observability::{
     BackendMode, BackendStats, FieldValue, FieldVisitor, ObservableFields, TableOccupancy,
 };
 pub(crate) use observability::{HighWaterMark, OccupancyCounter};
-pub use overlay::{Overlay, OverlayHeader, OverlayKind};
+pub use overlay::{Overlay, OverlayHeader, OverlayKind, VXLAN_PORT};
 pub use packet::{
     validate_arp, validate_arp_request, validate_ipv4_frame, ArpOpcode, MacAddress, ValidatedArp,
     ValidatedArpRequest, ValidatedIpv4, ARP_ETHERTYPE, ETHERNET_HEADER_LEN, IPV4_ETHERTYPE,

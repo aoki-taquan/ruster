@@ -248,6 +248,9 @@ pub enum Value {
         vni: u32,
         local: IpAddr,
         remotes: Vec<IpAddr>,
+        /// The UDP port, sent to and received on (RFC 7348 section 5: 4789 by
+        /// default, [`VXLAN_PORT`]).
+        port: u16,
     },
     /// Frames leave wrapped from `source` toward `segments` (the first first;
     /// H.Encaps.L2, or H.Encaps.L2.Red with `reduced`), and packets to the
@@ -262,6 +265,9 @@ pub enum Value {
 
 /// The range of a bridge's ageing time, in seconds (IEEE 802.1Q 8.8.3).
 pub const BRIDGE_AGING_RANGE: std::ops::RangeInclusive<u32> = 10..=1_000_000;
+
+/// VXLAN's UDP port (IANA, RFC 7348 section 5).
+pub const VXLAN_PORT: u16 = 4789;
 
 /// The largest VXLAN network identifier (24 bits).
 pub const VXLAN_VNI_MAX: u32 = 0x00ff_ffff;
@@ -1044,7 +1050,11 @@ impl Change {
                         vni,
                         local,
                         remotes,
+                        port,
                     } => {
+                        if *port == 0 {
+                            return Err(ModelError::Invalid("port"));
+                        }
                         if !(1..=VXLAN_VNI_MAX).contains(vni) {
                             return Err(ModelError::Invalid("VNI"));
                         }
@@ -1665,8 +1675,11 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
             vni,
             local,
             remotes,
+            port,
         } => {
-            e.map(3)
+            e.map(4)
+                .u64(sid::VXLAN_PORT - sid::VXLAN)
+                .u64(u64::from(*port))
                 .u64(sid::VXLAN_VNI - sid::VXLAN)
                 .u64(u64::from(*vni))
                 .u64(sid::VXLAN_LOCAL - sid::VXLAN)
@@ -2376,11 +2389,17 @@ pub fn entry_line(key: &Key, value: &Value) -> Option<String> {
                 vni,
                 local,
                 remotes,
+                port,
             },
         ) => {
             let remotes: Vec<String> = remotes.iter().map(ToString::to_string).collect();
+            let port = if *port == VXLAN_PORT {
+                String::new()
+            } else {
+                format!(" port {port}")
+            };
             format!(
-                "vxlan {interface} vni {vni} {local} to {}",
+                "vxlan {interface} vni {vni}{port} {local} to {}",
                 remotes.join(" ")
             )
         }
@@ -2560,10 +2579,20 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
             Some(_) => return Err(ModelError::Invalid("remote")),
             None => return Err(ModelError::Missing("remote")),
         };
+        // Written by every ruster that has it; one from before gave none.
+        let port = match got.remove(&sid::VXLAN_PORT) {
+            Some(Member::Uint(n)) => u16::try_from(n)
+                .ok()
+                .filter(|p| *p != 0)
+                .ok_or(ModelError::Invalid("port"))?,
+            Some(_) => return Err(ModelError::Invalid("port")),
+            None => VXLAN_PORT,
+        };
         Value::Vxlan {
             vni,
             local,
             remotes,
+            port,
         }
     } else if matches!(
         table,

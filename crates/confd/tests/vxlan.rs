@@ -53,8 +53,28 @@ fn a_vxlan_member_becomes_its_row() {
                 "198.51.100.2".parse().unwrap(),
                 "198.51.100.3".parse().unwrap()
             ],
+            port: 4789,
         })
     );
+    // Another UDP port.
+    let config = parse(&with(
+        r#"vxlan = { vni = 100, local = "192.0.2.1", remote = ["198.51.100.2"], port = 8472 }"#,
+        MEMBERS,
+    ))
+    .unwrap();
+    let [[_, tables], _] = confd.tables_now_and_with(&config);
+    assert!(matches!(
+        tables.get(&Key::Vxlan {
+            interface: "vx0".into()
+        }),
+        Some(Value::Vxlan { port: 8472, .. })
+    ));
+    let error = parse(&with(
+        r#"vxlan = { vni = 100, local = "192.0.2.1", remote = ["198.51.100.2"], port = 0 }"#,
+        MEMBERS,
+    ))
+    .unwrap_err();
+    assert!(error.contains("port must be 1 to 65535"), "{error}");
     let text = with(
         r#"vxlan = { vni = 100, local = "2001:db8::1", remote = ["2001:db8:1::2"] }"#,
         MEMBERS,
