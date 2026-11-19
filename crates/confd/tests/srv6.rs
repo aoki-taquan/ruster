@@ -252,6 +252,7 @@ fn flavors_of_end_and_end_x_become_routes_for_ribd() {
                 psp: true,
                 usp: false,
                 usd: true,
+                next_csid: None,
             }
         })))
     );
@@ -327,4 +328,37 @@ fn an_srv6_l2_interface_becomes_the_fe_s_row() {
     }
     let error = parse(&format!("{INTERFACES}{L2}")).expect_err("no [srv6]");
     assert!(error.contains("needs [srv6]"), "{error}");
+}
+
+#[test]
+fn a_next_csid_sid_is_a_route_of_its_block_and_csid() {
+    use ruster_proto::table::{Srv6Csid, Srv6Flavors};
+    let text = GOOD.replacen(
+        "sid = \"fc00:1::1\"\nbehavior = \"End\"\n",
+        "sid = \"fc00:1::\"\nbehavior = \"End\"\nflavors = [\"NEXT-CSID\"]\ncsid-structure = [32, 16]\n",
+        1,
+    );
+    let config = parse(&format!("{INTERFACES}{text}")).unwrap();
+    let mut confd = Confd::new(Config::default());
+    let [_, [_, routes]] = confd.tables_now_and_with(&config);
+    assert_eq!(
+        routes.get(&route("default", "fc00:1::", 48)),
+        Some(&Value::Route(RouteAction::Srv6Local(Srv6Local::End {
+            flavors: Srv6Flavors {
+                next_csid: Some(Srv6Csid {
+                    block: 32,
+                    csid: 16
+                }),
+                ..Srv6Flavors::default()
+            }
+        })))
+    );
+    for (from, to, says) in [
+        ("csid-structure = [32, 16]\n", "", "needs csid-structure"),
+        ("flavors = [\"NEXT-CSID\"]\n", "", "only for NEXT-CSID"),
+        ("sid = \"fc00:1::\"", "sid = \"fc00:1::5\"", "bits are set"),
+    ] {
+        let error = parse(&format!("{INTERFACES}{}", text.replacen(from, to, 1))).unwrap_err();
+        assert!(error.contains(says), "{says}: {error}");
+    }
 }

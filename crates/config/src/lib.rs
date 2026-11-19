@@ -304,7 +304,9 @@
 //!                              # packet goes on in
 //! # interface = "wan" and next-hop = "fe80::2" for End.X (default VRF) and End.DX6
 //! # (any interface); next-hop an IPv4 address for End.DX4
-//! # flavors = ["PSP", "USD"] for End and End.X: any of PSP, USP and USD
+//! # flavors = ["PSP", "USD"] for End and End.X: any of PSP, USP, USD and NEXT-CSID
+//! # (RFC 9800; then csid-structure = [32, 16], the locator block and CSID lengths,
+//! # and the SID is the block and one CSID)
 //!
 //! [[srv6.policy]]              # an SR policy (H.Encaps)
 //! prefix = "10.2.0.0/16"       # the route it makes, in its VRF
@@ -612,7 +614,7 @@ pub const VERSION: u32 = 1;
 ///
 /// A new key also goes into `tests/data/every-key.lock` (the test reads it with every
 /// key required, and checks that every list in it has an item).
-pub const LOCK_SHAPE: u64 = 0x305a_11b9_5c30_e544;
+pub const LOCK_SHAPE: u64 = 0x8978_665c_4045_3114;
 
 /// A bridge's ageing time, in seconds (IEEE 802.1Q 8.8.3, the recommended value).
 pub const BRIDGE_AGING_TIME: u32 = 300;

@@ -1670,6 +1670,10 @@ fn srv6_flavors(flavors: table::Srv6Flavors) -> ruster_core::Srv6Flavors {
         psp: flavors.psp,
         usp: flavors.usp,
         usd: flavors.usd,
+        next_csid: flavors.next_csid.map(|c| ruster_core::Srv6Csid {
+            block: c.block,
+            csid: c.csid,
+        }),
     }
 }
 

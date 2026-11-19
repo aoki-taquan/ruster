@@ -628,3 +628,59 @@ fn usd_unwraps_the_inner_packet_with_no_segment_left() {
     assert_eq!(&out[0].1[0..6], &GATEWAY_MAC);
     assert_eq!(&out[0].1[14 + 24..14 + 40], &v6("2001:db8:99::1").octets());
 }
+
+#[test]
+fn an_end_with_next_csid_shifts_the_next_csid_in() {
+    use ruster_proto::table::{Srv6Csid, Srv6Flavors};
+    let mut fe = bench();
+    // The router's uSID fc00:0:1::/48 (32-bit block fc00:0, 16-bit CSIDs).
+    let csid = Srv6Flavors {
+        next_csid: Some(Srv6Csid {
+            block: 32,
+            csid: 16,
+        }),
+        ..Srv6Flavors::default()
+    };
+    let changes = [route(
+        "default",
+        v6("fc00:0:1::").into(),
+        48,
+        RouteAction::Srv6Local(Srv6Local::End { flavors: csid }),
+    )];
+    let (a, b) = UnixStream::pair().unwrap();
+    fe.attach(a, writers::ROUTE).unwrap();
+    let mut client = Client::new(b).unwrap();
+    let token = client.patch(&changes).unwrap();
+    assert_eq!(settle(&mut fe, &mut client, token), Code::CHANGED);
+
+    // To fc00:0:1:2:3:: with no SRH: on to fc00:0:2:3:: (routed out of wan).
+    let inner = ipv6("2001:db8:ff::9", "2001:db8:99::1");
+    let mut frame = WAN_MAC.to_vec();
+    frame.extend_from_slice(&GATEWAY_MAC);
+    frame.extend_from_slice(&[0x86, 0xdd, 0x60, 0, 0, 0]);
+    frame.extend_from_slice(&u16::try_from(inner.len()).unwrap().to_be_bytes());
+    frame.extend_from_slice(&[41, 64]);
+    frame.extend_from_slice(&v6("2001:db8:ff::9").octets());
+    frame.extend_from_slice(&v6("fc00:0:1:2:3::").octets());
+    frame.extend_from_slice(&inner);
+    let out = send(&mut fe, WAN, frame);
+    assert_eq!(out.len(), 1);
+    let (port, sent) = &out[0];
+    assert_eq!(*port, WAN);
+    assert_eq!(&sent[14 + 24..14 + 40], &v6("fc00:0:2:3::").octets());
+    assert_eq!(sent[14 + 7], 63);
+
+    // The last CSID (no argument) and no SRH: the upper layer is not taken.
+    let mut last = WAN_MAC.to_vec();
+    last.extend_from_slice(&GATEWAY_MAC);
+    last.extend_from_slice(&[0x86, 0xdd, 0x60, 0, 0, 0]);
+    last.extend_from_slice(&u16::try_from(inner.len()).unwrap().to_be_bytes());
+    last.extend_from_slice(&[41, 64]);
+    last.extend_from_slice(&v6("2001:db8:ff::9").octets());
+    last.extend_from_slice(&v6("fc00:0:1::").octets());
+    last.extend_from_slice(&inner);
+    let out = send(&mut fe, WAN, last);
+    assert_eq!(out.len(), 1);
+    // ICMPv6 Parameter Problem, code 4.
+    assert_eq!(&out[0].1[14 + 40..14 + 42], &[4, 4]);
+}

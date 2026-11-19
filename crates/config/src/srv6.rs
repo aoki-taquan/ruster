@@ -31,10 +31,14 @@ pub struct Srv6Sid {
     /// None or one: their next hop.
     pub next_hop: Vec<String>,
     /// The flavors of End and End.X: `PSP`, `USP` and `USD` (RFC 8986 section
-    /// 4.16), each at most once. A lock written before they were added has none,
-    /// and reads as none.
+    /// 4.16) and `NEXT-CSID` (RFC 9800), each at most once. A lock written before
+    /// they were added has none, and reads as none.
     #[serde(default)]
     pub flavors: Vec<String>,
+    /// With `NEXT-CSID`: the locator block length and the CSID length, in bits
+    /// (none otherwise). A lock written before it was added has none.
+    #[serde(default)]
+    pub csid_structure: Vec<u8>,
 }
 
 /// One SR policy: packets to `prefix` in `vrf` leave wrapped toward `segments`.
@@ -71,6 +75,8 @@ struct SidEntry {
     next_hop: Option<String>,
     #[serde(default)]
     flavors: Vec<String>,
+    #[serde(default)]
+    csid_structure: Vec<u8>,
 }
 
 #[derive(Deserialize)]
@@ -96,6 +102,7 @@ pub(crate) fn resolve(entry: Srv6Entry) -> Srv6 {
                 interface: s.interface.into_iter().collect(),
                 next_hop: s.next_hop.into_iter().collect(),
                 flavors: s.flavors,
+                csid_structure: s.csid_structure,
             })
             .collect(),
         policy: entry

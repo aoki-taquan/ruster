@@ -50,6 +50,13 @@
 //!   accepted: it would pop the header before the upper-layer header is
 //!   processed, but no upper-layer header is processed (below), so it changes
 //!   nothing.
+//! - RFC 9800 section 4.1 (NEXT-CSID flavor of End and End.X): a SID of a locator
+//!   block and one CSID; when the destination has a non-zero argument (the bits
+//!   after them), the Hop Limit is checked as for End, the argument is shifted to
+//!   follow the block and the rest zeroed, and the packet goes on (End: routed,
+//!   or handled again when the new destination is the router's; End.X: to its next
+//!   hop) without reading the Segment Routing Header. With no argument the
+//!   behaviour reads the Segment Routing Header as without the flavor.
 //! - RFC 8986 section 4.1.1 and RFC 8754 section 4.3.1.2: any other upper-layer
 //!   header, or No Next Header, gets Parameter Problem code 4 (SR Upper-layer
 //!   Header Error) pointing at it. No upper-layer header is allowed by
@@ -174,6 +181,36 @@ pub struct Srv6Flavors {
     /// Ultimate Segment Decapsulation: with no segment left, an inner IPv4 or IPv6
     /// packet is unwrapped (End: routed in the default VRF; End.X: to its next hop).
     pub usd: bool,
+    /// NEXT-CSID (RFC 9800 section 4.1): the destination holds compressed SIDs
+    /// after the locator block; the next one is shifted in before the Segment
+    /// Routing Header is read.
+    pub next_csid: Option<Srv6Csid>,
+}
+
+/// The structure of a compressed SID (RFC 9800 section 4.1): the locator block
+/// length and the CSID (locator node and function) length, in bits.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Srv6Csid {
+    pub block: u8,
+    pub csid: u8,
+}
+
+impl Srv6Csid {
+    /// RFC 9800 4.1 S01 to S07 on the destination `da`: with a non-zero argument
+    /// (the bits after the block and this CSID), the next CSID shifted to follow
+    /// the block, the rest zero. `None` with no argument left.
+    fn next(self, da: [u8; 16]) -> Option<[u8; 16]> {
+        let block = u32::from(self.block);
+        let taken = block + u32::from(self.csid);
+        let v = u128::from_be_bytes(da);
+        let argument = v.checked_shl(taken).unwrap_or(0);
+        if argument == 0 {
+            return None;
+        }
+        let block_mask = u128::MAX.checked_shl(128 - block).unwrap_or(0);
+        let shifted = argument.checked_shr(block).unwrap_or(0);
+        Some(((v & block_mask) | shifted).to_be_bytes())
+    }
 }
 
 impl Srv6Behaviour {
@@ -211,6 +248,9 @@ pub enum Srv6Error {
     SegmentCount,
     /// Two policies for the same interface.
     DuplicatePolicy,
+    /// A NEXT-CSID SID whose length is not its block's and CSID's, or a CSID of no
+    /// bits.
+    CsidLength,
 }
 
 impl Srv6Sid {
@@ -220,6 +260,14 @@ impl Srv6Sid {
         }
         if masked(prefix, len) != prefix {
             return Err(Srv6Error::HostBitsSet);
+        }
+        if let Srv6Behaviour::End { flavors } | Srv6Behaviour::EndX { flavors, .. } = behaviour {
+            if let Some(csid) = flavors.next_csid {
+                if csid.csid == 0 || u16::from(csid.block) + u16::from(csid.csid) != u16::from(len)
+                {
+                    return Err(Srv6Error::CsidLength);
+                }
+            }
         }
         Ok(Self {
             prefix,
@@ -385,6 +433,44 @@ pub(crate) fn receive<S: PacketSlot>(
     let mut end = end;
     for segment in 0..MAX_LOCAL_SEGMENTS {
         let bytes = &mut packet.bytes_mut()[..end];
+        // NEXT-CSID (RFC 9800 4.1): the next compressed SID in the destination
+        // comes first; the Segment Routing Header only when none is left.
+        if let Srv6Behaviour::End { flavors } | Srv6Behaviour::EndX { flavors, .. } = sid.behaviour
+        {
+            if let Some(next) = flavors
+                .next_csid
+                .and_then(|csid| csid.next(address(bytes, ip + 24)))
+            {
+                // S02 to S04, counted as for End.
+                if bytes[ip + 7] <= 1 + u8::from(segment > 0) {
+                    return Err(Rejected::Error(
+                        DropReason::Ipv6HopLimitExpired,
+                        TIME_EXCEEDED,
+                        0,
+                        0,
+                    ));
+                }
+                bytes[ip + 24..ip + 40].copy_from_slice(&next);
+                if segment > 0 {
+                    bytes[ip + 7] -= 1;
+                }
+                if let Srv6Behaviour::EndX {
+                    egress, next_hop, ..
+                } = sid.behaviour
+                {
+                    return Ok(Received::Forward {
+                        via: Some((egress, next_hop)),
+                    });
+                }
+                match lookup(next) {
+                    Some(following) => {
+                        sid = following;
+                        continue;
+                    }
+                    None => return Ok(Received::Forward { via: None }),
+                }
+            }
+        }
         let chain = walk(bytes)?;
         match (sid.behaviour, chain) {
             (
@@ -892,4 +978,47 @@ pub(crate) fn wrap(
     );
     out.extend_from_slice(&frame[ETHERNET..ETHERNET + inner_len]);
     Ok((egress, out))
+}
+
+#[cfg(test)]
+mod csid_tests {
+    use super::Srv6Csid;
+
+    fn v6(text: &str) -> [u8; 16] {
+        text.parse::<std::net::Ipv6Addr>().unwrap().octets()
+    }
+
+    /// RFC 9800 section 4.1 with a 32-bit block and 16-bit CSIDs (the "uSID"
+    /// example of its section 4.1.1): fc00:0 is the block.
+    #[test]
+    fn the_next_csid_is_shifted_in_after_the_block() {
+        let csid = Srv6Csid {
+            block: 32,
+            csid: 16,
+        };
+        assert_eq!(csid.next(v6("fc00:0:1:2:3::")), Some(v6("fc00:0:2:3::")));
+        assert_eq!(csid.next(v6("fc00:0:2:3::")), Some(v6("fc00:0:3::")));
+        // The last CSID: no argument, the SRH is read.
+        assert_eq!(csid.next(v6("fc00:0:3::")), None);
+        // Every bit of the argument moves, to the last.
+        assert_eq!(
+            csid.next(v6("fc00:0:1:2:3:4:5:6")),
+            Some(v6("fc00:0:2:3:4:5:6:0"))
+        );
+        // Other structures: a 48-bit block and 16-bit CSIDs; a 16-bit block and
+        // 32-bit CSIDs.
+        let csid = Srv6Csid {
+            block: 48,
+            csid: 16,
+        };
+        assert_eq!(
+            csid.next(v6("2001:db8:0:a:b::")),
+            Some(v6("2001:db8:0:b::"))
+        );
+        let csid = Srv6Csid {
+            block: 16,
+            csid: 32,
+        };
+        assert_eq!(csid.next(v6("fc00:1:1:2:2::")), Some(v6("fc00:2:2::")));
+    }
 }

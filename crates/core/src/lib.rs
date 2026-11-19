@@ -181,7 +181,7 @@ pub use route::{
 };
 pub use route_tree::{Ipv4RouteTree, Ipv6RouteTree, RouteTree};
 pub use source_validation::{SourceValidation, SourceValidationBinding};
-pub use srv6::{Srv6Behaviour, Srv6Error, Srv6Flavors, Srv6Policy, Srv6Sid, Srv6Table};
+pub use srv6::{Srv6Behaviour, Srv6Csid, Srv6Error, Srv6Flavors, Srv6Policy, Srv6Sid, Srv6Table};
 pub use time::MonotonicMillis;
 pub use tunnel::Ipv4InIpv6Tunnel;
 pub use vlan::VlanBinding;

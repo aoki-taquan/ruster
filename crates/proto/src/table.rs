@@ -600,16 +600,32 @@ pub struct Srv6Flavors {
     pub usp: bool,
     /// Ultimate Segment Decapsulation.
     pub usd: bool,
+    /// NEXT-CSID (RFC 9800 section 4.1), with the structure of its compressed SIDs.
+    pub next_csid: Option<Srv6Csid>,
+}
+
+/// The structure of a compressed SID (RFC 9800): the locator block length and the
+/// CSID (locator node and function) length, in bits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Srv6Csid {
+    pub block: u8,
+    pub csid: u8,
 }
 
 impl Srv6Flavors {
-    /// As RFC 8986 section 10.2 names them after the behaviour: "" for none,
-    /// " with PSP", " with PSP & USD", " with PSP, USP & USD".
+    /// As RFC 8986 section 10.2 and RFC 9800 section 9 name them after the
+    /// behaviour: "" for none, " with PSP", " with PSP & USD", " with NEXT-CSID,
+    /// PSP, USP & USD".
     fn suffix(self) -> String {
-        let names: Vec<&str> = [(self.psp, "PSP"), (self.usp, "USP"), (self.usd, "USD")]
-            .into_iter()
-            .filter_map(|(on, name)| on.then_some(name))
-            .collect();
+        let names: Vec<&str> = [
+            (self.next_csid.is_some(), "NEXT-CSID"),
+            (self.psp, "PSP"),
+            (self.usp, "USP"),
+            (self.usd, "USD"),
+        ]
+        .into_iter()
+        .filter_map(|(on, name)| on.then_some(name))
+        .collect();
         match names.as_slice() {
             [] => String::new(),
             [one] => format!(" with {one}"),
@@ -626,6 +642,14 @@ impl Srv6Flavors {
         let (first, last) = list.rsplit_once(" & ").unwrap_or(("", list));
         let names = first.split(", ").filter(|n| !n.is_empty()).chain([last]);
         for name in names {
+            if name == "NEXT-CSID" {
+                if flavors.next_csid.is_some() {
+                    return None;
+                }
+                // Its structure comes in members of its own.
+                flavors.next_csid = Some(Srv6Csid::default());
+                continue;
+            }
             let on = match name {
                 "PSP" => &mut flavors.psp,
                 "USP" => &mut flavors.usp,
@@ -921,11 +945,23 @@ impl Change {
                     }
                     Value::Route(RouteAction::LookupVrf(vrf)) => name(vrf)?,
                     Value::Route(RouteAction::Srv6Local(local)) => {
-                        let Key::Route { vrf, prefix, .. } = &self.key else {
+                        let Key::Route { vrf, prefix, len } = &self.key else {
                             unreachable!("checked above");
                         };
                         if !prefix.is_ipv6() || vrf != DEFAULT_VRF {
                             return Err(ModelError::Invalid("SRv6 SID (IPv6, default VRF)"));
+                        }
+                        // A NEXT-CSID SID is its block and its CSID (RFC 9800 4.1).
+                        if let Srv6Local::End { flavors } | Srv6Local::EndX { flavors, .. } = local
+                        {
+                            if let Some(csid) = flavors.next_csid {
+                                if csid.csid == 0
+                                    || u16::from(csid.block) + u16::from(csid.csid)
+                                        != u16::from(*len)
+                                {
+                                    return Err(ModelError::Invalid("NEXT-CSID lengths"));
+                                }
+                            }
                         }
                         match local {
                             Srv6Local::End { .. } => {}
@@ -1445,10 +1481,13 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
         }
         Value::Route(action) => {
             e.map(match action {
-                RouteAction::Srv6Local(Srv6Local::End { .. }) => 1,
-                RouteAction::Srv6Local(
-                    Srv6Local::EndX { .. } | Srv6Local::EndDx6 { .. } | Srv6Local::EndDx4 { .. },
-                ) => 3,
+                RouteAction::Srv6Local(Srv6Local::End { flavors }) => {
+                    1 + 2 * u64::from(flavors.next_csid.is_some())
+                }
+                RouteAction::Srv6Local(Srv6Local::EndX { flavors, .. }) => {
+                    3 + 2 * u64::from(flavors.next_csid.is_some())
+                }
+                RouteAction::Srv6Local(Srv6Local::EndDx6 { .. } | Srv6Local::EndDx4 { .. }) => 3,
                 RouteAction::Srv6Local(_) => 2,
                 RouteAction::Srv6Encap(_) => 3,
                 _ => 1,
@@ -1861,6 +1900,8 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
             | sid::ROUTE_SRV6_SOURCE
             | sid::ROUTE_SRV6_SEGMENTS
             | sid::ROUTE_SRV6_REDUCED
+            | sid::ROUTE_SRV6_CSID_BLOCK
+            | sid::ROUTE_SRV6_CSID_LENGTH
                 if table == sid::ROUTE =>
             {
                 srv6.decode(member, d)?;
@@ -1950,6 +1991,14 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
 fn encode_srv6_local(e: &mut Encoder, local: &Srv6Local) {
     let d = |member: u64| member - sid::ROUTE;
     e.u64(d(sid::ROUTE_SRV6_BEHAVIOUR)).text(&local.name());
+    if let Srv6Local::End { flavors } | Srv6Local::EndX { flavors, .. } = local {
+        if let Some(csid) = flavors.next_csid {
+            e.u64(d(sid::ROUTE_SRV6_CSID_BLOCK))
+                .u64(u64::from(csid.block))
+                .u64(d(sid::ROUTE_SRV6_CSID_LENGTH))
+                .u64(u64::from(csid.csid));
+        }
+    }
     match local {
         Srv6Local::End { .. } => {}
         Srv6Local::EndX {
@@ -2003,6 +2052,8 @@ struct Srv6Members {
     source: Option<std::net::Ipv6Addr>,
     segments: Option<Vec<std::net::Ipv6Addr>>,
     reduced: Option<bool>,
+    csid_block: Option<u8>,
+    csid_length: Option<u8>,
 }
 
 impl Srv6Members {
@@ -2014,6 +2065,17 @@ impl Srv6Members {
             sid::ROUTE_SRV6_NEXT_HOP => put(&mut self.next_hop, parse_ip(d.text()?)?),
             sid::ROUTE_SRV6_SOURCE => put(&mut self.source, parse_ipv6(d.text()?)?),
             sid::ROUTE_SRV6_REDUCED => put(&mut self.reduced, d.bool()?),
+            sid::ROUTE_SRV6_CSID_BLOCK | sid::ROUTE_SRV6_CSID_LENGTH => {
+                let bits = u8::try_from(d.u64()?)
+                    .ok()
+                    .filter(|b| *b <= 128)
+                    .ok_or(ModelError::Invalid("CSID length"))?;
+                if member == sid::ROUTE_SRV6_CSID_BLOCK {
+                    put(&mut self.csid_block, bits)
+                } else {
+                    put(&mut self.csid_length, bits)
+                }
+            }
             _ => {
                 let count = d.array()?;
                 if count == 0 || count > SRV6_SEGMENTS_MAX as u64 {
@@ -2033,7 +2095,9 @@ impl Srv6Members {
         let local = self.behaviour.is_some()
             || self.vrf.is_some()
             || self.interface.is_some()
-            || self.next_hop.is_some();
+            || self.next_hop.is_some()
+            || self.csid_block.is_some()
+            || self.csid_length.is_some();
         let encap = self.source.is_some() || self.segments.is_some() || self.reduced.is_some();
         if local && encap {
             return Err(ModelError::Invalid("duplicate member"));
@@ -2049,8 +2113,14 @@ impl Srv6Members {
             return Ok(None);
         }
         let behaviour = self.behaviour.ok_or(ModelError::Missing("behavior"))?;
-        let (name, flavors) =
+        let (name, mut flavors) =
             Srv6Flavors::parse(&behaviour).ok_or(ModelError::Invalid("SRv6 behavior"))?;
+        // NEXT-CSID's structure, and only with it.
+        flavors.next_csid = match (flavors.next_csid, self.csid_block, self.csid_length) {
+            (Some(_), Some(block), Some(csid)) => Some(Srv6Csid { block, csid }),
+            (None, None, None) => None,
+            _ => return Err(ModelError::Invalid("NEXT-CSID and its lengths")),
+        };
         let flavored = flavors != Srv6Flavors::default();
         let local = match (name, self.vrf, self.interface, self.next_hop) {
             ("End", None, None, None) => Srv6Local::End { flavors },
@@ -3138,6 +3208,7 @@ mod flavor_tests {
             psp: true,
             usp: true,
             usd: true,
+            next_csid: None,
         };
         assert_eq!(
             Srv6Flavors::parse("End"),
@@ -3152,12 +3223,17 @@ mod flavor_tests {
             ..Srv6Flavors::default()
         };
         assert_eq!(Srv6Flavors::parse("End with USD"), Some(("End", usd)));
+        let (base, csid) = Srv6Flavors::parse("End.X with NEXT-CSID, PSP & USD").unwrap();
+        assert_eq!(base, "End.X");
+        assert!(csid.next_csid.is_some() && csid.psp && csid.usd && !csid.usp);
         for bad in [
             "End with USD & PSP",
             "End with PSP, USD",
             "End with PSP & PSP",
             "End with XYZ",
             "End with PSP, USP, USD",
+            "End with PSP & NEXT-CSID",
+            "End with NEXT-CSID & NEXT-CSID",
         ] {
             assert_eq!(Srv6Flavors::parse(bad), None, "{bad}");
         }
