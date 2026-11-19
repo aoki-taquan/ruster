@@ -643,6 +643,7 @@ impl Confd {
         bridge::tables(&self.current.bridges, &mut out);
         etherip::tables(&self.current.etherip, &mut out);
         vxlan::tables(&self.current.vxlan, &mut out);
+        srv6::tables(&self.current.srv6, &mut out);
         if let Some((ipv4_interval_ms, ipv6_burst, ipv6_interval_ms)) = self.current.icmp_errors {
             out.insert(
                 Key::IcmpErrors {

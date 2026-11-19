@@ -163,6 +163,7 @@ struct InterfaceEntry {
     tunnel: Option<TunnelEntry>,
     etherip: Option<TunnelEntry>,
     vxlan: Option<VxlanEntry>,
+    srv6_l2: Option<Srv6L2Entry>,
     pppoe: Option<PppoeEntry>,
     bridge: Option<BridgeEntry>,
 }
@@ -190,6 +191,14 @@ struct VxlanEntry {
     vni: u32,
     local: String,
     remote: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Srv6L2Entry {
+    sid: String,
+    segments: Vec<String>,
+    reduced: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -240,10 +249,27 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
         let at = format!("interface {:?}", entry.name);
         let vrf = default_vrf(entry.vrf);
         let etherip = entry.etherip;
-        if entry.vxlan.is_some() && etherip.is_some() {
-            return Err(format!("{at}: give etherip or vxlan, not both"));
+        if u8::from(entry.vxlan.is_some())
+            + u8::from(etherip.is_some())
+            + u8::from(entry.srv6_l2.is_some())
+            > 1
+        {
+            return Err(format!("{at}: give one of etherip, vxlan and srv6-l2"));
         }
         let kind = match (entry.parent, entry.vlan, entry.tunnel, entry.pppoe) {
+            (None, None, None, None) if entry.bridge.is_none() && entry.srv6_l2.is_some() => {
+                let l2 = entry.srv6_l2.expect("checked");
+                Kind::Srv6L2 {
+                    sid: l2.sid,
+                    segments: l2.segments,
+                    reduced: l2.reduced.unwrap_or(false),
+                }
+            }
+            _ if entry.srv6_l2.is_some() => {
+                return Err(format!(
+                "{at}: an SRv6 L2 interface is not also a VLAN, a tunnel, a PPPoE session or a bridge"
+            ))
+            }
             (None, None, None, None) if entry.bridge.is_none() && entry.vxlan.is_some() => {
                 let vxlan = entry.vxlan.expect("checked");
                 Kind::Vxlan {
@@ -365,9 +391,14 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
         };
         let mac = match (entry.mac, &kind, &parent) {
             (Some(mac), ..) => mac,
-            (None, Kind::Tunnel { .. } | Kind::EtherIp { .. } | Kind::Vxlan { .. }, _) => {
-                TUNNEL_MAC.to_owned()
-            }
+            (
+                None,
+                Kind::Tunnel { .. }
+                | Kind::EtherIp { .. }
+                | Kind::Vxlan { .. }
+                | Kind::Srv6L2 { .. },
+                _,
+            ) => TUNNEL_MAC.to_owned(),
             (None, Kind::Bridge(_), Some(Ok((mac, _)))) if mac.is_empty() => {
                 return Err(format!(
                     "{at}: give its mac: it has no port or VLAN member given before it"
@@ -387,6 +418,13 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
                 MTU - crate::VXLAN_OVERHEAD_IPV6
             }
             (None, Kind::Vxlan { .. }, _) => MTU - crate::VXLAN_OVERHEAD_IPV4,
+            (
+                None,
+                Kind::Srv6L2 {
+                    segments, reduced, ..
+                },
+                _,
+            ) => MTU.saturating_sub(crate::srv6_l2_overhead(segments.len(), *reduced)),
             (None, _, Some(parent)) => parent.clone()?.1,
             (None, ..) => MTU,
         };

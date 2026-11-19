@@ -83,6 +83,18 @@ ipv6-from = []
 kind = { vxlan = { vni = 100, local = "192.0.2.1", remote = ["198.51.100.2"] } }
 
 [[interface]]
+name = "sr0"
+mac = "02:00:00:00:00:06"
+mtu = 1446
+enabled = true
+vrf = "default"
+ipv4 = []
+ipv4-from = []
+ipv6 = []
+ipv6-from = []
+kind = { srv6-l2 = { sid = "fc00:1::d2", segments = ["fc00:2::d2"], reduced = false } }
+
+[[interface]]
 name = "br0"
 mac = "02:00:00:00:00:04"
 mtu = 1492

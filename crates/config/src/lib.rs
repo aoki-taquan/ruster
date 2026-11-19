@@ -66,6 +66,12 @@
 //!                              # is an address of an interface in the default VRF
 //! # mac is 02:00:00:00:00:fe and mtu 1464 (IPv4) or 1444 (IPv6) when left out
 //!
+//! [[interface]]                # frames over SRv6 (RFC 8986), only as a bridge member
+//! name = "sr0"                 # wrapped toward segments (H.Encaps.L2) from [srv6]'s
+//! srv6-l2 = { sid = "fc00:1::d2", segments = ["fc00:2::d2"] }  # source; packets to
+//!                              # the End.DX2 sid (in [srv6]'s locator) bring frames in;
+//!                              # reduced = true for H.Encaps.L2.Red
+//!
 //! [[interface]]                # a VXLAN network (RFC 7348), only as a bridge member
 //! name = "vx100"
 //! vxlan = { vni = 100, local = "192.0.2.1", remote = ["198.51.100.2", "198.51.100.3"] }
@@ -80,7 +86,7 @@
 //!
 //! [[interface]]                # a bridge and its own interface (IRB), after its members
 //! name = "br0"
-//! bridge = { members = ["lan", "lan.10"] }  # ports, VLANs, EtherIP, one VXLAN
+//! bridge = { members = ["lan", "lan.10"] }  # ports, VLANs, EtherIP, SRv6 L2, one VXLAN
 //! ipv4 = "192.0.2.1/24"        # optional: the IRB routes like any interface
 //! # mac is the first port's or VLAN's, and mtu the smallest member's, when left out.
 //! # In bridge, optional:
@@ -603,7 +609,7 @@ pub const VERSION: u32 = 1;
 ///
 /// A new key also goes into `tests/data/every-key.lock` (the test reads it with every
 /// key required, and checks that every list in it has an item).
-pub const LOCK_SHAPE: u64 = 0x59e1_0c19_e60f_4fc1;
+pub const LOCK_SHAPE: u64 = 0x7c0b_e85b_2349_06fe;
 
 /// A bridge's ageing time, in seconds (IEEE 802.1Q 8.8.3, the recommended value).
 pub const BRIDGE_AGING_TIME: u32 = 300;
@@ -625,6 +631,20 @@ pub const ETHERIP_OVERHEAD_IPV6: u16 = 14 + 2 + 40;
 /// Ethernet header, VXLAN, UDP, and IPv4 or IPv6.
 pub const VXLAN_OVERHEAD_IPV4: u16 = 14 + 8 + 8 + 20;
 pub const VXLAN_OVERHEAD_IPV6: u16 = 14 + 8 + 8 + 40;
+
+/// What an SRv6 L2 interface's outer headers take from the MTU of the link below
+/// for `segments` segments: the inner Ethernet header, IPv6, and with two segments
+/// or more the Segment Routing Header (without the first with `reduced`).
+#[must_use]
+pub fn srv6_l2_overhead(segments: usize, reduced: bool) -> u16 {
+    let listed = match (segments, reduced) {
+        (0 | 1, _) => 0,
+        (n, true) => n - 1,
+        (n, false) => n,
+    };
+    let srh = if listed == 0 { 0 } else { 8 + 16 * listed };
+    14 + 40 + u16::try_from(srh).unwrap_or(u16::MAX)
+}
 /// What the outer IPv6 header takes from a tunnel's MTU.
 pub const TUNNEL_OVERHEAD: u16 = 40;
 /// The MTU of a tunnel or MAP-E that names none.
@@ -922,6 +942,15 @@ pub enum Kind {
         vni: u32,
         local: String,
         remote: Vec<String>,
+    },
+    /// Frames over SRv6 (RFC 8986): wrapped toward `segments` (H.Encaps.L2, or
+    /// H.Encaps.L2.Red with `reduced`) from `[srv6]`'s source, and brought in by
+    /// packets to the router's End.DX2 SID `sid`; only a bridge member.
+    #[serde(rename = "srv6-l2")]
+    Srv6L2 {
+        sid: String,
+        segments: Vec<String>,
+        reduced: bool,
     },
     /// A bridge, and its own interface (IRB) of the same name.
     Bridge(Bridge),

@@ -31,7 +31,13 @@ pub struct Srv6 {
     pub sids: Vec<(Ipv6Addr, Srv6Local)>,
     /// VRF, prefix, length and the policy.
     pub policies: Vec<(String, IpAddr, u8, Srv6Encap)>,
+    /// The SRv6 L2 interfaces: the FE's rows for them.
+    pub l2: Vec<(String, Value)>,
 }
+
+/// One SRv6 L2 interface of the lock form: its name, End.DX2 SID, segments and
+/// whether reduced.
+pub(crate) type L2Entry = (String, String, Vec<String>, bool);
 
 fn unicast6(text: &str) -> Option<Ipv6Addr> {
     text.parse::<Ipv6Addr>()
@@ -52,11 +58,18 @@ pub(crate) fn check(
     lock: Vec<ruster_config::Srv6>,
     interfaces: &[InterfaceConfig],
     static_routes: &[StaticRoute],
+    l2: Vec<L2Entry>,
+    bridges: &[crate::bridge::Bridge],
 ) -> Result<Srv6, String> {
     if lock.len() > 1 {
         return Err("srv6: give it once".to_owned());
     }
     let Some(srv6) = lock.into_iter().next() else {
+        if let Some((name, ..)) = l2.first() {
+            return Err(format!(
+                "interface {name:?}: an SRv6 L2 interface needs [srv6] (its locator and source)"
+            ));
+        }
         return Ok(Srv6::default());
     };
     let (locator, locator_len) = match crate::file::prefix(&srv6.locator) {
@@ -246,7 +259,82 @@ pub(crate) fn check(
             },
         ));
     }
+    for (name, sid, segments, reduced) in l2 {
+        let at = format!("interface {name:?}");
+        let sid = unicast6(&sid)
+            .ok_or_else(|| format!("{at}: srv6-l2 sid must be a unicast IPv6 address"))?;
+        if ruster_proto::table::network(IpAddr::V6(sid), locator_len) != IpAddr::V6(locator) {
+            return Err(format!(
+                "{at}: srv6-l2 sid is not in the locator {:?}",
+                srv6.locator
+            ));
+        }
+        let used = out.sids.iter().any(|(other, _)| *other == sid)
+            || out
+                .l2
+                .iter()
+                .any(|(_, v)| matches!(v, Value::Srv6L2 { sid: other, .. } if *other == sid));
+        if own.contains(&sid) || used {
+            return Err(format!(
+                "{at}: srv6-l2 sid is an address of an interface or another SID"
+            ));
+        }
+        if taken.contains(&(DEFAULT_VRF.to_owned(), IpAddr::V6(sid), 128)) {
+            return Err(format!("{at}: the default VRF has a route for its sid"));
+        }
+        if segments.is_empty() || segments.len() > ruster_proto::table::SRV6_SEGMENTS_MAX {
+            return Err(format!(
+                "{at}: srv6-l2 takes 1 to {} segments",
+                ruster_proto::table::SRV6_SEGMENTS_MAX
+            ));
+        }
+        let segments = segments
+            .iter()
+            .map(|s| {
+                unicast6(s).ok_or_else(|| {
+                    format!("{at}: srv6-l2 segment {s:?} is not a unicast IPv6 address")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if !crate::bridge::is_member(bridges, &name) {
+            return Err(format!(
+                "{at}: an SRv6 L2 interface must be a member of a bridge"
+            ));
+        }
+        let most = crate::etherip::LINK_MTU
+            .saturating_sub(ruster_config::srv6_l2_overhead(segments.len(), reduced));
+        let mtu = interfaces
+            .iter()
+            .find(|i| i.name == name)
+            .map_or(0, |i| i.mtu);
+        if mtu > most {
+            return Err(format!(
+                "{at}: mtu must be at most {most} (1500 less the outer headers)"
+            ));
+        }
+        out.l2.push((
+            name,
+            Value::Srv6L2 {
+                source,
+                sid,
+                segments,
+                reduced,
+            },
+        ));
+    }
     Ok(out)
+}
+
+/// The FE's table rows of the SRv6 L2 interfaces.
+pub(crate) fn tables(srv6: &Srv6, out: &mut BTreeMap<Key, Value>) {
+    for (name, value) in &srv6.l2 {
+        out.insert(
+            Key::Srv6L2 {
+                interface: name.clone(),
+            },
+            value.clone(),
+        );
+    }
 }
 
 /// Adds the routes of `srv6` to `out` (ribd's routes from confd), after the
