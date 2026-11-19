@@ -901,6 +901,26 @@ pub fn config(lock: Lock) -> Result<Config, String> {
                 .flat_map(|(_, bridge)| bridge.members.iter().map(String::as_str)),
         )
         .collect();
+    // A tunnel bridge member carries only its bridge's frames: no VLAN or PPPoE
+    // session on it.
+    for interface in &interfaces {
+        let parent = interface
+            .vlan
+            .as_ref()
+            .map(|(parent, _)| parent)
+            .or(interface.pppoe.as_ref().map(|(parent, _)| parent));
+        let tunnel = |p: &str| {
+            etherip.iter().any(|(name, ..)| name == p)
+                || vxlan.iter().any(|v| v.name == p)
+                || srv6_l2.iter().any(|(name, ..)| name == p)
+        };
+        if let Some(parent) = parent.filter(|p| tunnel(p)) {
+            return Err(format!(
+                "interface {:?}: its parent {parent:?} is a tunnel bridge member",
+                interface.name
+            ));
+        }
+    }
     // Owned: the lists are checked below.
     let members: BTreeSet<String> = members.into_iter().map(str::to_owned).collect();
     // Of VRF `vrf` (VXLAN's outer packets may be in another than the default).

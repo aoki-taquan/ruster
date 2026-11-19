@@ -1751,8 +1751,8 @@ where
                     // sent back to its own VTEPs (RFC 8365 section 8.3: each VTEP
                     // sends its own frames to every other), but goes to the bridge's
                     // other VXLAN interfaces (other VNIs or VTEPs).
-                    if frame.from != Some(member) && !members.send(member, None, frame.bytes()) {
-                        dropped += 1;
+                    if frame.from != Some(member) {
+                        dropped += members.send_counted(member, None, frame.bytes()).1;
                     }
                 }
                 if dropped > 0 {
@@ -2178,11 +2178,9 @@ where
                     sent = members.send(member, vtep, frame);
                 } else {
                     for &member in members.bridges.members(bridge) {
-                        if members.send(member, None, frame) {
-                            sent = true;
-                        } else {
-                            dropped += 1;
-                        }
+                        let (went, failed) = members.send_counted(member, None, frame);
+                        sent |= went;
+                        dropped += failed;
                     }
                 }
             }
@@ -2285,8 +2283,16 @@ impl<'f, 't, B: GeneratedPacketIo> Members<'f, 't, B> {
     /// is known (a VXLAN interface's, learned with the destination), or to each of
     /// its remote ends. Whether it went out at least once.
     fn send(&mut self, member: IfId, vtep: Option<IpAddr>, frame: &[u8]) -> bool {
+        self.send_counted(member, vtep, frame).0
+    }
+
+    /// [`Self::send`], with how many copies did not go out: one for a port that
+    /// could not take it; for an overlay, one per remote end it was not sent to (one
+    /// when it has none).
+    fn send_counted(&mut self, member: IfId, vtep: Option<IpAddr>, frame: &[u8]) -> (bool, u64) {
         let Some(overlay) = self.outer.overlay(member) else {
-            return send_member(self.io, self.vlans, member, frame);
+            let sent = send_member(self.io, self.vlans, member, frame);
+            return (sent, u64::from(!sent));
         };
         let remotes = match &vtep {
             Some(vtep) if overlay.is_vxlan() => std::slice::from_ref(vtep),
@@ -2294,6 +2300,7 @@ impl<'f, 't, B: GeneratedPacketIo> Members<'f, 't, B> {
         };
         let bridges = self.bridges;
         let mut sent = false;
+        let mut failed = u64::from(remotes.is_empty());
         for &remote in remotes {
             let irb = |id: IfId| bridges.irb_of(id).is_some();
             match self.outer.overlay_header_in(
@@ -2305,13 +2312,19 @@ impl<'f, 't, B: GeneratedPacketIo> Members<'f, 't, B> {
                 self.trace,
             ) {
                 Some(Ok(header)) => {
-                    sent |= send_parts(self.io, self.vlans, header.egress, header.bytes(), frame);
+                    let went =
+                        send_parts(self.io, self.vlans, header.egress, header.bytes(), frame);
+                    sent |= went;
+                    failed += u64::from(!went);
                 }
-                Some(Err(reason)) => self.trace.overlay_drop(reason),
-                None => {}
+                Some(Err(reason)) => {
+                    self.trace.overlay_drop(reason);
+                    failed += 1;
+                }
+                None => failed += 1,
             }
         }
-        sent
+        (sent, failed)
     }
 }
 
