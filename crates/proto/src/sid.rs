@@ -177,6 +177,14 @@ pub const VXLAN: u64 = 60280;
 pub const VXLAN_VNI: u64 = 60281;
 pub const VXLAN_LOCAL: u64 = 60282;
 pub const VXLAN_REMOTE: u64 = 60283;
+/// `ruster-if-srv6-l2`: an interface whose frames travel over SRv6 (RFC 8986 H.Encaps.L2
+/// and End.DX2), by interface, its outer source, its End.DX2 SID, the segments it
+/// sends to and whether reduced.
+pub const SRV6_L2: u64 = 60300;
+pub const SRV6_L2_SOURCE: u64 = 60301;
+pub const SRV6_L2_SID: u64 = 60302;
+pub const SRV6_L2_SEGMENTS: u64 = 60303;
+pub const SRV6_L2_REDUCED: u64 = 60304;
 
 /// Notification: the FE has a packet for a next hop that is not in the neighbor table.
 pub const RESOLVE_REQUEST: u64 = 60050;
@@ -352,6 +360,11 @@ pub const ALL: &[(&str, u64)] = &[
     ("/ruster-if-vxlan:vxlan/vni", VXLAN_VNI),
     ("/ruster-if-vxlan:vxlan/local", VXLAN_LOCAL),
     ("/ruster-if-vxlan:vxlan/remote", VXLAN_REMOTE),
+    ("/ruster-if-srv6-l2:srv6-l2", SRV6_L2),
+    ("/ruster-if-srv6-l2:srv6-l2/source-address", SRV6_L2_SOURCE),
+    ("/ruster-if-srv6-l2:srv6-l2/sid", SRV6_L2_SID),
+    ("/ruster-if-srv6-l2:srv6-l2/segment", SRV6_L2_SEGMENTS),
+    ("/ruster-if-srv6-l2:srv6-l2/reduced", SRV6_L2_REDUCED),
     ("/ruster-neighbor:resolve-request", RESOLVE_REQUEST),
     (
         "/ruster-neighbor:resolve-request/interface",

@@ -96,6 +96,7 @@ pub mod writers {
         sid::BRIDGE_MAC,
         sid::ETHERIP,
         sid::VXLAN,
+        sid::SRV6_L2,
     ];
     pub const ROUTE: &[u64] = &[sid::ROUTE];
     pub const NEIGHBOR: &[u64] = &[sid::NEIGHBOR];

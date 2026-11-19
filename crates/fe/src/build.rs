@@ -271,6 +271,7 @@ impl Routes {
                 Key::Interface { .. }
                 | Key::EtherIp { .. }
                 | Key::Vxlan { .. }
+                | Key::Srv6L2 { .. }
                 | Key::Bridge { .. } => return None,
             };
             let after = match store.get(key) {
@@ -854,7 +855,11 @@ pub(crate) fn build(
     // EtherIP and VXLAN interfaces get the ids after those: an interface row of the
     // name, with no VLAN, tunnel or PPPoE session, and the EtherIP or VXLAN row.
     let mut overlays = Vec::new();
-    for (key, value) in store.table(sid::ETHERIP).chain(store.table(sid::VXLAN)) {
+    let members = store
+        .table(sid::ETHERIP)
+        .chain(store.table(sid::VXLAN))
+        .chain(store.table(sid::SRV6_L2));
+    for (key, value) in members {
         let (name, local, kind) = match (key, value) {
             (Key::EtherIp { interface }, Value::EtherIp { local, remote }) => (
                 interface,
@@ -876,6 +881,23 @@ pub(crate) fn build(
                     remotes: remotes.clone(),
                 },
             ),
+            (
+                Key::Srv6L2 { interface },
+                Value::Srv6L2 {
+                    source,
+                    sid,
+                    segments,
+                    reduced,
+                },
+            ) => (
+                interface,
+                IpAddr::V6(*source),
+                ruster_core::OverlayKind::Srv6L2 {
+                    sid: sid.octets(),
+                    segments: segments.iter().map(|s| IpAddr::V6(*s)).collect(),
+                    reduced: *reduced,
+                },
+            ),
             _ => continue,
         };
         {
@@ -895,7 +917,9 @@ pub(crate) fn build(
                 return Err(format!("overlay interface {name} has the name of a port"));
             }
             if active.contains_key(name.as_str()) {
-                return Err(format!("{name} is both an EtherIP and a VXLAN interface"));
+                return Err(format!(
+                    "{name} is more than one of an EtherIP, VXLAN and SRv6 L2 interface"
+                ));
             }
             let id = ids.take(name)?;
             interfaces.push(Interface {
@@ -933,9 +957,14 @@ pub(crate) fn build(
                         interface: name.clone(),
                     })
                     .is_some()
+                || store
+                    .get(&Key::Srv6L2 {
+                        interface: name.clone(),
+                    })
+                    .is_some()
             {
                 return Err(format!(
-                    "bridge {name} has the name of an EtherIP or VXLAN interface"
+                    "bridge {name} has the name of an EtherIP, VXLAN or SRv6 L2 interface"
                 ));
             }
             let limits = ruster_core::BridgeLimits {

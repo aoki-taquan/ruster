@@ -133,6 +133,11 @@ pub enum Key {
     Vxlan {
         interface: String,
     },
+    /// An SRv6 L2 interface (RFC 8986 H.Encaps.L2 and End.DX2): the interface of
+    /// this name carries its frames over SRv6. It is only a bridge member.
+    Srv6L2 {
+        interface: String,
+    },
 }
 
 /// The value of one entry.
@@ -243,6 +248,15 @@ pub enum Value {
         vni: u32,
         local: IpAddr,
         remotes: Vec<IpAddr>,
+    },
+    /// Frames leave wrapped from `source` toward `segments` (the first first;
+    /// H.Encaps.L2, or H.Encaps.L2.Red with `reduced`), and packets to the
+    /// router's End.DX2 SID `sid` bring frames in. Routed in the default VRF.
+    Srv6L2 {
+        source: std::net::Ipv6Addr,
+        sid: std::net::Ipv6Addr,
+        segments: Vec<std::net::Ipv6Addr>,
+        reduced: bool,
     },
 }
 
@@ -713,6 +727,7 @@ impl Key {
             Self::BridgeMac { .. } => sid::BRIDGE_MAC,
             Self::EtherIp { .. } => sid::ETHERIP,
             Self::Vxlan { .. } => sid::VXLAN,
+            Self::Srv6L2 { .. } => sid::SRV6_L2,
         }
     }
 }
@@ -791,7 +806,8 @@ impl Change {
             Key::Bridge { name: n } | Key::BridgeMac { bridge: n, .. } => name(n)?,
             Key::BridgePort { interface }
             | Key::EtherIp { interface }
-            | Key::Vxlan { interface } => name(interface)?,
+            | Key::Vxlan { interface }
+            | Key::Srv6L2 { interface } => name(interface)?,
             Key::Route { vrf, prefix, len } => {
                 name(vrf)?;
                 // The prefix is an address already: what a text of it is checked
@@ -828,6 +844,7 @@ impl Change {
                         | (Key::BridgeMac { .. }, Value::BridgeMac { .. })
                         | (Key::EtherIp { .. }, Value::EtherIp { .. })
                         | (Key::Vxlan { .. }, Value::Vxlan { .. })
+                        | (Key::Srv6L2 { .. }, Value::Srv6L2 { .. })
                 );
                 if !table_matches {
                     return Err(ModelError::WrongTable);
@@ -1003,6 +1020,24 @@ impl Change {
                             || local == remote
                         {
                             return Err(ModelError::Invalid("EtherIP local and remote"));
+                        }
+                    }
+                    Value::Srv6L2 {
+                        source,
+                        sid,
+                        segments,
+                        ..
+                    } => {
+                        let unicast = |a: &std::net::Ipv6Addr| {
+                            !(a.is_unspecified() || a.is_loopback() || a.is_multicast())
+                        };
+                        if !unicast(source)
+                            || !unicast(sid)
+                            || segments.is_empty()
+                            || segments.len() > SRV6_SEGMENTS_MAX
+                            || !segments.iter().all(unicast)
+                        {
+                            return Err(ModelError::Invalid("SRv6 L2 addresses"));
                         }
                     }
                     Value::Vxlan {
@@ -1241,6 +1276,9 @@ pub fn encode_key(key: &Key, e: &mut Encoder<'_>) {
         Key::EtherIp { interface } => {
             e.array(2).u64(sid::ETHERIP).text(interface);
         }
+        Key::Srv6L2 { interface } => {
+            e.array(2).u64(sid::SRV6_L2).text(interface);
+        }
         Key::Vxlan { interface } => {
             e.array(2).u64(sid::VXLAN).text(interface);
         }
@@ -1276,7 +1314,8 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
         | sid::BRIDGE
         | sid::BRIDGE_PORT
         | sid::ETHERIP
-        | sid::VXLAN => 2,
+        | sid::VXLAN
+        | sid::SRV6_L2 => 2,
         sid::ADDRESS | sid::ROUTE | sid::NEIGHBOR | sid::FIREWALL_RULE | sid::BRIDGE_MAC => 3,
         other => return Err(ModelError::UnknownTable(other)),
     };
@@ -1302,6 +1341,7 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
         sid::BRIDGE_PORT => Key::BridgePort { interface: first },
         sid::ETHERIP => Key::EtherIp { interface: first },
         sid::VXLAN => Key::Vxlan { interface: first },
+        sid::SRV6_L2 => Key::Srv6L2 { interface: first },
         sid::BRIDGE_MAC => Key::BridgeMac {
             bridge: first,
             mac: parse_mac(d.text()?)?,
@@ -1637,6 +1677,25 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
                 e.text(&remote.to_string());
             }
         }
+        Value::Srv6L2 {
+            source,
+            sid: address,
+            segments,
+            reduced,
+        } => {
+            let d = |member: u64| member - sid::SRV6_L2;
+            e.map(4)
+                .u64(d(sid::SRV6_L2_SOURCE))
+                .text(&source.to_string())
+                .u64(d(sid::SRV6_L2_SID))
+                .text(&address.to_string())
+                .u64(d(sid::SRV6_L2_SEGMENTS))
+                .array(segments.len() as u64);
+            for segment in segments {
+                e.text(&segment.to_string());
+            }
+            e.u64(d(sid::SRV6_L2_REDUCED)).bool(*reduced);
+        }
         Value::EtherIp { local, remote } => {
             e.map(2)
                 .u64(sid::ETHERIP_LOCAL - sid::ETHERIP)
@@ -1700,6 +1759,7 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
             | sid::BRIDGE_MAC
             | sid::ETHERIP
             | sid::VXLAN
+            | sid::SRV6_L2
     ) {
         return decode_policy_value(table, d);
     }
@@ -2295,6 +2355,22 @@ pub fn entry_line(key: &Key, value: &Value) -> Option<String> {
             format!("etherip {interface} {local} to {remote}")
         }
         (
+            Key::Srv6L2 { interface },
+            Value::Srv6L2 {
+                source,
+                sid,
+                segments,
+                reduced,
+            },
+        ) => {
+            let segments: Vec<String> = segments.iter().map(ToString::to_string).collect();
+            format!(
+                "srv6-l2 {interface} sid {sid} encap{} from {source} segs {}",
+                if *reduced { " reduced" } else { "" },
+                segments.join(",")
+            )
+        }
+        (
             Key::Vxlan { interface },
             Value::Vxlan {
                 vni,
@@ -2442,6 +2518,31 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
         Value::EtherIp {
             local: address(sid::ETHERIP_LOCAL, "local")?,
             remote: address(sid::ETHERIP_REMOTE, "remote")?,
+        }
+    } else if table == sid::SRV6_L2 {
+        let mut address = |member: u64, what: &'static str| {
+            parse_ipv6(&text(member, what)?.ok_or(ModelError::Missing(what))?)
+        };
+        let source = address(sid::SRV6_L2_SOURCE, "source-address")?;
+        let sid = address(sid::SRV6_L2_SID, "sid")?;
+        let segments = match got.remove(&sid::SRV6_L2_SEGMENTS) {
+            Some(Member::List(list)) => list
+                .iter()
+                .map(|t| parse_ipv6(t))
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => return Err(ModelError::Invalid("segment")),
+            None => return Err(ModelError::Missing("segment")),
+        };
+        let reduced = match got.remove(&sid::SRV6_L2_REDUCED) {
+            Some(Member::Bool(b)) => b,
+            Some(_) => return Err(ModelError::Invalid("reduced")),
+            None => false,
+        };
+        Value::Srv6L2 {
+            source,
+            sid,
+            segments,
+            reduced,
         }
     } else if table == sid::VXLAN {
         let local =
