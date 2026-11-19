@@ -104,8 +104,12 @@ impl Bench {
     }
 
     fn change(&mut self, changes: &[Change]) {
+        assert_eq!(self.try_change(changes), Code::CHANGED);
+    }
+
+    fn try_change(&mut self, changes: &[Change]) -> Code {
         let token = self.config.patch(changes).unwrap();
-        assert_eq!(settle(&mut self.fe, &mut self.config, token), Code::CHANGED);
+        settle(&mut self.fe, &mut self.config, token)
     }
 
     /// Sends `frame` in on `port` and returns what left, by port.
@@ -302,4 +306,29 @@ fn an_address_behind_a_vtep_taken_off_the_list_is_forgotten() {
     let out = bench.send(P1, c.clone());
     assert_eq!(out.len(), 1);
     assert_eq!(vtep_of(&out[0].1, &c), VTEP3);
+}
+
+#[test]
+fn two_vxlan_interfaces_of_a_bridge_may_not_share_a_vtep() {
+    let mut bench = Bench::new();
+    let code = bench.try_change(&[
+        iface("vx1", [2, 0, 0, 0, 0, 0xf]),
+        vxlan("vx1", 200, &[VTEP3]),
+        member("vx1"),
+    ]);
+    assert_ne!(code, Code::CHANGED);
+}
+
+#[test]
+fn an_address_learned_in_a_vni_is_forgotten_when_the_interface_changes_vni() {
+    let mut bench = Bench::new();
+    let b = frame(H1, H2, 60);
+    bench.send(P1, frame(H2, H1, 60));
+    assert_eq!(bench.send(WAN, outer(VTEP2, 100, &b)), vec![(P1, b)]);
+    bench.change(&[vxlan("vx0", 300, &[VTEP2, VTEP3])]);
+    // Flooded to both VTEPs again, in VNI 300.
+    let c = frame(H2, H1, 100);
+    let out = bench.send(P1, c);
+    assert_eq!(out.len(), 2, "{out:?}");
+    assert!(out.iter().all(|(_, w)| w[46..49] == 300_u32.to_be_bytes()[1..]));
 }

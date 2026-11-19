@@ -1429,6 +1429,7 @@ where
         self.handover.controls.follow(built.punt.controls());
         self.kernel_bits = ruster_core::kernel_ingress_bits(&built.kernel);
         let old = std::mem::replace(&mut self.tables, built);
+        let old_overlays = old.overlays.clone();
         // Freed on the control task's side; here only when it is gone.
         let _ = self.to_control.send(FromWorker::Retired(old));
         self.version += 1;
@@ -1456,18 +1457,24 @@ where
             .collect();
         let (names, configs): (Vec<String>, Vec<_>) = self.tables.bridges.iter().cloned().unzip();
         self.bridge_names = names;
-        // An address learned behind a VTEP the member no longer lists goes: frames
-        // to it are flooded again.
+        // An address learned behind a VTEP goes when the member no longer lists the
+        // VTEP, or is now in another VNI or from another local address: frames to
+        // it are flooded again.
         let overlays = &self.tables.overlays;
+        let of = |list: &'_ [ruster_core::Overlay], member: IfId| {
+            list.iter().find(|o| o.interface == member).cloned()
+        };
         let left = self.bridges.publish(
             configs,
             &old_of_new,
             &self.tables.bridge_statics,
-            |member, vtep| {
-                overlays
-                    .iter()
-                    .find(|o| o.interface == member)
-                    .is_some_and(|o| o.remotes().contains(&vtep))
+            |member, vtep| match (of(overlays, member), of(&old_overlays, member)) {
+                (Some(new), Some(old)) => {
+                    new.remotes().contains(&vtep)
+                        && new.local == old.local
+                        && new.kind.same_network(&old.kind)
+                }
+                _ => false,
             },
         );
         if left > 0 {

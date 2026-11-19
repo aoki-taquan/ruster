@@ -1040,6 +1040,24 @@ pub(crate) fn build(
     for (at, member) in members {
         bridges[at].1.members.push(member);
     }
+    // A bridge's VXLAN members share no remote VTEP: frames flooded from one go to
+    // the others, so a VTEP behind two would get them back (a loop between two
+    // routers joined that way).
+    for (name, bridge) in &bridges {
+        let mut vteps: BTreeSet<IpAddr> = BTreeSet::new();
+        for overlay in overlays
+            .iter()
+            .filter(|o| bridge.members.contains(&o.interface))
+        {
+            if let ruster_core::OverlayKind::Vxlan { remotes, .. } = &overlay.kind {
+                if let Some(vtep) = remotes.iter().find(|r| !vteps.insert(**r)) {
+                    return Err(format!(
+                        "bridge {name}: VTEP {vtep} is a remote of two of its VXLAN interfaces"
+                    ));
+                }
+            }
+        }
+    }
     for (key, value) in store.table(sid::BRIDGE_MAC) {
         if let (Key::BridgeMac { bridge, mac }, Value::BridgeMac { interface }) = (key, value) {
             let member = active.get(interface.as_str()).map(|&(id, _)| id);
