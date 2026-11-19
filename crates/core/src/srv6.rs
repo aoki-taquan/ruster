@@ -65,7 +65,10 @@
 //!   stepped over when its Segments Left is 0, and gets Parameter Problem code 0
 //!   pointing at its Routing Type otherwise.
 //! - RFC 8200 section 4: Hop-by-Hop and Destination Options headers are stepped
-//!   over, at most [`MAX_EXTENSION_HEADERS`] extension headers in all.
+//!   over, at most [`MAX_EXTENSION_HEADERS`] extension headers in all; a Hop-by-Hop
+//!   header anywhere but right after the IPv6 header drops the packet (section
+//!   4.3). No ICMPv6 error goes to a source that is one of the router's addresses
+//!   (as the IPv6 checks drop such packets silently).
 //! - RFC 8986 section 5.1 (H.Encaps) and RFC 8754 section 4.1: a packet routed to
 //!   a policy's interface (its TTL or Hop Limit already decremented, S05) gets an
 //!   outer IPv6 header from the policy's source to its first segment and a Segment
@@ -251,6 +254,8 @@ pub enum Srv6Error {
     /// A NEXT-CSID SID whose length is not its block's and CSID's, or a CSID of no
     /// bits.
     CsidLength,
+    /// A policy's source or segment that is no global unicast address.
+    Address,
 }
 
 impl Srv6Sid {
@@ -634,6 +639,8 @@ fn walk(frame: &[u8]) -> Result<Chain, Rejected> {
     let mut at = ETHERNET + IPV6_HEADER;
     for _ in 0..MAX_EXTENSION_HEADERS {
         match next {
+            // RFC 8200 4.3: Hop-by-Hop Options only right after the IPv6 header.
+            HOP_BY_HOP if at != ETHERNET + IPV6_HEADER => return Err(invalid),
             HOP_BY_HOP | DESTINATION_OPTIONS | ROUTING => {
                 let header = frame.get(at..at + 8).ok_or(invalid)?;
                 let len = (usize::from(header[1]) + 1) * 8;
@@ -766,6 +773,18 @@ impl Srv6Policy {
     ) -> Result<Self, Srv6Error> {
         if segments.is_empty() || segments.len() > MAX_SEGMENTS {
             return Err(Srv6Error::SegmentCount);
+        }
+        // A global unicast source and segments: a link-local or multicast one names
+        // no node across the SR domain.
+        let global = |a: &[u8; 16]| {
+            let a = std::net::Ipv6Addr::from(*a);
+            !(a.is_unspecified()
+                || a.is_loopback()
+                || a.is_multicast()
+                || a.is_unicast_link_local())
+        };
+        if !global(&source) || !segments.iter().all(global) {
+            return Err(Srv6Error::Address);
         }
         Ok(Self {
             interface,

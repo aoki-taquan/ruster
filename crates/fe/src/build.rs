@@ -1255,9 +1255,7 @@ pub(crate) fn build(
                         {
                             sid_vrfs.insert(vrf.clone());
                         }
-                        if let Some(sid) = srv6_sid(*prefix, *len, local, &active, index_of)? {
-                            sids.push(sid);
-                        }
+                        sids.push(srv6_sid(*prefix, *len, local, &active, index_of)?);
                         continue;
                     }
                     RouteAction::Srv6Encap(encap) => {
@@ -1604,21 +1602,22 @@ fn policy_name(vrf: &str, encap: &table::Srv6Encap) -> String {
     name
 }
 
-/// Core's SID for an SRv6 SID route, or `None` when it names an interface that is
-/// missing or disabled.
+/// Core's SID for an SRv6 SID route. One that names an interface that is missing
+/// or disabled drops its packets (they are not routed as to no SID).
 fn srv6_sid(
     prefix: IpAddr,
     len: u8,
     local: &table::Srv6Local,
     active: &BTreeMap<&str, (IfId, &str)>,
     index_of: impl Fn(&str) -> Option<usize>,
-) -> Result<Option<ruster_core::Srv6Sid>, String> {
+) -> Result<ruster_core::Srv6Sid, String> {
     use ruster_core::Srv6Behaviour;
     let vrf = |name: &str| {
         index_of(name)
             .and_then(|at| u16::try_from(at).ok())
             .ok_or_else(|| format!("SRv6 SID {prefix}/{len}: VRF {name}"))
     };
+    let egress = |name: &str| active.get(name).map_or(IfId::DISCARD, |&(id, _)| id);
     let behaviour = match local {
         table::Srv6Local::End { flavors } => Srv6Behaviour::End {
             flavors: srv6_flavors(*flavors),
@@ -1627,33 +1626,24 @@ fn srv6_sid(
             interface,
             next_hop,
             flavors,
-        } => match active.get(interface.as_str()) {
-            Some(&(egress, _)) => Srv6Behaviour::EndX {
-                egress,
-                next_hop: next_hop.octets(),
-                flavors: srv6_flavors(*flavors),
-            },
-            None => return Ok(None),
+        } => Srv6Behaviour::EndX {
+            egress: egress(interface),
+            next_hop: next_hop.octets(),
+            flavors: srv6_flavors(*flavors),
         },
         table::Srv6Local::EndDx6 {
             interface,
             next_hop,
-        } => match active.get(interface.as_str()) {
-            Some(&(egress, _)) => Srv6Behaviour::EndDx6 {
-                egress,
-                next_hop: next_hop.octets(),
-            },
-            None => return Ok(None),
+        } => Srv6Behaviour::EndDx6 {
+            egress: egress(interface),
+            next_hop: next_hop.octets(),
         },
         table::Srv6Local::EndDx4 {
             interface,
             next_hop,
-        } => match active.get(interface.as_str()) {
-            Some(&(egress, _)) => Srv6Behaviour::EndDx4 {
-                egress,
-                next_hop: next_hop.octets(),
-            },
-            None => return Ok(None),
+        } => Srv6Behaviour::EndDx4 {
+            egress: egress(interface),
+            next_hop: next_hop.octets(),
         },
         table::Srv6Local::EndDt4 { vrf: name } => Srv6Behaviour::EndDt4 { vrf: vrf(name)? },
         table::Srv6Local::EndDt6 { vrf: name } => Srv6Behaviour::EndDt6 { vrf: vrf(name)? },
@@ -1661,8 +1651,7 @@ fn srv6_sid(
     };
     let prefix = v6(prefix).ok_or_else(|| format!("SRv6 SID {prefix}/{len}: not IPv6"))?;
     ruster_core::Srv6Sid::new(prefix, len, behaviour)
-        .map(Some)
-        .map_err(|e| format!("SRv6 SID {len}: {e:?}"))
+        .map_err(|e| format!("SRv6 SID {}/{len}: {e:?}", IpAddr::V6(prefix.into())))
 }
 
 fn srv6_flavors(flavors: table::Srv6Flavors) -> ruster_core::Srv6Flavors {

@@ -3881,7 +3881,18 @@ where
                 let reason = match rejected {
                     crate::srv6::Rejected::Drop(reason) => reason,
                     crate::srv6::Rejected::Error(reason, kind, code, parameter) => {
-                        if let (Some(queue), Some(fib)) = (control.as_deref_mut(), all_vrfs.ipv6) {
+                        // No error to a source that claims to be the router (as the
+                        // IPv6 checks drop such packets silently).
+                        let forged = all_vrfs.ipv6.is_some_and(|fib| {
+                            packet
+                                .bytes_mut()
+                                .get(22..38)
+                                .and_then(|s| <[u8; 16]>::try_from(s).ok())
+                                .is_some_and(|source| fib.is_local(source))
+                        });
+                        if let (Some(queue), Some(fib), false) =
+                            (control.as_deref_mut(), all_vrfs.ipv6, forged)
+                        {
                             queue.error(
                                 packet.bytes_mut(),
                                 all_vrfs,

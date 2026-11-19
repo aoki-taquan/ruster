@@ -367,3 +367,20 @@ fn a_next_csid_sid_is_a_route_of_its_block_and_csid() {
         assert!(error.contains(says), "{says}: {error}");
     }
 }
+
+#[test]
+fn a_sid_interface_is_no_bridge_and_a_default_vrf_policy_holds_no_sid() {
+    // End.X out of a bridge member.
+    let bridged = format!(
+        "{INTERFACES}\n[[interface]]\nname = \"p2\"\nmac = \"02:00:00:00:01:03\"\n\n[[interface]]\nname = \"br0\"\nbridge = {{ members = [\"p2\"] }}\n{}",
+        GOOD.replacen("interface = \"wan\"", "interface = \"p2\"", 1)
+    );
+    let error = parse(&bridged).unwrap_err();
+    assert!(error.contains("bridge member"), "{error}");
+    // A default-VRF policy for fc00:1::/48: it holds the router's SIDs.
+    let policy = format!(
+        "{INTERFACES}{GOOD}\n[[srv6.policy]]\nprefix = \"fc00:1::/48\"\nsegments = [\"fc00:2::1\"]\n"
+    );
+    let error = parse(&policy).unwrap_err();
+    assert!(error.contains("holds the SID"), "{error}");
+}

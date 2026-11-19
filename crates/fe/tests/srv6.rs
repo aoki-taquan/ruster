@@ -684,3 +684,56 @@ fn an_end_with_next_csid_shifts_the_next_csid_in() {
     // ICMPv6 Parameter Problem, code 4.
     assert_eq!(&out[0].1[14 + 40..14 + 42], &[4, 4]);
 }
+
+#[test]
+fn no_error_goes_to_a_source_that_claims_to_be_the_router() {
+    let mut fe = bench_with_cross_connects();
+    // To End.DT4 with a segment left, from the router's own wan address.
+    let mut frame = to_sid("fc00:1::4", 1, 4, &ipv4(REMOTE, HOST));
+    frame[14 + 8..14 + 24].copy_from_slice(&v6("2001:db8::1").octets());
+    assert_eq!(send(&mut fe, WAN, frame), vec![]);
+}
+
+#[test]
+fn a_hop_by_hop_header_after_another_header_is_dropped() {
+    let mut fe = bench();
+    // IPv6, Destination Options, then Hop-by-Hop (not first), to End.DT4.
+    let inner = ipv4(REMOTE, HOST);
+    let mut frame = WAN_MAC.to_vec();
+    frame.extend_from_slice(&GATEWAY_MAC);
+    frame.extend_from_slice(&[0x86, 0xdd, 0x60, 0, 0, 0]);
+    frame.extend_from_slice(&u16::try_from(16 + inner.len()).unwrap().to_be_bytes());
+    frame.extend_from_slice(&[60, 64]);
+    frame.extend_from_slice(&v6("2001:db8:ff::9").octets());
+    frame.extend_from_slice(&v6("fc00:1::4").octets());
+    frame.extend_from_slice(&[0, 0, 1, 4, 0, 0, 0, 0]);
+    frame.extend_from_slice(&[4, 0, 1, 4, 0, 0, 0, 0]);
+    frame.extend_from_slice(&inner);
+    assert_eq!(send(&mut fe, WAN, frame), vec![]);
+}
+
+#[test]
+fn a_cross_connect_sid_whose_interface_is_missing_drops_its_packets() {
+    let mut fe = bench();
+    let changes = [route(
+        "default",
+        v6("fc00:1::d4").into(),
+        128,
+        RouteAction::Srv6Local(Srv6Local::EndDx4 {
+            interface: "gone".into(),
+            next_hop: Ipv4Addr::from(HOST),
+        }),
+    )];
+    let (a, b) = UnixStream::pair().unwrap();
+    fe.attach(a, writers::ROUTE).unwrap();
+    let mut client = Client::new(b).unwrap();
+    let token = client.patch(&changes).unwrap();
+    assert_eq!(settle(&mut fe, &mut client, token), Code::CHANGED);
+    // Not routed as to no SID (the default route would take it out of wan).
+    let out = send(
+        &mut fe,
+        WAN,
+        to_sid("fc00:1::d4", 0, 4, &ipv4(REMOTE, HOST)),
+    );
+    assert_eq!(out, vec![]);
+}
