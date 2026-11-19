@@ -268,3 +268,63 @@ fn flavors_of_end_and_end_x_become_routes_for_ribd() {
         assert!(error.contains(says), "{says}: {error}");
     }
 }
+
+const L2: &str = r#"
+[[interface]]
+name = "p2"
+mac = "02:00:00:00:01:03"
+
+[[interface]]
+name = "sr0"
+srv6-l2 = { sid = "fc00:1::d2", segments = ["fc00:2::1", "fc00:2::d2"] }
+
+[[interface]]
+name = "br0"
+bridge = { members = ["p2", "sr0"] }
+"#;
+
+#[test]
+fn an_srv6_l2_interface_becomes_the_fe_s_row() {
+    let config = parse(&format!("{INTERFACES}{L2}{GOOD}")).unwrap();
+    let mut confd = Confd::new(Config::default());
+    let [[_, fe], _] = confd.tables_now_and_with(&config);
+    assert_eq!(
+        fe.get(&Key::Srv6L2 {
+            interface: "sr0".into()
+        }),
+        Some(&Value::Srv6L2 {
+            source: "2001:db8::1".parse().unwrap(),
+            sid: "fc00:1::d2".parse().unwrap(),
+            segments: vec!["fc00:2::1".parse().unwrap(), "fc00:2::d2".parse().unwrap()],
+            reduced: false,
+        })
+    );
+    // 1500 less the inner Ethernet header, IPv6 and an SRH of two segments.
+    let sr0 = config.interfaces.iter().find(|i| i.name == "sr0").unwrap();
+    assert_eq!(sr0.mtu, 1500 - 14 - 40 - 40);
+
+    for (from, to, says) in [
+        (
+            "sid = \"fc00:1::d2\"",
+            "sid = \"fc00:9::d2\"",
+            "not in the locator",
+        ),
+        ("sid = \"fc00:1::d2\"", "sid = \"fc00:1::4\"", "another SID"),
+        (
+            "segments = [\"fc00:2::1\", \"fc00:2::d2\"]",
+            "segments = []",
+            "1 to 8",
+        ),
+        (
+            "members = [\"p2\", \"sr0\"]",
+            "members = [\"p2\"]",
+            "member of a bridge",
+        ),
+    ] {
+        let text = format!("{INTERFACES}{}{GOOD}", L2.replacen(from, to, 1));
+        let error = parse(&text).expect_err(says);
+        assert!(error.contains(says), "{says}: {error}");
+    }
+    let error = parse(&format!("{INTERFACES}{L2}")).expect_err("no [srv6]");
+    assert!(error.contains("needs [srv6]"), "{error}");
+}
