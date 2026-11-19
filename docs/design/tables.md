@@ -91,7 +91,7 @@
   PPPoEやトンネルのように相手が一つしかないインターフェースでは、アドレスを書かない。
 - ルータ宛て（local）、黙って捨てる（discard）、ICMP Unreachableを返す（reject）。
 - 別のVRFで引き直す（lookup-vrf）。
-- SRv6のローカルのSID（End、End.X、End.DT4、End.DT6）。次の転送先には、SRv6で包むSIDのリストを付けられる
+- SRv6のローカルのSID（End、End.X、End.DX4、End.DX6、End.DT4、End.DT6、End.DT46）。次の転送先には、SRv6で包むSIDのリストを付けられる
   （[`overlay.md`](overlay.md)の5.）。
 
 VRFをまたぐ転送には二つの方法がある。次の転送先の出力インターフェースが別のVRFに属していれば、

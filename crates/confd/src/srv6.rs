@@ -9,7 +9,7 @@
 //! # Standards
 //!
 //! - RFC 8986 section 3.1: the SIDs are taken from the router's locator.
-//! - RFC 8986 section 4 (End, End.X, End.DT6, End.DT4) and 5.1 and 5.2 (H.Encaps,
+//! - RFC 8986 section 4 (End, End.X, End.DX6, End.DX4, End.DT6, End.DT4, End.DT46) and 5.1 and 5.2 (H.Encaps,
 //!   H.Encaps.Red): the behaviours and their parameters.
 //!
 //! Deviations: the SIDs are in the default VRF, the locator is not announced (no
@@ -135,21 +135,47 @@ pub(crate) fn check(
                     next_hop,
                 }
             }
-            (dt @ ("End.DT4" | "End.DT6"), Some(vrf), None, None) => {
+            (dx @ ("End.DX4" | "End.DX6"), None, Some(interface), Some(next_hop)) => {
+                if !interfaces.iter().any(|i| i.name == interface) {
+                    return Err(format!("{at}: no interface {interface:?}"));
+                }
+                let interface = interface.to_owned();
+                let unicast =
+                    |a: IpAddr| !a.is_unspecified() && !a.is_multicast() && !a.is_loopback();
+                match (dx, next_hop.parse::<IpAddr>()) {
+                    ("End.DX4", Ok(IpAddr::V4(next_hop))) if unicast(next_hop.into()) => {
+                        Srv6Local::EndDx4 {
+                            interface,
+                            next_hop,
+                        }
+                    }
+                    ("End.DX6", Ok(IpAddr::V6(next_hop))) if unicast(next_hop.into()) => {
+                        Srv6Local::EndDx6 {
+                            interface,
+                            next_hop,
+                        }
+                    }
+                    ("End.DX4", _) => {
+                        return Err(format!("{at}: next-hop must be a unicast IPv4 address"))
+                    }
+                    _ => return Err(format!("{at}: next-hop must be a unicast IPv6 address")),
+                }
+            }
+            (dt @ ("End.DT4" | "End.DT6" | "End.DT46"), Some(vrf), None, None) => {
                 if !vrfs.contains(vrf) {
                     return Err(format!("{at}: no interface is in VRF {vrf:?}"));
                 }
                 let vrf = vrf.to_owned();
-                if dt == "End.DT4" {
-                    Srv6Local::EndDt4 { vrf }
-                } else {
-                    Srv6Local::EndDt6 { vrf }
+                match dt {
+                    "End.DT4" => Srv6Local::EndDt4 { vrf },
+                    "End.DT6" => Srv6Local::EndDt6 { vrf },
+                    _ => Srv6Local::EndDt46 { vrf },
                 }
             }
             _ => {
                 return Err(format!(
-                    "{at}: behavior is End, End.X (with interface and next-hop), or End.DT4 or \
-                     End.DT6 (with vrf)"
+                    "{at}: behavior is End, End.X, End.DX4 or End.DX6 (with interface and \
+                     next-hop), or End.DT4, End.DT6 or End.DT46 (with vrf)"
                 ))
             }
         };

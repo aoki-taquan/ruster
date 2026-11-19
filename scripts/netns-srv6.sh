@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # SRv6 between ruster and Linux's seg6: VRF red on both sides, joined over the
 # IPv6 link wan. ruster wraps red's traffic to b (H.Encaps) toward Linux's
-# End.DT4 and End.DT6 SIDs, and Linux wraps the replies toward ruster's.
+# End.DT4 and End.DT6 SIDs, and Linux wraps the replies toward ruster's (also its
+# End.DT46, End.DX4 and End.DX6).
 #
 #   a 192.168.1.10 -- p1 [ruster, p1 in red] wan 2001:db8::1 ==== 2001:db8::2 [Linux, bside in vrf-red] -- b 10.2.0.7
 #     fd00:a::10                                SIDs fc00:1::/48     SIDs fc00:2::/48                    fd00:b::7
 #
 # Checks: IPv4 and IPv6 both ways; Linux's packets through ruster's End and End.X
-# with a two-segment SRH; ruster's two-segment policy through Linux's End; and a
-# Parameter Problem for a packet to an End.DT4 SID with segments left. Run as root
+# with a two-segment SRH; ruster's two-segment policy through Linux's End; Linux's
+# packets to ruster's End.DT46, End.DX4 and End.DX6; and a Parameter Problem for a
+# packet to an End.DT4 SID with segments left. Run as root
 # after `cargo build`:
 #   sudo scripts/netns-srv6.sh [target/debug]
 # FE_BACKEND=af-packet selects the FE's AF_PACKET backend (af-xdp by default).
@@ -142,6 +144,23 @@ sid = "fc00:1::6"
 behavior = "End.DT6"
 vrf = "red"
 
+[[srv6.sid]]
+sid = "fc00:1::46"
+behavior = "End.DT46"
+vrf = "red"
+
+[[srv6.sid]]
+sid = "fc00:1::d4"
+behavior = "End.DX4"
+interface = "p1"
+next-hop = "192.168.1.10"
+
+[[srv6.sid]]
+sid = "fc00:1::d6"
+behavior = "End.DX6"
+interface = "p1"
+next-hop = "fd00:a::10"
+
 [[srv6.policy]]
 prefix = "10.2.0.0/24"
 vrf = "red"
@@ -193,6 +212,20 @@ echo "ok: a two-segment SRH through ruster's End.X"
 back4 fc00:1::1,fc00:1::4
 pings "$b" 192.168.1.10 || pings "$b" 192.168.1.10 || fail "b does not reach a through ruster's End"
 echo "ok: a two-segment SRH through ruster's End"
+
+# To ruster's End.DT46 SID, IPv4 and IPv6, and to its End.DX4 and End.DX6 SIDs,
+# which send the inner packet to a without a lookup.
+back6() { nsx "$linux" ip -6 route replace fd00:a::/64 vrf vrf-red encap seg6 mode encap segs "$1" dev wan; }
+back4 fc00:1::46
+back6 fc00:1::46
+pings "$b" 192.168.1.10 || pings "$b" 192.168.1.10 || fail "b does not reach a through ruster's End.DT46 (IPv4)"
+pings "$b" fd00:a::10 || pings "$b" fd00:a::10 || fail "b does not reach a through ruster's End.DT46 (IPv6)"
+echo "ok: Linux's encap to ruster's End.DT46, IPv4 and IPv6"
+back4 fc00:1::d4
+back6 fc00:1::d6
+pings "$b" 192.168.1.10 || pings "$b" 192.168.1.10 || fail "b does not reach a through ruster's End.DX4"
+pings "$b" fd00:a::10 || pings "$b" fd00:a::10 || fail "b does not reach a through ruster's End.DX6"
+echo "ok: Linux's encap to ruster's End.DX4 and End.DX6"
 
 # To ruster's End.DT4 SID with a segment left: Parameter Problem, code 0, pointing
 # at Segments Left (40 + 3), back to Linux.

@@ -547,6 +547,20 @@ pub enum Srv6Local {
     EndDt6 {
         vrf: String,
     },
+    /// The inner IPv4 or IPv6 packet, routed in `vrf`.
+    EndDt46 {
+        vrf: String,
+    },
+    /// The inner IPv6 packet, out of `interface` to `next_hop`.
+    EndDx6 {
+        interface: String,
+        next_hop: std::net::Ipv6Addr,
+    },
+    /// The inner IPv4 packet, out of `interface` to `next_hop`.
+    EndDx4 {
+        interface: String,
+        next_hop: std::net::Ipv4Addr,
+    },
 }
 
 impl Srv6Local {
@@ -557,6 +571,9 @@ impl Srv6Local {
             Self::EndX { .. } => "End.X",
             Self::EndDt4 { .. } => "End.DT4",
             Self::EndDt6 { .. } => "End.DT6",
+            Self::EndDt46 { .. } => "End.DT46",
+            Self::EndDx6 { .. } => "End.DX6",
+            Self::EndDx4 { .. } => "End.DX4",
         }
     }
 }
@@ -829,8 +846,12 @@ impl Change {
                         }
                         match local {
                             Srv6Local::End => {}
-                            Srv6Local::EndX { interface, .. } => name(interface)?,
-                            Srv6Local::EndDt4 { vrf } | Srv6Local::EndDt6 { vrf } => name(vrf)?,
+                            Srv6Local::EndX { interface, .. }
+                            | Srv6Local::EndDx6 { interface, .. }
+                            | Srv6Local::EndDx4 { interface, .. } => name(interface)?,
+                            Srv6Local::EndDt4 { vrf }
+                            | Srv6Local::EndDt6 { vrf }
+                            | Srv6Local::EndDt46 { vrf } => name(vrf)?,
                         }
                     }
                     Value::Route(RouteAction::Srv6Encap(encap)) => {
@@ -1310,7 +1331,9 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
         Value::Route(action) => {
             e.map(match action {
                 RouteAction::Srv6Local(Srv6Local::End) => 1,
-                RouteAction::Srv6Local(Srv6Local::EndX { .. }) => 3,
+                RouteAction::Srv6Local(
+                    Srv6Local::EndX { .. } | Srv6Local::EndDx6 { .. } | Srv6Local::EndDx4 { .. },
+                ) => 3,
                 RouteAction::Srv6Local(_) => 2,
                 RouteAction::Srv6Encap(_) => 3,
                 _ => 1,
@@ -1786,13 +1809,26 @@ fn encode_srv6_local(e: &mut Encoder, local: &Srv6Local) {
         Srv6Local::EndX {
             interface,
             next_hop,
+        }
+        | Srv6Local::EndDx6 {
+            interface,
+            next_hop,
         } => {
             e.u64(d(sid::ROUTE_SRV6_INTERFACE))
                 .text(interface)
                 .u64(d(sid::ROUTE_SRV6_NEXT_HOP))
                 .text(IpText::of(*next_hop).as_str());
         }
-        Srv6Local::EndDt4 { vrf } | Srv6Local::EndDt6 { vrf } => {
+        Srv6Local::EndDx4 {
+            interface,
+            next_hop,
+        } => {
+            e.u64(d(sid::ROUTE_SRV6_INTERFACE))
+                .text(interface)
+                .u64(d(sid::ROUTE_SRV6_NEXT_HOP))
+                .text(&next_hop.to_string());
+        }
+        Srv6Local::EndDt4 { vrf } | Srv6Local::EndDt6 { vrf } | Srv6Local::EndDt46 { vrf } => {
             e.u64(d(sid::ROUTE_SRV6_VRF)).text(vrf);
         }
     }
@@ -1816,7 +1852,7 @@ struct Srv6Members {
     behaviour: Option<String>,
     vrf: Option<String>,
     interface: Option<String>,
-    next_hop: Option<std::net::Ipv6Addr>,
+    next_hop: Option<IpAddr>,
     source: Option<std::net::Ipv6Addr>,
     segments: Option<Vec<std::net::Ipv6Addr>>,
     reduced: Option<bool>,
@@ -1828,7 +1864,7 @@ impl Srv6Members {
             sid::ROUTE_SRV6_BEHAVIOUR => put(&mut self.behaviour, d.text()?.to_owned()),
             sid::ROUTE_SRV6_VRF => put(&mut self.vrf, d.text()?.to_owned()),
             sid::ROUTE_SRV6_INTERFACE => put(&mut self.interface, d.text()?.to_owned()),
-            sid::ROUTE_SRV6_NEXT_HOP => put(&mut self.next_hop, parse_ipv6(d.text()?)?),
+            sid::ROUTE_SRV6_NEXT_HOP => put(&mut self.next_hop, parse_ip(d.text()?)?),
             sid::ROUTE_SRV6_SOURCE => put(&mut self.source, parse_ipv6(d.text()?)?),
             sid::ROUTE_SRV6_REDUCED => put(&mut self.reduced, d.bool()?),
             _ => {
@@ -1868,12 +1904,21 @@ impl Srv6Members {
         let behaviour = self.behaviour.ok_or(ModelError::Missing("behavior"))?;
         let local = match (behaviour.as_str(), self.vrf, self.interface, self.next_hop) {
             ("End", None, None, None) => Srv6Local::End,
-            ("End.X", None, Some(interface), Some(next_hop)) => Srv6Local::EndX {
+            ("End.X", None, Some(interface), Some(IpAddr::V6(next_hop))) => Srv6Local::EndX {
+                interface,
+                next_hop,
+            },
+            ("End.DX6", None, Some(interface), Some(IpAddr::V6(next_hop))) => Srv6Local::EndDx6 {
+                interface,
+                next_hop,
+            },
+            ("End.DX4", None, Some(interface), Some(IpAddr::V4(next_hop))) => Srv6Local::EndDx4 {
                 interface,
                 next_hop,
             },
             ("End.DT4", Some(vrf), None, None) => Srv6Local::EndDt4 { vrf },
             ("End.DT6", Some(vrf), None, None) => Srv6Local::EndDt6 { vrf },
+            ("End.DT46", Some(vrf), None, None) => Srv6Local::EndDt46 { vrf },
             _ => return Err(ModelError::Invalid("SRv6 behavior and its members")),
         };
         Ok(Some(RouteAction::Srv6Local(local)))
@@ -2140,7 +2185,17 @@ pub fn entry_line(key: &Key, value: &Value) -> Option<String> {
                         interface,
                         next_hop,
                     } => format!("srv6 End.X via {next_hop} dev {interface}"),
-                    Srv6Local::EndDt4 { vrf } | Srv6Local::EndDt6 { vrf } => {
+                    Srv6Local::EndDx6 {
+                        interface,
+                        next_hop,
+                    } => format!("srv6 End.DX6 via {next_hop} dev {interface}"),
+                    Srv6Local::EndDx4 {
+                        interface,
+                        next_hop,
+                    } => format!("srv6 End.DX4 via {next_hop} dev {interface}"),
+                    Srv6Local::EndDt4 { vrf }
+                    | Srv6Local::EndDt6 { vrf }
+                    | Srv6Local::EndDt46 { vrf } => {
                         format!("srv6 {} vrf {vrf}", local.name())
                     }
                 },

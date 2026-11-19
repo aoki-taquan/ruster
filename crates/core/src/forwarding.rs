@@ -1406,6 +1406,9 @@ pub struct ForwardingSnapshot<'a> {
     /// The time NAT, firewall and ICMP limits count by when no ARP resolution
     /// runtime gives one ([`ForwardingSnapshot::with_now`]).
     pub(crate) now: MonotonicMillis,
+    /// The route every IPv4 destination takes instead of its own, for a packet an
+    /// SRv6 End.DX4 SID unwrapped ([`ForwardingSnapshot::with_ipv4_via`]).
+    ipv4_via: Option<Route>,
     /// Per-VRF snapshots and which one each ingress interface uses
     /// ([`ForwardingSnapshot::with_vrfs`]).
     vrfs: Option<VrfSnapshots<'a>>,
@@ -1641,6 +1644,7 @@ impl<'a> ForwardingSnapshot<'a> {
             vlans: &[],
             punt: &[],
             now: MonotonicMillis(0),
+            ipv4_via: None,
             vrfs: None,
             index: None,
             authority: calculate_snapshot_authority(
@@ -1810,6 +1814,30 @@ impl<'a> ForwardingSnapshot<'a> {
     #[must_use]
     pub fn with_now(self, now: MonotonicMillis) -> Self {
         Self { now, ..self }
+    }
+
+    /// The same snapshot, in which an IPv4 packet goes out of `egress` to
+    /// `next_hop` whatever its destination, and is never the router's (an SRv6
+    /// End.DX4 SID's adjacency). Lookups of other addresses (the source's, for
+    /// the ingress checks) are as before.
+    pub(crate) fn with_ipv4_via(self, egress: IfId, next_hop: crate::Ipv4Address) -> Self {
+        let via = Route::new(
+            crate::Ipv4Address::from_octets([0; 4]),
+            0,
+            egress,
+            Some(next_hop),
+        );
+        Self {
+            ipv4_via: via.ok(),
+            ..self
+        }
+    }
+
+    /// The route an IPv4 packet to `destination` takes: its longest-prefix route,
+    /// or the one [`ForwardingSnapshot::with_ipv4_via`] gave.
+    #[inline]
+    pub(crate) fn destination_route(&self, destination: crate::Ipv4Address) -> Option<Route> {
+        self.ipv4_via.or_else(|| self.route_lookup(destination))
     }
 
     /// Drops every IPv6 packet that would be forwarded within this snapshot's VRF or
@@ -2576,6 +2604,7 @@ impl ValidatedForwardingOwner {
             vlans: &[],
             punt: &[],
             now: MonotonicMillis(0),
+            ipv4_via: None,
             vrfs: None,
             index: Some(&self.index),
             authority: self.authority,
@@ -3796,7 +3825,7 @@ where
         let (vrf, via) = match crate::srv6::receive(&mut packet, all_vrfs) {
             Ok(crate::srv6::Received::NotSid) => (None, None),
             Ok(crate::srv6::Received::Forward { via }) => (None, via),
-            Ok(crate::srv6::Received::Unwrapped { vrf }) => (Some(vrf), None),
+            Ok(crate::srv6::Received::Unwrapped { vrf, via }) => (Some(vrf), via),
             Err(rejected) => {
                 let ingress = packet.ingress();
                 let reason = match rejected {
@@ -3826,6 +3855,17 @@ where
             None => all_vrfs.for_ingress(packet.ingress()),
         };
         let snapshot = &snapshot.with_now(all_vrfs.now);
+        // End.DX4: the unwrapped IPv4 packet goes to the SID's adjacency.
+        let ipv4_via =
+            via.filter(|_| packet::read_u16(packet.bytes_mut(), 12) == Some(crate::IPV4_ETHERTYPE));
+        let snapshot = &match ipv4_via {
+            Some((egress, hop)) => {
+                let mut next_hop = [0; 4];
+                next_hop.copy_from_slice(&hop[..4]);
+                snapshot.with_ipv4_via(egress, crate::Ipv4Address::from_octets(next_hop))
+            }
+            None => *snapshot,
+        };
         if let Some(fib) = snapshot.ipv6 {
             if packet::read_u16(packet.bytes_mut(), 12) == Some(crate::IPV6_ETHERTYPE) {
                 let outer = all_vrfs.authority();
@@ -4649,7 +4689,7 @@ fn exceeds_egress_mtu<T: TraceSink>(
             snapshot,
             ingress,
             ipv4,
-            snapshot.route_lookup(ipv4.destination),
+            snapshot.destination_route(ipv4.destination),
             Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded,
             u32::from(mtu),
             runtime,
@@ -5023,15 +5063,16 @@ fn decide_ipv4<T: TraceSink>(
         destination: ipv4.destination,
     });
     validate_ipv4_ingress(snapshot, ingress, ipv4)?;
-    let local = snapshot.is_ipv4_for_router(
-        ingress,
-        ipv4.destination,
-        nat_public_destination(ipv4, nat44_udp_config, nat44_tcp_config, nat44_icmp_config),
-    );
+    let local = snapshot.ipv4_via.is_none()
+        && snapshot.is_ipv4_for_router(
+            ingress,
+            ipv4.destination,
+            nat_public_destination(ipv4, nat44_udp_config, nat44_tcp_config, nat44_icmp_config),
+        );
     let selected_route = if local {
         None
     } else {
-        snapshot.route_lookup(ipv4.destination)
+        snapshot.destination_route(ipv4.destination)
     };
     // A discard route drops silently; a reject route is as no route (Destination
     // Unreachable).
@@ -9173,7 +9214,7 @@ fn truncated_parameter_problem<T: TraceSink>(
     let selected_route = if local {
         None
     } else {
-        let selected_route = snapshot.route_lookup(ipv4.destination);
+        let selected_route = snapshot.destination_route(ipv4.destination);
         if selected_route.is_some_and(|route| route.egress() == IfId::DISCARD) {
             return;
         }

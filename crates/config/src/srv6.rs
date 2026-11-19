@@ -21,13 +21,14 @@ pub struct Srv6 {
 pub struct Srv6Sid {
     /// An IPv6 address in the locator.
     pub sid: String,
-    /// `End`, `End.X`, `End.DT4` or `End.DT6` (RFC 8986 section 10.2's names).
+    /// `End`, `End.X`, `End.DX4`, `End.DX6`, `End.DT4`, `End.DT6` or `End.DT46`
+    /// (RFC 8986 section 10.2's names).
     pub behavior: String,
-    /// None or one: End.DT4's and End.DT6's VRF.
+    /// None or one: the VRF of End.DT4, End.DT6 and End.DT46.
     pub vrf: Vec<String>,
-    /// None or one: End.X's interface.
+    /// None or one: the interface of End.X, End.DX4 and End.DX6.
     pub interface: Vec<String>,
-    /// None or one: End.X's next hop.
+    /// None or one: their next hop.
     pub next_hop: Vec<String>,
 }
 

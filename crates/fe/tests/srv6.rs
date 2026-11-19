@@ -342,3 +342,169 @@ fn routes_with_the_same_policy_share_one_interface() {
         assert_eq!(&out[0].1[14 + 24..14 + 40], &v6(segment).octets());
     }
 }
+
+/// A frame from the WAN gateway to `sid`, with an SRv6 header with `left` segments
+/// left, around `inner` (upper-layer header `next`).
+fn to_sid(sid: &str, left: u8, next: u8, inner: &[u8]) -> Vec<u8> {
+    let mut frame = WAN_MAC.to_vec();
+    frame.extend_from_slice(&GATEWAY_MAC);
+    frame.extend_from_slice(&[0x86, 0xdd, 0x60, 0, 0, 0]);
+    frame.extend_from_slice(&u16::try_from(40 + inner.len()).unwrap().to_be_bytes());
+    frame.extend_from_slice(&[43, 64]);
+    frame.extend_from_slice(&v6("2001:db8:ff::9").octets());
+    frame.extend_from_slice(&v6(sid).octets());
+    frame.extend_from_slice(&[next, 4, 4, left, 1, 0, 0, 0]);
+    frame.extend_from_slice(&v6(sid).octets());
+    frame.extend_from_slice(&v6("fc00:9::1").octets());
+    frame.extend_from_slice(inner);
+    frame
+}
+
+/// An IPv6 UDP packet (no Ethernet header) with Hop Limit 64.
+fn ipv6(source: &str, destination: &str) -> Vec<u8> {
+    let mut ip = vec![0x60, 0, 0, 0, 0, 8, 17, 64];
+    ip.extend_from_slice(&v6(source).octets());
+    ip.extend_from_slice(&v6(destination).octets());
+    ip.extend_from_slice(&[0, 1, 0, 2, 0, 8, 0, 0]);
+    ip
+}
+
+/// The bench with End.DT46 into red, End.DX4 to the LAN host and End.DX6 to the
+/// LAN host's link-local address, and an IPv6 default route in red.
+fn bench_with_cross_connects() -> Fe<SimIo> {
+    let mut fe = bench();
+    let lan_host = v6("fe80::10");
+    let changes = [
+        route(
+            "default",
+            v6("fc00:1::46").into(),
+            128,
+            RouteAction::Srv6Local(Srv6Local::EndDt46 { vrf: "red".into() }),
+        ),
+        route(
+            "default",
+            v6("fc00:1::d4").into(),
+            128,
+            RouteAction::Srv6Local(Srv6Local::EndDx4 {
+                interface: "lan".into(),
+                next_hop: Ipv4Addr::from(HOST),
+            }),
+        ),
+        route(
+            "default",
+            v6("fc00:1::d6").into(),
+            128,
+            RouteAction::Srv6Local(Srv6Local::EndDx6 {
+                interface: "lan".into(),
+                next_hop: lan_host,
+            }),
+        ),
+        route(
+            "red",
+            Ipv6Addr::UNSPECIFIED.into(),
+            0,
+            RouteAction::Forward(vec![NextHop {
+                interface: "lan".into(),
+                address: Some(lan_host.into()),
+            }]),
+        ),
+    ];
+    let neighbor = [Change::set(
+        Key::Neighbor {
+            interface: "lan".into(),
+            address: lan_host.into(),
+        },
+        Value::Neighbor { mac: HOST_MAC },
+    )];
+    for (writer, changes) in [
+        (writers::ROUTE, &changes[..]),
+        (writers::NEIGHBOR, &neighbor[..]),
+    ] {
+        let (a, b) = UnixStream::pair().unwrap();
+        fe.attach(a, writer).unwrap();
+        let mut client = Client::new(b).unwrap();
+        let token = client.patch(changes).unwrap();
+        assert_eq!(settle(&mut fe, &mut client, token), Code::CHANGED);
+    }
+    fe
+}
+
+#[test]
+fn an_end_dt46_sid_unwraps_ipv4_and_ipv6_into_its_vrf() {
+    let mut fe = bench_with_cross_connects();
+    let out = send(
+        &mut fe,
+        WAN,
+        to_sid("fc00:1::46", 0, 4, &ipv4(REMOTE, HOST)),
+    );
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].0, LAN);
+    assert_eq!(&out[0].1[12..14], &[0x08, 0x00]);
+    assert_eq!(&out[0].1[14 + 16..14 + 20], &HOST);
+
+    let inner = ipv6("2001:db8:ff::9", "2001:db8:99::1");
+    let out = send(&mut fe, WAN, to_sid("fc00:1::46", 0, 41, &inner));
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].0, LAN);
+    assert_eq!(&out[0].1[0..6], &HOST_MAC);
+    assert_eq!(&out[0].1[12..14], &[0x86, 0xdd]);
+    assert_eq!(out[0].1[14 + 7], 63, "the inner Hop Limit, decremented");
+    assert_eq!(&out[0].1[14 + 24..14 + 40], &v6("2001:db8:99::1").octets());
+}
+
+#[test]
+fn an_end_dx4_sid_sends_the_inner_ipv4_to_its_next_hop_without_a_lookup() {
+    let mut fe = bench_with_cross_connects();
+    // Red has no route to 10.9.9.9: the SID's next hop is used, not a route.
+    let out = send(
+        &mut fe,
+        WAN,
+        to_sid("fc00:1::d4", 0, 4, &ipv4(REMOTE, [10, 9, 9, 9])),
+    );
+    assert_eq!(out.len(), 1);
+    let (port, sent) = &out[0];
+    assert_eq!(*port, LAN);
+    assert_eq!(&sent[0..6], &HOST_MAC);
+    assert_eq!(&sent[12..14], &[0x08, 0x00]);
+    assert_eq!(sent[14 + 8], 63, "the inner TTL, decremented");
+    assert_eq!(&sent[14 + 16..14 + 20], &[10, 9, 9, 9]);
+
+    // An IPv6 packet inside is not End.DX4's: Parameter Problem back to the source.
+    let inner = ipv6("2001:db8:ff::9", "2001:db8:99::1");
+    let out = send(&mut fe, WAN, to_sid("fc00:1::d4", 0, 41, &inner));
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].0, WAN);
+    // Code 4, SR Upper-layer Header Error.
+    assert_eq!(&out[0].1[14 + 40..14 + 42], &[4, 4]);
+}
+
+#[test]
+fn an_end_dx6_sid_sends_the_inner_ipv6_to_its_next_hop() {
+    let mut fe = bench_with_cross_connects();
+    let inner = ipv6("2001:db8:ff::9", "2001:db8:77::1");
+    let out = send(&mut fe, WAN, to_sid("fc00:1::d6", 0, 41, &inner));
+    assert_eq!(out.len(), 1);
+    let (port, sent) = &out[0];
+    assert_eq!(*port, LAN);
+    assert_eq!(&sent[0..6], &HOST_MAC);
+    assert_eq!(&sent[14 + 24..14 + 40], &v6("2001:db8:77::1").octets());
+}
+
+#[test]
+fn a_cross_connect_sid_with_segments_left_gets_a_parameter_problem() {
+    let mut fe = bench_with_cross_connects();
+    for sid in ["fc00:1::d4", "fc00:1::d6", "fc00:1::46"] {
+        let out = send(&mut fe, WAN, to_sid(sid, 1, 4, &ipv4(REMOTE, HOST)));
+        assert_eq!(out.len(), 1, "{sid}");
+        let (port, error) = &out[0];
+        assert_eq!(*port, WAN, "{sid}");
+        // ICMPv6 Parameter Problem, code 0, pointing at Segments Left.
+        assert_eq!(error[14 + 6], 58, "{sid}");
+        assert_eq!(&error[14 + 40..14 + 42], &[4, 0], "{sid}");
+        assert_eq!(
+            &error[14 + 44..14 + 48],
+            &(40_u32 + 3).to_be_bytes(),
+            "{sid}"
+        );
+    }
+}
