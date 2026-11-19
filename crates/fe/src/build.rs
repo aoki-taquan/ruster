@@ -77,7 +77,7 @@ pub(crate) struct Built {
     /// The classes of the punt table.
     pub(crate) punt: crate::punt_table::Classes,
     /// The bridges by name, in name order, and the static entries of their MAC
-    /// address tables (bridge index, address, member).
+    /// address tables (bridge index, address, member, the remote VTEP on a VXLAN member).
     pub(crate) bridges: Vec<(String, ruster_core::BridgeConfig)>,
     pub(crate) bridge_statics: Vec<(u16, [u8; 6], IfId, Option<IpAddr>)>,
     /// The router's SRv6 SIDs and SR policies.
@@ -1077,8 +1077,11 @@ pub(crate) fn build(
                     _ => false,
                 };
                 if !fits {
+                    let vtep = vtep.map_or_else(|| "none".to_owned(), |v| v.to_string());
                     return Err(format!(
-                        "bridge {bridge}: static MAC on {interface} needs a VTEP of it if and only if it is a VXLAN interface"
+                        "bridge {bridge}: static MAC {} on {interface} has VTEP {vtep}: one of \
+                         the interface's VTEPs on a VXLAN interface, none on any other",
+                        table::format_mac(mac)
                     ));
                 }
                 if bridges[at].1.members.contains(&member) {
