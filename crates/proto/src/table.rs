@@ -987,8 +987,13 @@ impl Change {
                         if encap.segments.is_empty() || encap.segments.len() > SRV6_SEGMENTS_MAX {
                             return Err(ModelError::Invalid("number of SRv6 segments"));
                         }
+                        // Global unicast only: a link-local one names no node across
+                        // the SR domain.
                         let unusable = |a: &std::net::Ipv6Addr| {
-                            a.is_unspecified() || a.is_loopback() || a.is_multicast()
+                            a.is_unspecified()
+                                || a.is_loopback()
+                                || a.is_multicast()
+                                || a.is_unicast_link_local()
                         };
                         if unusable(&encap.source) || encap.segments.iter().any(unusable) {
                             return Err(ModelError::Invalid("SRv6 address"));

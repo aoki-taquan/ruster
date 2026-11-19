@@ -1255,9 +1255,7 @@ pub(crate) fn build(
                         {
                             sid_vrfs.insert(vrf.clone());
                         }
-                        if let Some(sid) = srv6_sid(*prefix, *len, local, &active, index_of)? {
-                            sids.push(sid);
-                        }
+                        sids.push(srv6_sid(*prefix, *len, local, &active, index_of)?);
                         continue;
                     }
                     RouteAction::Srv6Encap(encap) => {
@@ -1612,7 +1610,7 @@ fn srv6_sid(
     local: &table::Srv6Local,
     active: &BTreeMap<&str, (IfId, &str)>,
     index_of: impl Fn(&str) -> Option<usize>,
-) -> Result<Option<ruster_core::Srv6Sid>, String> {
+) -> Result<ruster_core::Srv6Sid, String> {
     use ruster_core::Srv6Behaviour;
     let vrf = |name: &str| {
         index_of(name)
@@ -1653,7 +1651,6 @@ fn srv6_sid(
     };
     let prefix = v6(prefix).ok_or_else(|| format!("SRv6 SID {prefix}/{len}: not IPv6"))?;
     ruster_core::Srv6Sid::new(prefix, len, behaviour)
-        .map(Some)
         .map_err(|e| format!("SRv6 SID {}/{len}: {e:?}", IpAddr::V6(prefix.into())))
 }
 
