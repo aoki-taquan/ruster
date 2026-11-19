@@ -4,8 +4,9 @@
 //!
 //! An EtherIP interface carries a bridge's frames inside IP from one of the
 //! router's addresses to one remote end. It is only a bridge member, so it has no
-//! address of its own; its MTU leaves room for the outer headers on a 1500-byte
-//! link.
+//! address of its own; its MTU leaves room for the outer headers on the largest
+//! link the outer packets can leave through (an enabled port or VLAN of the
+//! default VRF, at most 1500).
 //!
 //! # Standards
 //!
@@ -13,7 +14,7 @@
 //!
 //! Deviations: the local address must be an address given to an interface of the
 //! default VRF (not one a DHCP client or PPPoE session finds), and the outer
-//! packets are never fragmented, so the MTU is at most 1500 less the outer headers.
+//! packets are never fragmented, so the MTU is at most the largest link's less the outer headers.
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -31,7 +32,8 @@ pub struct EtherIp {
     pub remote: IpAddr,
 }
 
-/// The most the FE takes on a link (frames of up to 1514 bytes).
+/// The most the FE takes on a link (frames of up to 1514 bytes): the largest MTU
+/// the outer packets of a tunnel bridge member can have.
 pub(crate) const LINK_MTU: u16 = 1_500;
 
 pub(crate) fn unicast(address: IpAddr) -> bool {
@@ -69,6 +71,7 @@ pub(crate) fn check(
     entries: Vec<(String, String, String)>,
     interfaces: &[InterfaceConfig],
     bridges: &[crate::bridge::Bridge],
+    link_mtu: u16,
 ) -> Result<Vec<EtherIp>, String> {
     let mut out: Vec<EtherIp> = Vec::with_capacity(entries.len());
     for (name, local, remote) in entries {
@@ -107,10 +110,10 @@ pub(crate) fn check(
             .iter()
             .find(|i| i.name == name)
             .map_or(0, |i| i.mtu);
-        if mtu > LINK_MTU - overhead {
+        if mtu > link_mtu - overhead {
             return Err(format!(
-                "{at}: mtu must be at most {} (1500 less the outer headers)",
-                LINK_MTU - overhead
+                "{at}: mtu must be at most {} ({link_mtu}, the largest MTU of the links, less the outer headers)",
+                link_mtu - overhead
             ));
         }
         if out.iter().any(|e| e.local == local && e.remote == remote) {

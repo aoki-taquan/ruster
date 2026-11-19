@@ -197,3 +197,28 @@ fn a_static_address_on_a_vxlan_member_is_behind_one_of_its_vteps() {
         })
     );
 }
+
+#[test]
+fn the_mtu_leaves_room_for_the_outer_headers_on_the_largest_link() {
+    // Both links at 1400: a VXLAN interface of the default MTU (1450) does not fit.
+    let small = WAN
+        .replace(
+            "ipv6 = [\"2001:db8::1/64\"]\n",
+            "ipv6 = [\"2001:db8::1/64\"]\nmtu = 1400\n",
+        )
+        .replace(
+            "mac = \"02:00:00:00:01:02\"\n",
+            "mac = \"02:00:00:00:01:02\"\nmtu = 1400\n",
+        );
+    let vxlan = r#"vxlan = { vni = 100, local = "192.0.2.1", remote = ["198.51.100.2"] }"#;
+    let text = with(vxlan, MEMBERS).replacen(WAN, &small, 1);
+    let error = parse(&text).unwrap_err();
+    assert!(error.contains("at most 1350 (1400"), "{error}");
+    // Given a fitting MTU, it is taken.
+    let fitting = text.replacen(
+        "remote = [\"198.51.100.2\"] }",
+        "remote = [\"198.51.100.2\"] }\nmtu = 1350",
+        1,
+    );
+    assert!(parse(&fitting).is_ok(), "{:?}", parse(&fitting).err());
+}

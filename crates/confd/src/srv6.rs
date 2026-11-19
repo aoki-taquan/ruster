@@ -62,8 +62,8 @@ pub(crate) fn check(
     lock: Vec<ruster_config::Srv6>,
     interfaces: &[InterfaceConfig],
     static_routes: &[StaticRoute],
-    l2: Vec<L2Entry>,
-    bridges: &[crate::bridge::Bridge],
+    (l2, bridges): (Vec<L2Entry>, &[crate::bridge::Bridge]),
+    link_mtu: u16,
 ) -> Result<Srv6, String> {
     if lock.len() > 1 {
         return Err("srv6: give it once".to_owned());
@@ -305,15 +305,15 @@ pub(crate) fn check(
                 "{at}: an SRv6 L2 interface must be a member of a bridge"
             ));
         }
-        let most = crate::etherip::LINK_MTU
-            .saturating_sub(ruster_config::srv6_l2_overhead(segments.len(), reduced));
+        let most =
+            link_mtu.saturating_sub(ruster_config::srv6_l2_overhead(segments.len(), reduced));
         let mtu = interfaces
             .iter()
             .find(|i| i.name == name)
             .map_or(0, |i| i.mtu);
         if mtu > most {
             return Err(format!(
-                "{at}: mtu must be at most {most} (1500 less the outer headers)"
+                "{at}: mtu must be at most {most} ({link_mtu}, the largest MTU of the links, less the outer headers)"
             ));
         }
         out.l2.push((
