@@ -93,6 +93,7 @@
 //! # In bridge, optional:
 //! # aging-time = 300 (seconds a learned address is used without being seen),
 //! # max-learned = 4096, static-mac = [{ mac = "02:...", interface = "lan" }]
+//! # (on a VXLAN member also vtep = "198.51.100.2", one of its remotes)
 //!
 //! [map-e]                      # a MAP-E CE (instead of [nat] and a tunnel)
 //! interface = "map"            # the tunnel interface it makes
@@ -610,7 +611,7 @@ pub const VERSION: u32 = 1;
 ///
 /// A new key also goes into `tests/data/every-key.lock` (the test reads it with every
 /// key required, and checks that every list in it has an item).
-pub const LOCK_SHAPE: u64 = 0x7788_a209_aa63_df6b;
+pub const LOCK_SHAPE: u64 = 0x5169_3d49_6ac1_5b98;
 
 /// A bridge's ageing time, in seconds (IEEE 802.1Q 8.8.3, the recommended value).
 pub const BRIDGE_AGING_TIME: u32 = 300;
@@ -985,6 +986,10 @@ pub struct Bridge {
 pub struct StaticMac {
     pub mac: String,
     pub interface: String,
+    /// None or one: the remote VTEP the address is behind, on a VXLAN member. A
+    /// lock written before it was added has none.
+    #[serde(default)]
+    pub vtep: Vec<String>,
 }
 
 /// A MAP-E CE (RFC 7597): one Basic Mapping Rule, the delegated prefix, the BR.

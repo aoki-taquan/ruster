@@ -59,7 +59,8 @@ fn a_bridge_becomes_its_rows_and_its_own_interface() {
             mac: [2, 0, 0, 0, 0, 0x55]
         }),
         Some(&Value::BridgeMac {
-            interface: "p1".into()
+            interface: "p1".into(),
+            vtep: None,
         })
     );
     assert!(tables.contains_key(&Key::Address {

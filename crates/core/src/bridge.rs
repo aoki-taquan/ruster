@@ -268,14 +268,15 @@ impl MacTable {
     /// table change. Bridge `new` was bridge `old_of_new[new]` before (`None` for a new
     /// one): it keeps its counters and learned entries, but only those whose member
     /// (and remote VTEP) `keep(new, member, vtep)` allows. Static entries are replaced by `statics` (bridge,
-    /// address, member); those beyond the capacity are left out and their number
+    /// address, member, the remote VTEP behind a VXLAN member); those beyond the
+    /// capacity are left out and their number
     /// returned.
     pub fn republish(
         &mut self,
         bridges: &[BridgeLimits],
         old_of_new: &[Option<u16>],
         keep: impl Fn(u16, IfId, Option<IpAddr>) -> bool,
-        statics: &[(u16, [u8; 6], IfId)],
+        statics: &[(u16, [u8; 6], IfId, Option<IpAddr>)],
     ) -> usize {
         // An empty table is all `EMPTY` already (`remove` leaves `EMPTY` behind):
         // with nothing learned, nothing is gone through slot by slot.
@@ -304,7 +305,7 @@ impl MacTable {
             })
             .collect();
         let mut left_out = 0;
-        for &(bridge, mac, member) in statics {
+        for &(bridge, mac, member, vtep) in statics {
             if usize::from(bridge) >= self.bridges.len() || self.find(bridge, &mac).is_some() {
                 continue;
             }
@@ -318,7 +319,7 @@ impl MacTable {
                 bridge,
                 mac,
                 member,
-                vtep: None,
+                vtep,
                 seen_ms: 0,
             });
         }
@@ -649,7 +650,7 @@ impl Bridges {
         &mut self,
         bridges: Vec<BridgeConfig>,
         old_of_new: &[Option<u16>],
-        statics: &[(u16, [u8; 6], IfId)],
+        statics: &[(u16, [u8; 6], IfId, Option<IpAddr>)],
         vtep_kept: impl Fn(IfId, IpAddr) -> bool,
     ) -> usize {
         let size = |ids: &mut dyn Iterator<Item = IfId>| ids.map(|id| usize::from(id.0) + 1).max();
@@ -1036,7 +1037,7 @@ mod tests {
             }],
             &[Some(0)],
             |_, member, _| member != P1,
-            &[(0, s, P3)],
+            &[(0, s, P3, None)],
         );
         assert_eq!(left, 0);
         // The learned entries on P1 went; the counters stayed.

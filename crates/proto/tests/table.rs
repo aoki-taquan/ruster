@@ -1431,6 +1431,7 @@ fn bridge_entries_round_trip_and_are_checked() {
             },
             Value::BridgeMac {
                 interface: "p1".into(),
+                vtep: None,
             },
         ),
         Change::delete(Key::BridgeMac {
@@ -1476,6 +1477,7 @@ fn bridge_entries_round_trip_and_are_checked() {
             },
             Value::BridgeMac {
                 interface: "p1".into(),
+                vtep: None,
             },
         ),
         Change::set(
@@ -1484,6 +1486,7 @@ fn bridge_entries_round_trip_and_are_checked() {
             },
             Value::BridgeMac {
                 interface: "p1".into(),
+                vtep: None,
             },
         ),
     ];

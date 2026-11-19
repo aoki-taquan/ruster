@@ -232,9 +232,11 @@ pub enum Value {
     BridgePort {
         bridge: String,
     },
-    /// The address is on member `interface`.
+    /// The address is on member `interface` (behind remote VTEP `vtep`, on a
+    /// VXLAN member).
     BridgeMac {
         interface: String,
+        vtep: Option<IpAddr>,
     },
     /// EtherIP from the router's address `local` to `remote` (the same family),
     /// routed in the default VRF.
@@ -1007,8 +1009,11 @@ impl Change {
                             }
                         }
                     }
-                    Value::BridgeMac { interface } => {
+                    Value::BridgeMac { interface, vtep } => {
                         name(interface)?;
+                        if vtep.is_some_and(|v| v.is_unspecified() || v.is_multicast()) {
+                            return Err(ModelError::Invalid("static MAC address's VTEP"));
+                        }
                         if let Key::BridgeMac { mac, .. } = &self.key {
                             if mac[0] & 1 != 0 || *mac == [0; 6] {
                                 return Err(ModelError::Invalid("static MAC address"));
@@ -1666,10 +1671,14 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
                 .u64(sid::BRIDGE_PORT_BRIDGE - sid::BRIDGE_PORT)
                 .text(bridge);
         }
-        Value::BridgeMac { interface } => {
-            e.map(1)
+        Value::BridgeMac { interface, vtep } => {
+            e.map(1 + u64::from(vtep.is_some()))
                 .u64(sid::BRIDGE_MAC_PORT - sid::BRIDGE_MAC)
                 .text(interface);
+            if let Some(vtep) = vtep {
+                e.u64(sid::BRIDGE_MAC_VTEP - sid::BRIDGE_MAC)
+                    .text(&vtep.to_string());
+            }
         }
         Value::Vxlan {
             vni,
@@ -2360,8 +2369,9 @@ pub fn entry_line(key: &Key, value: &Value) -> Option<String> {
         (Key::BridgePort { interface }, Value::BridgePort { bridge }) => {
             format!("bridge-port {interface} bridge {bridge}")
         }
-        (Key::BridgeMac { bridge, mac }, Value::BridgeMac { interface }) => {
-            format!("bridge-mac {bridge} {} {interface}", format_mac(mac))
+        (Key::BridgeMac { bridge, mac }, Value::BridgeMac { interface, vtep }) => {
+            let vtep = vtep.map(|v| format!(" vtep {v}")).unwrap_or_default();
+            format!("bridge-mac {bridge} {} {interface}{vtep}", format_mac(mac))
         }
         (Key::EtherIp { interface }, Value::EtherIp { local, remote }) => {
             format!("etherip {interface} {local} to {remote}")
@@ -2528,6 +2538,9 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
     } else if table == sid::BRIDGE_MAC {
         Value::BridgeMac {
             interface: text(sid::BRIDGE_MAC_PORT, "port")?.ok_or(ModelError::Missing("port"))?,
+            vtep: text(sid::BRIDGE_MAC_VTEP, "vtep")?
+                .map(|t| parse_ip(&t))
+                .transpose()?,
         }
     } else if table == sid::ETHERIP {
         let mut address = |member: u64, what: &'static str| {

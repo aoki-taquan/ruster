@@ -12,7 +12,7 @@
 //!
 //! Deviations: the remote VTEPs are a list (no multicast underlay, RFC 7348 section
 //! 4.2); the local address must be an address given to an interface of the default
-//! VRF; and no static MAC address on it (it would need a VTEP).
+//! VRF. A static MAC address on it is behind one of its VTEPs.
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -97,8 +97,18 @@ pub(crate) fn check(
                 other.name, bridge.name
             ));
         }
-        if bridge.statics.iter().any(|(_, member)| *member == name) {
-            return Err(format!("{at}: a static-mac cannot be on a VXLAN interface"));
+        // A static address on it is behind one of its VTEPs.
+        for (mac, _, vtep) in bridge
+            .statics
+            .iter()
+            .filter(|(_, member, _)| *member == name)
+        {
+            if !vtep.is_some_and(|v| remotes.contains(&v)) {
+                return Err(format!(
+                    "{at}: static-mac {} must give a vtep of its remotes",
+                    ruster_proto::table::format_mac(mac)
+                ));
+            }
         }
         let overhead = if local.is_ipv4() {
             ruster_config::VXLAN_OVERHEAD_IPV4
@@ -129,6 +139,18 @@ pub(crate) fn check(
             remotes,
             port,
         });
+    }
+    // A VTEP only on a VXLAN member's static address.
+    for bridge in bridges {
+        for (mac, member, vtep) in &bridge.statics {
+            if vtep.is_some() && !out.iter().any(|v| v.name == *member) {
+                return Err(format!(
+                    "bridge {:?}: static-mac {} gives a vtep, but {member:?} is no VXLAN interface",
+                    bridge.name,
+                    ruster_proto::table::format_mac(mac)
+                ));
+            }
+        }
     }
     Ok(out)
 }

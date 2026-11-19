@@ -166,6 +166,8 @@ pub const BRIDGE_PORT_BRIDGE: u64 = 60251;
 /// A static entry of a bridge's MAC address table (`filtering-database/filtering-entry`).
 pub const BRIDGE_MAC: u64 = 60260;
 pub const BRIDGE_MAC_PORT: u64 = 60261;
+/// The remote VTEP of a static entry on a VXLAN member.
+pub const BRIDGE_MAC_VTEP: u64 = 60262;
 /// `ruster-if-tunnel`: an EtherIP interface (RFC 3378), by interface, its local and
 /// remote addresses.
 pub const ETHERIP: u64 = 60270;
@@ -355,6 +357,7 @@ pub const ALL: &[(&str, u64)] = &[
     ("/ruster-bridge:bridge-ports/bridge-port/bridge-name", BRIDGE_PORT_BRIDGE),
     ("/ruster-bridge:bridges/bridge/filtering-entry", BRIDGE_MAC),
     ("/ruster-bridge:bridges/bridge/filtering-entry/port", BRIDGE_MAC_PORT),
+    ("/ruster-bridge:bridges/bridge/filtering-entry/vtep", BRIDGE_MAC_VTEP),
     ("/ruster-if-tunnel:etherip", ETHERIP),
     ("/ruster-if-tunnel:etherip/local", ETHERIP_LOCAL),
     ("/ruster-if-tunnel:etherip/remote", ETHERIP_REMOTE),
