@@ -155,7 +155,7 @@ behavior = "End"
 flavors = ["PSP"]
 
 [[srv6.sid]]
-sid = "fc00:1::"
+sid = "fc00:1:1::"
 behavior = "End"
 flavors = ["NEXT-CSID"]
 csid-structure = [32, 16]
@@ -236,9 +236,9 @@ pings "$b" 192.168.1.10 || pings "$b" 192.168.1.10 || fail "b does not reach a t
 echo "ok: a two-segment SRH through ruster's End with PSP"
 
 # Compressed SIDs (RFC 9800, a 32-bit block fc00:1 and 16-bit CSIDs): Linux sends
-# to the container fc00:1:0:4::, whose first CSID (0) is ruster's End with
+# to the container fc00:1:1:4::, whose first CSID (1) is ruster's End with
 # NEXT-CSID; it shifts the next in, fc00:1:4::, ruster's End.DT4.
-back4 fc00:1:0:4::
+back4 fc00:1:1:4::
 pings "$b" 192.168.1.10 || pings "$b" 192.168.1.10 || fail "b does not reach a through ruster's End with NEXT-CSID"
 echo "ok: a container of compressed SIDs through ruster's End with NEXT-CSID"
 

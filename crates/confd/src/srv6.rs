@@ -175,6 +175,45 @@ pub(crate) fn check(
                 "{at}: bits are set after the block and the CSID ({len} bits)"
             ));
         }
+        // A NEXT-CSID SID is a prefix: every packet into it is taken as compressed
+        // SIDs, so it stays in the locator and covers none of the router's own
+        // addresses or the default VRF's longer routes.
+        if flavors.next_csid.is_some() {
+            let inside = |address: IpAddr| {
+                address.is_ipv6() && ruster_proto::table::network(address, len) == IpAddr::V6(sid)
+            };
+            if len < locator_len {
+                return Err(format!(
+                    "{at}: its {len} bits are fewer than the locator's {locator_len}"
+                ));
+            }
+            if own.iter().any(|a| inside(IpAddr::V6(*a))) {
+                return Err(format!(
+                    "{at}: its prefix covers an address of an interface"
+                ));
+            }
+            let routes = static_routes
+                .iter()
+                .filter(|r| r.vrf == DEFAULT_VRF)
+                .map(|r| (r.prefix, r.len))
+                .chain(
+                    interfaces
+                        .iter()
+                        .filter(|i| i.vrf == DEFAULT_VRF)
+                        .flat_map(|i| {
+                            i.ipv6
+                                .iter()
+                                .map(|&(a, l)| (ruster_proto::table::network(IpAddr::V6(a), l), l))
+                        }),
+                );
+            for (prefix, plen) in routes {
+                if plen > len && inside(prefix) {
+                    return Err(format!(
+                        "{at}: its prefix covers the default VRF's route {prefix}/{plen}"
+                    ));
+                }
+            }
+        }
         if flavors != Srv6Flavors::default() && !matches!(entry.behavior.as_str(), "End" | "End.X")
         {
             return Err(format!("{at}: only End and End.X take flavors"));
@@ -311,6 +350,20 @@ pub(crate) fn check(
         if own.contains(&sid) || used {
             return Err(format!(
                 "{at}: srv6-l2 sid is an address of an interface or another SID"
+            ));
+        }
+        let covered = out.sids.iter().any(|(other, local)| match local {
+            Srv6Local::End { flavors } | Srv6Local::EndX { flavors, .. }
+                if flavors.next_csid.is_some() =>
+            {
+                ruster_proto::table::network(IpAddr::V6(sid), sid_len(flavors))
+                    == IpAddr::V6(*other)
+            }
+            _ => false,
+        });
+        if covered {
+            return Err(format!(
+                "{at}: srv6-l2 sid is inside a NEXT-CSID SID's prefix"
             ));
         }
         if taken.contains(&(DEFAULT_VRF.to_owned(), IpAddr::V6(sid), 128)) {

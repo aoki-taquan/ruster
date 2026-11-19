@@ -357,6 +357,11 @@ fn a_next_csid_sid_is_a_route_of_its_block_and_csid() {
         ("csid-structure = [32, 16]\n", "", "needs csid-structure"),
         ("flavors = [\"NEXT-CSID\"]\n", "", "only for NEXT-CSID"),
         ("sid = \"fc00:1::\"", "sid = \"fc00:1::5\"", "bits are set"),
+        (
+            "csid-structure = [32, 16]",
+            "csid-structure = [16, 16]",
+            "fewer than the locator's",
+        ),
     ] {
         let error = parse(&format!("{INTERFACES}{}", text.replacen(from, to, 1))).unwrap_err();
         assert!(error.contains(says), "{says}: {error}");

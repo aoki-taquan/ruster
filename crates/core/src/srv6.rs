@@ -389,10 +389,9 @@ pub(crate) fn receive<S: PacketSlot>(
         return Ok(Received::NotSid);
     }
     let lookup = |destination: [u8; 16]| -> Option<Srv6Sid> {
-        if let Some(sid) = table.and_then(|t| t.sid(destination)) {
-            return Some(*sid);
-        }
-        snapshot.overlays.iter().find_map(|o| match o.kind {
+        // An SRv6 L2 interface's SID (a /128) first: a NEXT-CSID SID's prefix may
+        // cover it.
+        let member = snapshot.overlays.iter().find_map(|o| match o.kind {
             crate::OverlayKind::Srv6L2 { sid, .. } if sid == destination => Some(Srv6Sid {
                 prefix: sid,
                 len: 128,
@@ -401,7 +400,8 @@ pub(crate) fn receive<S: PacketSlot>(
                 },
             }),
             _ => None,
-        })
+        });
+        member.or_else(|| table.and_then(|t| t.sid(destination)).copied())
     };
     let ingress = packet.ingress();
     if snapshot.vrf_of(ingress) != 0 || snapshot.is_kernel_ingress(ingress) {
