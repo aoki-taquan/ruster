@@ -377,3 +377,33 @@ fn another_udp_port_is_sent_to_and_received_on() {
         .all(|(port, _)| *port != P1));
     assert_eq!(bench.send(WAN, on(8472)), vec![(P1, b)]);
 }
+
+#[test]
+fn a_static_address_on_a_vxlan_member_goes_to_its_vtep_only() {
+    let mut bench = Bench::with(&[Change::set(
+        Key::BridgeMac {
+            bridge: "br0".into(),
+            mac: H2,
+        },
+        Value::BridgeMac {
+            interface: "vx0".into(),
+            vtep: Some(IpAddr::from(VTEP3)),
+        },
+    )]);
+    let c = frame(H2, H1, 100);
+    let out = bench.send(P1, c.clone());
+    assert_eq!(out.len(), 1);
+    assert_eq!(vtep_of(&out[0].1, &c), VTEP3);
+    // A VTEP that is not the member's is refused.
+    let code = bench.try_change(&[Change::set(
+        Key::BridgeMac {
+            bridge: "br0".into(),
+            mac: H2,
+        },
+        Value::BridgeMac {
+            interface: "vx0".into(),
+            vtep: Some(IpAddr::from([203, 0, 113, 99])),
+        },
+    )]);
+    assert_ne!(code, Code::CHANGED);
+}

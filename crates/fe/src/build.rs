@@ -79,7 +79,7 @@ pub(crate) struct Built {
     /// The bridges by name, in name order, and the static entries of their MAC
     /// address tables (bridge index, address, member).
     pub(crate) bridges: Vec<(String, ruster_core::BridgeConfig)>,
-    pub(crate) bridge_statics: Vec<(u16, [u8; 6], IfId)>,
+    pub(crate) bridge_statics: Vec<(u16, [u8; 6], IfId, Option<IpAddr>)>,
     /// The router's SRv6 SIDs and SR policies.
     pub(crate) srv6: ruster_core::Srv6Table,
 }
@@ -1061,11 +1061,33 @@ pub(crate) fn build(
         }
     }
     for (key, value) in store.table(sid::BRIDGE_MAC) {
-        if let (Key::BridgeMac { bridge, mac }, Value::BridgeMac { interface }) = (key, value) {
+        if let (Key::BridgeMac { bridge, mac }, Value::BridgeMac { interface, vtep }) = (key, value)
+        {
             let member = active.get(interface.as_str()).map(|&(id, _)| id);
             if let (Some(at), Some(member)) = (bridge_at(bridge), member) {
+                // On a VXLAN member, behind one of its VTEPs; on any other, behind
+                // none.
+                let vxlan = overlays
+                    .iter()
+                    .find(|o| o.interface == member)
+                    .filter(|o| o.is_vxlan());
+                let fits = match (vxlan, vtep) {
+                    (Some(overlay), Some(vtep)) => overlay.remotes().contains(vtep),
+                    (None, None) => true,
+                    _ => false,
+                };
+                if !fits {
+                    return Err(format!(
+                        "bridge {bridge}: static MAC on {interface} needs a VTEP of it if and only if it is a VXLAN interface"
+                    ));
+                }
                 if bridges[at].1.members.contains(&member) {
-                    bridge_statics.push((u16::try_from(at).unwrap_or(u16::MAX), *mac, member));
+                    bridge_statics.push((
+                        u16::try_from(at).unwrap_or(u16::MAX),
+                        *mac,
+                        member,
+                        *vtep,
+                    ));
                 }
             }
         }

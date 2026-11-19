@@ -25,7 +25,8 @@ pub struct Bridge {
     pub aging_s: u32,
     pub max_learned: u32,
     /// Addresses fixed to a member.
-    pub statics: Vec<([u8; 6], String)>,
+    /// Address, member, and the remote VTEP behind it (a VXLAN member's).
+    pub statics: Vec<([u8; 6], String, Option<std::net::IpAddr>)>,
 }
 
 /// Checks the bridges (the interface's name and its `bridge`) against the
@@ -102,10 +103,25 @@ pub(crate) fn check(
                     fixed.mac, fixed.interface
                 ));
             }
-            if statics.iter().any(|(m, _)| *m == mac) {
+            if statics.iter().any(|(m, _, _)| *m == mac) {
                 return Err(format!("{at}: static-mac {:?} is given twice", fixed.mac));
             }
-            statics.push((mac, fixed.interface));
+            if fixed.vtep.len() > 1 {
+                return Err(format!(
+                    "{at}: static-mac {:?} has one vtep at most",
+                    fixed.mac
+                ));
+            }
+            let vtep = match fixed.vtep.first() {
+                Some(text) => Some(text.parse().map_err(|_| {
+                    format!(
+                        "{at}: static-mac {:?}: vtep {text:?} is not an IP address",
+                        fixed.mac
+                    )
+                })?),
+                None => None,
+            };
+            statics.push((mac, fixed.interface, vtep));
         }
         bridges.push(Bridge {
             name,
@@ -173,7 +189,7 @@ pub(crate) fn tables(bridges: &[Bridge], out: &mut BTreeMap<Key, Value>) {
                 },
             );
         }
-        for (mac, interface) in &bridge.statics {
+        for (mac, interface, vtep) in &bridge.statics {
             out.insert(
                 Key::BridgeMac {
                     bridge: bridge.name.clone(),
@@ -181,6 +197,7 @@ pub(crate) fn tables(bridges: &[Bridge], out: &mut BTreeMap<Key, Value>) {
                 },
                 Value::BridgeMac {
                     interface: interface.clone(),
+                    vtep: *vtep,
                 },
             );
         }

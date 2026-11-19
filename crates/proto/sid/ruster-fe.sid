@@ -589,6 +589,12 @@
       },
       {
         "namespace": "data",
+        "identifier": "/ruster-bridge:bridges/bridge/filtering-entry/vtep",
+        "sid": 60262,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
         "identifier": "/ruster-if-tunnel:etherip",
         "sid": 60270,
         "status": "unstable"

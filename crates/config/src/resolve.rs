@@ -175,7 +175,15 @@ struct BridgeEntry {
     aging_time: Option<u32>,
     max_learned: Option<u32>,
     #[serde(default)]
-    static_mac: Vec<crate::StaticMac>,
+    static_mac: Vec<StaticMacEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StaticMacEntry {
+    mac: String,
+    interface: String,
+    vtep: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -303,7 +311,15 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
                     members: bridge.members,
                     aging_time: bridge.aging_time.unwrap_or(crate::BRIDGE_AGING_TIME),
                     max_learned: bridge.max_learned.unwrap_or(crate::BRIDGE_MAX_LEARNED),
-                    static_mac: bridge.static_mac,
+                    static_mac: bridge
+                        .static_mac
+                        .into_iter()
+                        .map(|s| crate::StaticMac {
+                            mac: s.mac,
+                            interface: s.interface,
+                            vtep: s.vtep.into_iter().collect(),
+                        })
+                        .collect(),
                 })
             }
             _ if entry.bridge.is_some() => {

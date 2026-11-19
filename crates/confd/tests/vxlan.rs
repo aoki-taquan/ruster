@@ -122,7 +122,17 @@ fn bad_vxlan_interfaces_are_refused() {
         (
             good,
             r#"members = ["vx0", "p1"], static-mac = [{ mac = "02:00:00:00:00:55", interface = "vx0" }]"#,
-            "static-mac",
+            "must give a vtep",
+        ),
+        (
+            good,
+            r#"members = ["vx0", "p1"], static-mac = [{ mac = "02:00:00:00:00:55", interface = "vx0", vtep = "198.51.100.9" }]"#,
+            "must give a vtep",
+        ),
+        (
+            good,
+            r#"members = ["vx0", "p1"], static-mac = [{ mac = "02:00:00:00:00:55", interface = "p1", vtep = "198.51.100.2" }]"#,
+            "no VXLAN interface",
         ),
         (
             "vxlan = { vni = 100, local = \"192.0.2.1\", remote = [\"198.51.100.2\"] }\nmtu = 1451",
@@ -165,4 +175,25 @@ fn a_bridge_of_tunnels_only_needs_its_mac() {
     let config = parse(&text).unwrap();
     let br0 = config.interfaces.iter().find(|i| i.name == "br0").unwrap();
     assert_eq!((br0.mac, br0.mtu), ([2, 0, 0, 0, 0, 0x77], 1450));
+}
+
+#[test]
+fn a_static_address_on_a_vxlan_member_is_behind_one_of_its_vteps() {
+    let config = parse(&with(
+        r#"vxlan = { vni = 100, local = "192.0.2.1", remote = ["198.51.100.2"] }"#,
+        r#"members = ["vx0", "p1"], static-mac = [{ mac = "02:00:00:00:00:55", interface = "vx0", vtep = "198.51.100.2" }]"#,
+    ))
+    .unwrap();
+    let mut confd = Confd::new(Config::default());
+    let [[_, tables], _] = confd.tables_now_and_with(&config);
+    assert_eq!(
+        tables.get(&Key::BridgeMac {
+            bridge: "br0".into(),
+            mac: [2, 0, 0, 0, 0, 0x55]
+        }),
+        Some(&Value::BridgeMac {
+            interface: "vx0".into(),
+            vtep: Some("198.51.100.2".parse().unwrap()),
+        })
+    );
 }
