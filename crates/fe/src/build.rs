@@ -921,6 +921,19 @@ pub(crate) fn build(
                     "{name} is more than one of an EtherIP, VXLAN and SRv6 L2 interface"
                 ));
             }
+            // A received packet finds its VXLAN interface by the local address and
+            // the VNI.
+            if let ruster_core::OverlayKind::Vxlan { vni, .. } = &kind {
+                let same = |o: &ruster_core::Overlay| {
+                    o.local == local
+                        && matches!(o.kind, ruster_core::OverlayKind::Vxlan { vni: v, .. } if v == *vni)
+                };
+                if overlays.iter().any(same) {
+                    return Err(format!(
+                        "VXLAN interface {name}: another has the same local address and VNI"
+                    ));
+                }
+            }
             let id = ids.take(name)?;
             interfaces.push(Interface {
                 id,

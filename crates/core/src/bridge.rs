@@ -267,14 +267,14 @@ impl MacTable {
     /// Sets the bridges (in the order of their ids) and the static entries after a
     /// table change. Bridge `new` was bridge `old_of_new[new]` before (`None` for a new
     /// one): it keeps its counters and learned entries, but only those whose member
-    /// `keep(new, member)` allows. Static entries are replaced by `statics` (bridge,
+    /// (and remote VTEP) `keep(new, member, vtep)` allows. Static entries are replaced by `statics` (bridge,
     /// address, member); those beyond the capacity are left out and their number
     /// returned.
     pub fn republish(
         &mut self,
         bridges: &[BridgeLimits],
         old_of_new: &[Option<u16>],
-        keep: impl Fn(u16, IfId) -> bool,
+        keep: impl Fn(u16, IfId, Option<IpAddr>) -> bool,
         statics: &[(u16, [u8; 6], IfId)],
     ) -> usize {
         // An empty table is all `EMPTY` already (`remove` leaves `EMPTY` behind):
@@ -337,7 +337,7 @@ impl MacTable {
             };
             let state = &self.bridges[usize::from(new)];
             let room = state.learned < state.limits.max_macs;
-            if !keep(new, slot.member)
+            if !keep(new, slot.member, slot.vtep)
                 || self.find(new, &slot.mac).is_some()
                 || self.len >= self.capacity
                 || !room
@@ -642,12 +642,15 @@ impl Bridges {
     }
 
     /// Sets the bridges after a table change (see [`MacTable::republish`]); a member
-    /// listed twice stays with the first bridge. Returns the static entries left out.
+    /// listed twice stays with the first bridge. An address learned behind a remote
+    /// VTEP is kept only while `vtep_kept(member, vtep)` (the VTEP is still one of
+    /// the member's). Returns the static entries left out.
     pub fn publish(
         &mut self,
         bridges: Vec<BridgeConfig>,
         old_of_new: &[Option<u16>],
         statics: &[(u16, [u8; 6], IfId)],
+        vtep_kept: impl Fn(IfId, IpAddr) -> bool,
     ) -> usize {
         let size = |ids: &mut dyn Iterator<Item = IfId>| ids.map(|id| usize::from(id.0) + 1).max();
         let len = size(
@@ -675,8 +678,9 @@ impl Bridges {
         let left = self.table.republish(
             &limits,
             old_of_new,
-            |bridge, member| {
+            |bridge, member, vtep| {
                 member_of.get(usize::from(member.0)).copied().flatten() == Some(bridge)
+                    && vtep.is_none_or(|vtep| vtep_kept(member, vtep))
             },
             statics,
         );
@@ -836,7 +840,7 @@ mod tests {
                 max_macs,
             }],
             &[None],
-            |_, _| true,
+            |_, _, _| true,
             &[],
         );
         table
@@ -1031,7 +1035,7 @@ mod tests {
                 max_macs: 2,
             }],
             &[Some(0)],
-            |_, member| member != P1,
+            |_, member, _| member != P1,
             &[(0, s, P3)],
         );
         assert_eq!(left, 0);
@@ -1073,14 +1077,14 @@ mod tests {
             aging_ms: 1_000,
             max_macs: 4,
         };
-        t.republish(&[limits, limits], &[None, None], |_, _| true, &[]);
+        t.republish(&[limits, limits], &[None, None], |_, _, _| true, &[]);
         t.learn(0, A, P1, None, 0);
         assert_eq!(t.send(1, &A, 0), None);
         t.learn(1, A, P2, None, 0);
         assert_eq!(t.send(0, &A, 0), Some((P1, None)));
         assert_eq!(t.send(1, &A, 0), Some((P2, None)));
         // Bridge 1 goes, bridge 0 becomes 1.
-        t.republish(&[limits], &[Some(0)], |_, _| true, &[]);
+        t.republish(&[limits], &[Some(0)], |_, _, _| true, &[]);
         assert_eq!(t.send(0, &A, 0), Some((P1, None)));
         assert_eq!(t.len(), 1);
     }
@@ -1097,7 +1101,7 @@ mod tests {
             irb: Some((IfId(9), IRB)),
             members: vec![P1, P2],
         };
-        bridges.publish(vec![config], &[None], &[]);
+        bridges.publish(vec![config], &[None], &[], |_, _| true);
         assert_eq!(bridges.member_of(P2), Some(0));
         assert_eq!(bridges.irb_of(IfId(9)), Some(0));
         // Not an IRB: as it is.

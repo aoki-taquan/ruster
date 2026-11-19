@@ -1456,9 +1456,20 @@ where
             .collect();
         let (names, configs): (Vec<String>, Vec<_>) = self.tables.bridges.iter().cloned().unzip();
         self.bridge_names = names;
-        let left = self
-            .bridges
-            .publish(configs, &old_of_new, &self.tables.bridge_statics);
+        // An address learned behind a VTEP the member no longer lists goes: frames
+        // to it are flooded again.
+        let overlays = &self.tables.overlays;
+        let left = self.bridges.publish(
+            configs,
+            &old_of_new,
+            &self.tables.bridge_statics,
+            |member, vtep| {
+                overlays
+                    .iter()
+                    .find(|o| o.interface == member)
+                    .is_some_and(|o| o.remotes().contains(&vtep))
+            },
+        );
         if left > 0 {
             eprintln!("ruster-fe: {left} static MAC addresses left out: the table is full");
         }
@@ -1729,9 +1740,11 @@ where
             for frame in members.bridges.flood() {
                 let mut dropped = 0;
                 for &member in members.bridges.members(frame.bridge) {
-                    if members.floods_to(frame.from, member)
-                        && !members.send(member, None, frame.bytes())
-                    {
+                    // Not back where it came from: a VXLAN interface's frame is not
+                    // sent back to its own VTEPs (RFC 8365 section 8.3: each VTEP
+                    // sends its own frames to every other), but goes to the bridge's
+                    // other VXLAN interfaces (other VNIs or VTEPs).
+                    if frame.from != Some(member) && !members.send(member, None, frame.bytes()) {
                         dropped += 1;
                     }
                 }
@@ -2281,21 +2294,6 @@ impl<'f, 't, B: GeneratedPacketIo> Members<'f, 't, B> {
             }
         }
         sent
-    }
-
-    /// Whether a frame flooded from `from` goes out of `member`: not back where it
-    /// came from, nor from one VXLAN interface to another (RFC 8365 section 8.3:
-    /// each VTEP sends its own frames to every other).
-    fn floods_to(&self, from: Option<IfId>, member: IfId) -> bool {
-        let vxlan = |id: IfId| {
-            self.outer
-                .overlay(id)
-                .is_some_and(ruster_core::Overlay::is_vxlan)
-        };
-        match from {
-            Some(from) => from != member && !(vxlan(from) && vxlan(member)),
-            None => true,
-        }
     }
 }
 

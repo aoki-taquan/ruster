@@ -176,8 +176,8 @@ charterの「作るもの」は上の表のとおりそろい、2026-11-10 にow
 次の順に作る。FPMでFRRからSRv6の経路を受けることとEVPNは作らない。
 
 1. SIDごとの数を、FEの状態のsocketで見せる。
-2. VXLAN: 一つのブリッジに複数のVXLANのメンバー、UDPのポートと下側のVRFを選ぶ、下側の本当のMTUで
-   確かめる、一覧から消したVTEPの後ろで学んだMACを消す、VXLANのメンバーに静的なMAC（VTEPを付けて）。
+2. VXLAN: UDPのポートと下側のVRFを選ぶ、下側の本当のMTUで確かめる、VXLANのメンバーに静的なMAC
+   （VTEPを付けて）。
 3. RFC 9800のNEXT-CSID（End、End.X、End.DT4、End.DT6、End.DT46）。
 4. SRv6とVXLANのbacklog（#754、#756、#759、#762、#765、#768、#774）のうち、上で片付かなかったもの。
 

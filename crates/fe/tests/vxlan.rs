@@ -24,10 +24,17 @@ const VTEP3: [u8; 4] = [203, 0, 113, 3];
 
 struct Bench {
     fe: Fe<SimIo>,
+    /// The client that wrote the configuration, for changes after.
+    config: Client,
 }
 
 impl Bench {
     fn new() -> Self {
+        Self::with(&[])
+    }
+
+    /// The bench, with `more` in the configuration.
+    fn with(more: &[Change]) -> Self {
         let mut fe = Fe::new(SimIo::new(), vec!["p1".into(), "wan".into()]);
         let config = [
             iface("p1", [2, 0, 0, 0, 1, 1]),
@@ -60,6 +67,7 @@ impl Bench {
             member("p1"),
             member("vx0"),
         ];
+        let config: Vec<Change> = config.into_iter().chain(more.iter().cloned()).collect();
         let route = Change::set(
             Key::Route {
                 vrf: "default".into(),
@@ -78,6 +86,7 @@ impl Bench {
             },
             Value::Neighbor { mac: GATEWAY_MAC },
         );
+        let mut clients = Vec::new();
         for (writer, changes) in [
             (writers::CONFIG, &config[..]),
             (writers::ROUTE, &[route][..]),
@@ -88,8 +97,15 @@ impl Bench {
             let mut client = Client::new(b).unwrap();
             let token = client.patch(changes).unwrap();
             assert_eq!(settle(&mut fe, &mut client, token), Code::CHANGED);
+            clients.push(client);
         }
-        Self { fe }
+        let config = clients.swap_remove(0);
+        Self { fe, config }
+    }
+
+    fn change(&mut self, changes: &[Change]) {
+        let token = self.config.patch(changes).unwrap();
+        assert_eq!(settle(&mut self.fe, &mut self.config, token), Code::CHANGED);
     }
 
     /// Sends `frame` in on `port` and returns what left, by port.
@@ -239,4 +255,51 @@ fn a_flood_from_a_vtep_is_not_sent_to_the_other_vteps() {
         vec![]
     );
     assert_eq!(bench.send(WAN, outer(VTEP2, 101, &unknown)), vec![]);
+}
+
+fn vxlan(name: &str, vni: u32, remotes: &[[u8; 4]]) -> Change {
+    Change::set(
+        Key::Vxlan {
+            interface: name.into(),
+        },
+        Value::Vxlan {
+            vni,
+            local: IpAddr::from(LOCAL),
+            remotes: remotes.iter().map(|r| IpAddr::from(*r)).collect(),
+        },
+    )
+}
+
+#[test]
+fn a_flood_from_one_vxlan_interface_goes_to_another_of_the_bridge() {
+    const VTEP4: [u8; 4] = [203, 0, 113, 4];
+    let mut bench = Bench::with(&[
+        iface("vx1", [2, 0, 0, 0, 0, 0xf]),
+        vxlan("vx1", 200, &[VTEP4]),
+        member("vx1"),
+    ]);
+    let unknown = frame([2, 0, 0, 0, 0, 0x99], H2, 60);
+    let mut out = bench.send(WAN, outer(VTEP2, 100, &unknown));
+    out.sort();
+    // To p1 as it is, and to vx1's VTEP in VNI 200: not to vx0's other VTEP.
+    assert_eq!(out.len(), 2, "{out:?}");
+    assert!(out.contains(&(P1, unknown.clone())));
+    let wrapped = out.iter().find(|(port, _)| *port == WAN).unwrap();
+    assert_eq!(&wrapped.1[30..34], &VTEP4);
+    assert_eq!(&wrapped.1[46..49], &200_u32.to_be_bytes()[1..]);
+}
+
+#[test]
+fn an_address_behind_a_vtep_taken_off_the_list_is_forgotten() {
+    let mut bench = Bench::new();
+    let b = frame(H1, H2, 60);
+    bench.send(P1, frame(H2, H1, 60));
+    assert_eq!(bench.send(WAN, outer(VTEP2, 100, &b)), vec![(P1, b)]);
+    // H2 is behind VTEP2; VTEP2 leaves the list: a frame to H2 is flooded to the
+    // VTEPs left, not sent to VTEP2.
+    bench.change(&[vxlan("vx0", 100, &[VTEP3])]);
+    let c = frame(H2, H1, 100);
+    let out = bench.send(P1, c.clone());
+    assert_eq!(out.len(), 1);
+    assert_eq!(vtep_of(&out[0].1, &c), VTEP3);
 }

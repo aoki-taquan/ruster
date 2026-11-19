@@ -3,8 +3,7 @@
 //!
 //! A VXLAN interface carries a bridge's frames in UDP from one of the router's
 //! addresses to a list of remote VTEPs, which get every broadcast (head-end
-//! replication). It is only a bridge member, at most one per bridge, so it has no
-//! address of its own; its MTU leaves room for the outer headers on a 1500-byte
+//! replication). It is only a bridge member, so it has no address of its own; its MTU leaves room for the outer headers on a 1500-byte
 //! link.
 //!
 //! # Standards
@@ -13,9 +12,7 @@
 //!
 //! Deviations: the remote VTEPs are a list (no multicast underlay, RFC 7348 section
 //! 4.2); the local address must be an address given to an interface of the default
-//! VRF; a bridge has at most one VXLAN member (frames flooded from one VXLAN
-//! member are not sent to another), and no static MAC address on it (it would need
-//! a VTEP).
+//! VRF; and no static MAC address on it (it would need a VTEP).
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -86,12 +83,6 @@ pub(crate) fn check(
                 "{at}: a VXLAN interface must be a member of a bridge"
             ));
         };
-        if let Some(other) = out.iter().find(|v| bridge.members.contains(&v.name)) {
-            return Err(format!(
-                "{at}: bridge {:?} already has VXLAN interface {:?}",
-                bridge.name, other.name
-            ));
-        }
         if bridge.statics.iter().any(|(_, member)| *member == name) {
             return Err(format!("{at}: a static-mac cannot be on a VXLAN interface"));
         }
