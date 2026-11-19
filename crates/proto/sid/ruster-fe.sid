@@ -7,7 +7,7 @@
     "assignment-range": [
       {
         "entry-point": 60000,
-        "size": 300
+        "size": 400
       }
     ],
     "item": [
@@ -627,6 +627,36 @@
         "namespace": "data",
         "identifier": "/ruster-if-vxlan:vxlan/remote",
         "sid": 60283,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-if-srv6-l2:srv6-l2",
+        "sid": 60300,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-if-srv6-l2:srv6-l2/source-address",
+        "sid": 60301,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-if-srv6-l2:srv6-l2/sid",
+        "sid": 60302,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-if-srv6-l2:srv6-l2/segment",
+        "sid": 60303,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-if-srv6-l2:srv6-l2/reduced",
+        "sid": 60304,
         "status": "unstable"
       },
       {

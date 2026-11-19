@@ -56,6 +56,7 @@
 | PPPoE | `ruster-if-pppoe` | 親、セッションID、相手のMAC | セッションの確立は外のデーモン。FEは包むのと外すのだけ |
 | IPトンネル | `ruster-if-tunnel` | 種類（IPv4 in IPv6、IPv6 in IPv4、GRE、EtherIP）、下側のVRF、送信元、宛先 | DS-Liteはこれ一つで表せる。EtherIPは別の行（インターフェースごと）で、ブリッジのメンバーにだけなる |
 | VXLAN | `ruster-if-vxlan` | VNI、送信元、VTEPの一覧 | 別の行（インターフェースごと）で、ブリッジのメンバーにだけなる |
+| SRv6のL2 | `ruster-if-srv6-l2` | 送信元、End.DX2のSID、相手のSIDのリスト、H.Encaps.L2.Redか | 別の行（インターフェースごと）で、ブリッジのメンバーにだけなる |
 | IRB | — | — | 名前がブリッジと同じインターフェース（[`overlay.md`](overlay.md)） |
 | loopback | — | — | 特定のポートに属さないルータのアドレス用 |
 

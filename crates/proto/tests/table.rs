@@ -139,9 +139,9 @@ fn sid_file_matches_the_constants() {
         "the .sid file has items the code does not"
     );
     // Inside the file's assignment range.
-    assert!(text.contains("\"entry-point\": 60000,\n        \"size\": 300"));
+    assert!(text.contains("\"entry-point\": 60000,\n        \"size\": 400"));
     assert!(
-        values.iter().all(|v| (60_000..60_300).contains(v)),
+        values.iter().all(|v| (60_000..60_400).contains(v)),
         "{values:?}"
     );
 }
@@ -1695,4 +1695,44 @@ fn srv6_sids_and_policies_round_trip_and_are_checked() {
     assert!(encap(vec![], false).validate().is_err());
     assert!(encap(vec![v6("fc00:2::4"); 9], false).validate().is_err());
     assert!(encap(vec![v6("ff02::1")], false).validate().is_err());
+}
+
+#[test]
+fn srv6_l2_entries_round_trip_and_are_checked() {
+    let v6 = |a: &str| a.parse::<std::net::Ipv6Addr>().unwrap();
+    let entry = |segments: Vec<std::net::Ipv6Addr>, reduced: bool| {
+        Change::set(
+            Key::Srv6L2 {
+                interface: "sr0".into(),
+            },
+            Value::Srv6L2 {
+                source: v6("2001:db8::1"),
+                sid: v6("fc00:1::d2"),
+                segments,
+                reduced,
+            },
+        )
+    };
+    let good = [
+        entry(vec![v6("fc00:2::d2")], false),
+        entry(vec![v6("fc00:3::1"), v6("fc00:2::d2")], true),
+        Change::delete(Key::Srv6L2 {
+            interface: "sr0".into(),
+        }),
+    ];
+    for change in &good {
+        assert!(change.validate().is_ok(), "{change:?}");
+        assert_eq!(&round_trip(change), change);
+    }
+    assert_eq!(
+        entry_line(&good[1].key, good[1].value.as_ref().unwrap()).unwrap(),
+        "srv6-l2 sr0 sid fc00:1::d2 encap reduced from 2001:db8::1 segs fc00:3::1,fc00:2::d2"
+    );
+    for bad in [
+        entry(vec![], false),
+        entry(vec![v6("ff02::1")], false),
+        entry(vec![v6("fc00:2::d2"); 9], false),
+    ] {
+        assert!(bad.validate().is_err(), "{bad:?}");
+    }
 }

@@ -1,4 +1,4 @@
-//! Bridge members that carry Ethernet frames inside IP: EtherIP and VXLAN.
+//! Bridge members that carry Ethernet frames inside IP: EtherIP, VXLAN and SRv6.
 //!
 //! See `docs/design/overlay.md`, sections 3 and 4. An [`Overlay`] is an interface
 //! that is a member of a bridge, like a port, but whose frames travel inside IP
@@ -24,6 +24,14 @@
 //!   checksum is not checked (RFC 7348 section 5 allows that).
 //! - RFC 7348 section 4.1: the outer source address of a received frame is learned
 //!   with its inner source MAC address (see `crate::MacTable`).
+//! - RFC 8986 sections 5.3 and 5.4 (H.Encaps.L2, H.Encaps.L2.Red): an outer IPv6
+//!   header from the interface's source to its first segment, its flow label a
+//!   hash of the inner flow, and with two segments or more a Segment Routing Header
+//!   listing them last first (without the first for H.Encaps.L2.Red), Segments
+//!   Left n - 1; its next header, or the IPv6 header's, is 143 (Ethernet, section
+//!   10.1). Section 4.9 (End.DX2): a packet to the interface's SID whose upper-layer
+//!   header is 143, with no Segment Routing Header or one with no segment left,
+//!   loses its outer headers and its frame is received on the interface.
 //! - RFC 791 and RFC 8200: the outer header, TTL or Hop Limit 64; an IPv4 outer
 //!   header has DF set (RFC 7348 section 4.3) and identification 0 (RFC 6864
 //!   section 4.1: an atomic datagram). An IPv4 outer header with a bad checksum is
@@ -42,6 +50,9 @@
 //! - VXLAN: no multicast underlay (RFC 7348 section 4.2); the remote VTEPs are a
 //!   list given in the tables, and packets from any other address are dropped. The
 //!   UDP port is always 4789.
+//! - SRv6: a packet to an End.DX2 SID with segments left, or whose upper-layer
+//!   header is not 143, is dropped without an ICMPv6 error (RFC 8986 4.9 S01 to
+//!   S04 would send Parameter Problem); its source is not checked.
 //! - The outer packets are always routed in the default VRF, only out of a port or a
 //!   VLAN sub-interface (not a tunnel, PPPoE session or bridge), and only those
 //!   arriving on an interface of the default VRF are unwrapped.
@@ -69,8 +80,17 @@ const VXLAN_HEADERS: usize = 16;
 const VXLAN_I: u8 = 0x08;
 /// TTL and Hop Limit of the outer header.
 const HOP_LIMIT: u8 = 64;
-/// The longest outer header (Ethernet, IPv6, UDP and VXLAN).
-const MAX_HEADER: usize = ETHERNET + IPV6_HEADER + VXLAN_HEADERS;
+/// The IPv6 Next Header of an Ethernet frame (RFC 8986 section 10.1).
+const ETHERNET_NEXT_HEADER: u8 = 143;
+const ROUTING: u8 = 43;
+/// The Routing Type of the Segment Routing Header.
+const SEGMENT_ROUTING: u8 = 4;
+/// Segments an SRv6 L2 interface sends to, at most.
+const SRV6_SEGMENTS: usize = 8;
+/// The longest outer header (Ethernet, IPv6, and a Segment Routing Header of 8
+/// segments; VXLAN's is shorter). It fits the room the backends leave in front of
+/// a frame.
+const MAX_HEADER: usize = ETHERNET + IPV6_HEADER + 8 + 16 * SRV6_SEGMENTS;
 
 /// A bridge member whose frames travel inside IP.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -90,6 +110,15 @@ pub enum OverlayKind {
     /// VXLAN (RFC 7348) network `vni` (1 to 16777215), to and from the remote VTEPs
     /// `remotes`.
     Vxlan { vni: u32, remotes: Vec<IpAddr> },
+    /// SRv6 (RFC 8986): frames leave wrapped toward `segments` (IPv6, the first
+    /// first, 1 to 8; H.Encaps.L2, or H.Encaps.L2.Red with `reduced`), and packets
+    /// to the router's End.DX2 SID `sid` bring frames in. `local` is the outer
+    /// source.
+    Srv6L2 {
+        sid: [u8; 16],
+        segments: Vec<IpAddr>,
+        reduced: bool,
+    },
 }
 
 impl Overlay {
@@ -99,6 +128,8 @@ impl Overlay {
         match &self.kind {
             OverlayKind::EtherIp { remote } => std::slice::from_ref(remote),
             OverlayKind::Vxlan { remotes, .. } => remotes,
+            // The first segment: every frame goes there.
+            OverlayKind::Srv6L2 { segments, .. } => &segments[..segments.len().min(1)],
         }
     }
 
@@ -229,10 +260,16 @@ pub(crate) fn receive<S: PacketSlot>(
     let Some(outer) = outer(bytes) else {
         return Ok(Received::NotOverlay);
     };
+    if let Some(received) = receive_srv6(packet, snapshot, overlays, &outer)? {
+        return Ok(received);
+    }
+    let bytes = packet.bytes_mut();
     let ours = |vxlan: bool| {
-        overlays
-            .iter()
-            .any(|o| o.local == outer.destination && o.is_vxlan() == vxlan)
+        overlays.iter().any(|o| {
+            o.local == outer.destination
+                && o.is_vxlan() == vxlan
+                && !matches!(o.kind, OverlayKind::Srv6L2 { .. })
+        })
     };
     let vxlan = match outer.protocol {
         ETHERIP if ours(false) => false,
@@ -312,6 +349,59 @@ pub(crate) fn receive<S: PacketSlot>(
     Ok(Received::Unwrapped { vtep })
 }
 
+/// End.DX2 (RFC 8986 section 4.9) of an SRv6 L2 interface: an outer IPv6 packet to
+/// its SID whose upper-layer header is an Ethernet frame (143), after a Segment
+/// Routing Header with no segment left or none, loses its outer headers and its
+/// frame is received on the interface. `None` for a packet to no such SID.
+fn receive_srv6<S: PacketSlot>(
+    packet: &mut PacketLease<S>,
+    snapshot: &crate::ForwardingSnapshot<'_>,
+    overlays: &[Overlay],
+    outer: &Outer,
+) -> Result<Option<Received>, DropReason> {
+    let IpAddr::V6(destination) = outer.destination else {
+        return Ok(None);
+    };
+    let Some(overlay) = overlays
+        .iter()
+        .find(|o| matches!(o.kind, OverlayKind::Srv6L2 { sid, .. } if sid == destination.octets()))
+    else {
+        return Ok(None);
+    };
+    let ingress = packet.ingress();
+    if snapshot.for_ingress(ingress).authority() != snapshot.authority() {
+        return Err(DropReason::OverlayUnknownPeer);
+    }
+    let interface = snapshot
+        .interface(ingress)
+        .ok_or(DropReason::OverlayUnknownPeer)?;
+    let bytes = packet.bytes_mut();
+    if bytes[0..6] != interface.mac.0 {
+        return Err(DropReason::OverlayUnknownPeer);
+    }
+    let mut next = outer.protocol;
+    let mut at = outer.payload;
+    if next == ROUTING {
+        let header = bytes.get(at..at + 8).ok_or(DropReason::OverlayInvalid)?;
+        let len = (usize::from(header[1]) + 1) * 8;
+        // S01 to S04: segments left is not End.DX2's (no ICMP error is sent).
+        if header[2] != SEGMENT_ROUTING || header[3] != 0 || at + len > outer.end {
+            return Err(DropReason::OverlayInvalid);
+        }
+        next = header[0];
+        at += len;
+    }
+    if next != ETHERNET_NEXT_HEADER || outer.end < at + ETHERNET {
+        return Err(DropReason::OverlayInvalid);
+    }
+    let member = overlay.interface;
+    if !packet.truncate(outer.end) || !packet.resize_front(at as isize) {
+        return Err(DropReason::OverlayNoRoom);
+    }
+    packet.set_ingress(member);
+    Ok(Some(Received::Unwrapped { vtep: None }))
+}
+
 /// A hash of the flow of `inner` (an Ethernet frame): its IP addresses and, for TCP
 /// and UDP that are not later fragments, its ports; its MAC addresses otherwise
 /// (FNV-1a).
@@ -381,6 +471,7 @@ pub(crate) fn header<T: TraceSink>(
             Some(vni)
         }
         OverlayKind::EtherIp { .. } => None,
+        OverlayKind::Srv6L2 { .. } => None,
     };
     let (egress, mac) = route(snapshot, remote, trace)?;
     if irb(egress) || snapshot.wraps_frames(egress) || of(snapshot.overlays, egress).is_some() {
@@ -397,6 +488,17 @@ pub(crate) fn header<T: TraceSink>(
     let b = &mut out.bytes;
     b[0..6].copy_from_slice(&mac.0);
     b[6..12].copy_from_slice(&interface.mac.0);
+    if let OverlayKind::Srv6L2 {
+        segments, reduced, ..
+    } = &overlay.kind
+    {
+        let (IpAddr::V6(local), true) = (overlay.local, segments.len() <= SRV6_SEGMENTS) else {
+            return Err(DropReason::OverlayInvalid);
+        };
+        srv6_header(b, local, segments, *reduced, inner, interface.mtu)?;
+        out.len = ETHERNET + IPV6_HEADER + srh_len(segments.len(), *reduced);
+        return Ok(out);
+    }
     let encapsulation = if vni.is_some() {
         VXLAN_HEADERS
     } else {
@@ -475,6 +577,73 @@ pub(crate) fn header<T: TraceSink>(
     Ok(out)
 }
 
+/// The length of the Segment Routing Header for `segments` segments: none for one,
+/// and with H.Encaps.L2.Red (`reduced`) without the first.
+fn srh_len(segments: usize, reduced: bool) -> usize {
+    match (segments, reduced) {
+        (0 | 1, _) => 0,
+        (n, true) => 8 + 16 * (n - 1),
+        (n, false) => 8 + 16 * n,
+    }
+}
+
+/// H.Encaps.L2 (RFC 8986 section 5.3) and H.Encaps.L2.Red (5.4): into `b` (after
+/// its Ethernet addresses) the outer IPv6 header from `local` to the first of
+/// `segments` and the Segment Routing Header listing them, last first, whose next
+/// header is the Ethernet frame `inner`.
+fn srv6_header(
+    b: &mut [u8; MAX_HEADER],
+    local: std::net::Ipv6Addr,
+    segments: &[IpAddr],
+    reduced: bool,
+    inner: &[u8],
+    mtu: u16,
+) -> Result<(), DropReason> {
+    let six = |a: &IpAddr| match a {
+        IpAddr::V6(a) => Ok(a.octets()),
+        IpAddr::V4(_) => Err(DropReason::OverlayInvalid),
+    };
+    let srh = srh_len(segments.len(), reduced);
+    let carried = srh + inner.len();
+    if IPV6_HEADER + carried > usize::from(mtu) {
+        return Err(DropReason::OverlayMtuExceeded);
+    }
+    let length = u16::try_from(carried).map_err(|_| DropReason::OverlayMtuExceeded)?;
+    let ip = ETHERNET;
+    b[12..14].copy_from_slice(&IPV6_ETHERTYPE);
+    // The flow label from the inner frame's flow (RFC 6437), never 0.
+    let label = (flow_hash(inner) & 0x000f_ffff).max(1);
+    b[ip..ip + 4].copy_from_slice(&(0x6000_0000 | label).to_be_bytes());
+    b[ip + 4..ip + 6].copy_from_slice(&length.to_be_bytes());
+    b[ip + 6] = if srh == 0 {
+        ETHERNET_NEXT_HEADER
+    } else {
+        ROUTING
+    };
+    b[ip + 7] = HOP_LIMIT;
+    b[ip + 8..ip + 24].copy_from_slice(&local.octets());
+    b[ip + 24..ip + 40].copy_from_slice(&six(&segments[0])?);
+    if srh > 0 {
+        let at = ip + IPV6_HEADER;
+        let listed = if reduced { &segments[1..] } else { segments };
+        // Segments Left counts every segment after the first; Last Entry the
+        // listed ones (RFC 8754 section 4.1.1).
+        let left = u8::try_from(segments.len() - 1).map_err(|_| DropReason::OverlayInvalid)?;
+        let last = u8::try_from(listed.len() - 1).map_err(|_| DropReason::OverlayInvalid)?;
+        b[at] = ETHERNET_NEXT_HEADER;
+        b[at + 1] = u8::try_from(srh / 8 - 1).map_err(|_| DropReason::OverlayInvalid)?;
+        b[at + 2] = SEGMENT_ROUTING;
+        b[at + 3] = left;
+        b[at + 4] = last;
+        b[at + 5..at + 8].fill(0);
+        for (i, segment) in listed.iter().rev().enumerate() {
+            let entry = at + 8 + 16 * i;
+            b[entry..entry + 16].copy_from_slice(&six(segment)?);
+        }
+    }
+    Ok(())
+}
+
 /// The interface toward `remote` in the default VRF and its next hop's MAC
 /// address.
 fn route<T: TraceSink>(
@@ -551,6 +720,7 @@ pub(crate) fn transmit_member<S: PacketSlot, T: TraceSink>(
                 (OverlayKind::Vxlan { .. }, Some(vtep)) => vtep,
                 // A VXLAN destination known with no VTEP: nowhere to send it.
                 (OverlayKind::Vxlan { .. }, None) => return Err(DropReason::OverlayNoRoute),
+                (OverlayKind::Srv6L2 { segments, .. }, _) => segments[0],
             };
             let outer = header(snapshot, overlay, remote, packet.bytes_mut(), irb, trace)?;
             let len = outer.len;
