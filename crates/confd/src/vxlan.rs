@@ -3,8 +3,9 @@
 //!
 //! A VXLAN interface carries a bridge's frames in UDP from one of the router's
 //! addresses to a list of remote VTEPs, which get every broadcast (head-end
-//! replication). It is only a bridge member, so it has no address of its own; its MTU leaves room for the outer headers on a 1500-byte
-//! link.
+//! replication). It is only a bridge member, so it has no address of its own; its
+//! MTU leaves room for the outer headers on the largest link the outer packets can
+//! leave through.
 //!
 //! # Standards
 //!
@@ -19,7 +20,7 @@ use std::net::IpAddr;
 
 use ruster_proto::table::{Key, Value, VXLAN_VNI_MAX};
 
-use crate::etherip::{given, unicast, LINK_MTU};
+use crate::etherip::{given, unicast};
 use crate::InterfaceConfig;
 
 /// One VXLAN interface, checked.
@@ -42,6 +43,7 @@ pub(crate) fn check(
     entries: Vec<(String, u32, String, Vec<String>, u16)>,
     interfaces: &[InterfaceConfig],
     bridges: &[crate::bridge::Bridge],
+    link_mtu: u16,
 ) -> Result<Vec<Vxlan>, String> {
     let mut out: Vec<Vxlan> = Vec::with_capacity(entries.len());
     for (name, vni, local, remote, port) in entries {
@@ -119,10 +121,10 @@ pub(crate) fn check(
             .iter()
             .find(|i| i.name == name)
             .map_or(0, |i| i.mtu);
-        if mtu > LINK_MTU - overhead {
+        if mtu > link_mtu.saturating_sub(overhead) {
             return Err(format!(
-                "{at}: mtu must be at most {} (1500 less the outer headers)",
-                LINK_MTU - overhead
+                "{at}: mtu must be at most {} ({link_mtu}, the largest MTU of the links, less the outer headers)",
+                link_mtu.saturating_sub(overhead)
             ));
         }
         // A received packet finds its interface by the local address and the VNI

@@ -883,13 +883,48 @@ pub fn config(lock: Lock) -> Result<Config, String> {
     let pppoe = crate::pppoe::check(lock.pppoe, &interfaces, &sources)?;
     let dhcp_client = crate::dhcp_client::check(lock.dhcp_client, &interfaces, &sources)?;
     let bgp = crate::bgp::check(lock.bgp, &interfaces)?;
+    // The largest MTU an outer packet of a tunnel bridge member can leave with: of
+    // the enabled ports and VLAN sub-interfaces of the default VRF (the FE sends
+    // the outer packets out of no tunnel, PPPoE session or bridge).
+    let members: BTreeSet<&str> = etherip
+        .iter()
+        .map(|(name, ..)| name.as_str())
+        .chain(vxlan.iter().map(|(name, ..)| name.as_str()))
+        .chain(srv6_l2.iter().map(|(name, ..)| name.as_str()))
+        .chain(bridges.iter().map(|(name, _)| name.as_str()))
+        // A bridge member has no address: no route leaves through it.
+        .chain(
+            bridges
+                .iter()
+                .flat_map(|(_, bridge)| bridge.members.iter().map(String::as_str)),
+        )
+        .collect();
+    let link_mtu = interfaces
+        .iter()
+        .filter(|i| {
+            i.enabled
+                && i.vrf == DEFAULT_VRF
+                && i.tunnel.is_none()
+                && i.pppoe.is_none()
+                && !members.contains(i.name.as_str())
+        })
+        .map(|i| i.mtu)
+        .max()
+        .unwrap_or(crate::etherip::LINK_MTU)
+        .min(crate::etherip::LINK_MTU);
     let bridges = crate::bridge::check(bridges, &interfaces)?;
     let isis = crate::isis_ospf::check_isis(lock.isis, &interfaces, &bridges)?;
     let ospf = crate::isis_ospf::check_ospf("ospf", lock.ospf, &interfaces, &bridges)?;
     let ospf6 = crate::isis_ospf::check_ospf("ospf6", lock.ospf6, &interfaces, &bridges)?;
-    let etherip = crate::etherip::check(etherip, &interfaces, &bridges)?;
-    let vxlan = crate::vxlan::check(vxlan, &interfaces, &bridges)?;
-    let srv6 = crate::srv6::check(lock.srv6, &interfaces, &static_routes, srv6_l2, &bridges)?;
+    let etherip = crate::etherip::check(etherip, &interfaces, &bridges, link_mtu)?;
+    let vxlan = crate::vxlan::check(vxlan, &interfaces, &bridges, link_mtu)?;
+    let srv6 = crate::srv6::check(
+        lock.srv6,
+        &interfaces,
+        &static_routes,
+        (srv6_l2, &bridges),
+        link_mtu,
+    )?;
     // The FE takes at most this many punt classes besides its own.
     let routing = crate::isis_ospf::class_count(&Config {
         isis: isis.clone(),
