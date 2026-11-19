@@ -117,6 +117,18 @@ pub(crate) fn check(
             taken.insert((interface.vrf.clone(), network, len));
         }
     }
+    // A SID's interface sends on its own: no bridge's, nor a bridge member's.
+    let bridged = |at: &str, interface: &str| {
+        if bridges
+            .iter()
+            .any(|b| b.name == interface || b.members.iter().any(|m| m == interface))
+        {
+            return Err(format!(
+                "{at}: interface {interface:?} is a bridge or a bridge member"
+            ));
+        }
+        Ok(())
+    };
     let mut out = Srv6::default();
     for entry in srv6.sid {
         let at = format!("srv6 sid {:?}", entry.sid);
@@ -229,6 +241,7 @@ pub(crate) fn check(
                         "{at}: interface {interface:?} is not an interface of the default VRF"
                     ));
                 }
+                bridged(&at, interface)?;
                 let next_hop = next_hop
                     .parse::<Ipv6Addr>()
                     .ok()
@@ -244,6 +257,7 @@ pub(crate) fn check(
                 if !interfaces.iter().any(|i| i.name == interface) {
                     return Err(format!("{at}: no interface {interface:?}"));
                 }
+                bridged(&at, interface)?;
                 let interface = interface.to_owned();
                 let unicast =
                     |a: IpAddr| !a.is_unspecified() && !a.is_multicast() && !a.is_loopback();
@@ -304,6 +318,17 @@ pub(crate) fn check(
                 "{at}: VRF {:?} has another route or policy for it",
                 entry.vrf
             ));
+        }
+        // The outer packets are routed in the default VRF: a policy there whose
+        // prefix holds a SID would take them again.
+        if entry.vrf == DEFAULT_VRF {
+            if let Some((sid, _)) = out
+                .sids
+                .iter()
+                .find(|(sid, _)| ruster_proto::table::network(IpAddr::V6(*sid), len) == prefix)
+            {
+                return Err(format!("{at}: its prefix holds the SID {sid}"));
+            }
         }
         if entry.segments.is_empty()
             || entry.segments.len() > ruster_proto::table::SRV6_SEGMENTS_MAX
