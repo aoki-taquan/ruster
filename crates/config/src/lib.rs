@@ -76,7 +76,7 @@
 //! name = "vx100"
 //! vxlan = { vni = 100, local = "192.0.2.1", remote = ["198.51.100.2", "198.51.100.3"] }
 //!                              # port = 4789 by default
-//!                              # the remote VTEPs get every broadcast (UDP 4789)
+//!                              # the remote VTEPs get every broadcast (UDP, 4789 unless port says)
 //! # mac is 02:00:00:00:00:fe and mtu 1450 (IPv4) or 1430 (IPv6) when left out
 //!
 //! [[interface]]                # a PPPoE session, there while the session is up

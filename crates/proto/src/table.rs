@@ -1678,8 +1678,6 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
             port,
         } => {
             e.map(4)
-                .u64(sid::VXLAN_PORT - sid::VXLAN)
-                .u64(u64::from(*port))
                 .u64(sid::VXLAN_VNI - sid::VXLAN)
                 .u64(u64::from(*vni))
                 .u64(sid::VXLAN_LOCAL - sid::VXLAN)
@@ -1689,6 +1687,7 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
             for remote in remotes {
                 e.text(&remote.to_string());
             }
+            e.u64(sid::VXLAN_PORT - sid::VXLAN).u64(u64::from(*port));
         }
         Value::Srv6L2 {
             source,
