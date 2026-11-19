@@ -477,3 +477,40 @@ fn outer_packets_in_another_vrf_than_the_underlay_are_not_taken() {
     let out = bench.send(WAN, outer(VTEP2, 100, &b));
     assert!(out.iter().all(|(port, _)| *port != P1), "{out:?}");
 }
+
+#[test]
+fn an_underlay_vrf_with_no_interface_up_leaves_the_overlay_without_a_route() {
+    // vx0's outer packets in VRF blue, which has no enabled interface: the tables
+    // are taken, and frames for vx0 go nowhere.
+    let mut down = iface("blue0", [2, 0, 0, 0, 0, 0xb]);
+    if let Some(Value::Interface { enabled, vrf, .. }) = down.value.as_mut() {
+        *enabled = false;
+        *vrf = "blue".into();
+    }
+    let Change { key, value, .. } = vxlan("vx0", 100, &[VTEP2]);
+    let Some(Value::Vxlan {
+        vni,
+        local,
+        remotes,
+        port,
+        ..
+    }) = value
+    else {
+        unreachable!()
+    };
+    let mut bench = Bench::with(&[
+        down,
+        Change::set(
+            key,
+            Value::Vxlan {
+                vni,
+                local,
+                remotes,
+                port,
+                underlay_vrf: "blue".into(),
+            },
+        ),
+    ]);
+    let out = bench.send(P1, frame([0xff; 6], H1, 60));
+    assert!(out.iter().all(|(port, _)| *port != WAN), "{out:?}");
+}

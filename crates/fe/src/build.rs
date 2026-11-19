@@ -1130,10 +1130,12 @@ pub(crate) fn build(
     names.remove(DEFAULT_VRF);
     let order: Vec<&str> = std::iter::once(DEFAULT_VRF).chain(names).collect();
     let index_of = |vrf: &str| order.iter().position(|v| *v == vrf);
+    // A VRF with no enabled interface and no route is not in the tables: the
+    // overlay has no route then (as with no link up in the default VRF).
     for (overlay, name) in overlays.iter_mut().zip(&overlay_vrfs) {
         overlay.vrf = index_of(name)
             .and_then(|at| u16::try_from(at).ok())
-            .ok_or_else(|| format!("overlay's VRF {name}: no interface or route is in it"))?;
+            .unwrap_or(u16::MAX);
     }
     // Each VRF's kernel interface.
     let mut kernel = Vec::with_capacity(order.len());

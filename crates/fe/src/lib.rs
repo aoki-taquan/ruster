@@ -2231,7 +2231,7 @@ fn send_parts<B: GeneratedPacketIo>(
 }
 
 /// Where the frames of bridge members go: out of ports and VLAN sub-interfaces, or
-/// wrapped for an overlay and routed by the default VRF.
+/// wrapped for an overlay and routed by the overlay's VRF.
 struct Members<'f, 't, B> {
     io: &'f mut B,
     vlans: &'f [VlanBinding],

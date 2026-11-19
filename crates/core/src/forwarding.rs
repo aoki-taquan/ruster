@@ -2006,15 +2006,12 @@ impl<'a> ForwardingSnapshot<'a> {
         trace: &mut T,
     ) -> Option<Result<crate::OverlayHeader, DropReason>> {
         let overlay = crate::overlay::of(self.overlays, member)?;
-        Some(crate::overlay::header(
-            self,
-            self.for_vrf(overlay.vrf),
-            overlay,
-            remote,
-            frame,
-            irb,
-            trace,
-        ))
+        Some(match self.vrf_snapshot(overlay.vrf) {
+            Some(underlay) => {
+                crate::overlay::header(self, underlay, overlay, remote, frame, irb, trace)
+            }
+            None => Err(DropReason::OverlayNoRoute),
+        })
     }
 
     /// [`Self::overlay_header`], with the outer packet routed by `underlays[i]` for

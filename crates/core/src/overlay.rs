@@ -472,7 +472,8 @@ fn add_words(sum: u64, bytes: &[u8]) -> u64 {
 }
 
 /// The outer header for `inner` (an Ethernet frame) leaving `overlay` for its
-/// remote end `remote`, routed by `snapshot` (the default VRF's). `irb` tells the
+/// remote end `remote`, routed by `underlay` (the snapshot of the overlay's VRF);
+/// `snapshot` is the outer one, with the interfaces and tunnels. `irb` tells the
 /// bridges' own interfaces, which the outer packet may not leave through. A next hop
 /// missing from the neighbor table is recorded in `trace`.
 pub(crate) fn header<T: TraceSink>(
@@ -751,7 +752,9 @@ pub(crate) fn transmit_member<S: PacketSlot, T: TraceSink>(
                 (OverlayKind::Vxlan { .. }, None) => return Err(DropReason::OverlayNoRoute),
                 (OverlayKind::Srv6L2 { segments, .. }, _) => segments[0],
             };
-            let underlay = snapshot.for_vrf(overlay.vrf);
+            let underlay = snapshot
+                .vrf_snapshot(overlay.vrf)
+                .ok_or(DropReason::OverlayNoRoute)?;
             let outer = header(
                 snapshot,
                 underlay,
