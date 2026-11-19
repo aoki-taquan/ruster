@@ -330,5 +330,7 @@ fn an_address_learned_in_a_vni_is_forgotten_when_the_interface_changes_vni() {
     let c = frame(H2, H1, 100);
     let out = bench.send(P1, c);
     assert_eq!(out.len(), 2, "{out:?}");
-    assert!(out.iter().all(|(_, w)| w[46..49] == 300_u32.to_be_bytes()[1..]));
+    assert!(out
+        .iter()
+        .all(|(_, w)| w[46..49] == 300_u32.to_be_bytes()[1..]));
 }
