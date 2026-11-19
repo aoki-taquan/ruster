@@ -295,6 +295,7 @@
 //!                              # packet goes on in
 //! # interface = "wan" and next-hop = "fe80::2" for End.X (default VRF) and End.DX6
 //! # (any interface); next-hop an IPv4 address for End.DX4
+//! # flavors = ["PSP", "USD"] for End and End.X: any of PSP, USP and USD
 //!
 //! [[srv6.policy]]              # an SR policy (H.Encaps)
 //! prefix = "10.2.0.0/16"       # the route it makes, in its VRF
@@ -602,7 +603,7 @@ pub const VERSION: u32 = 1;
 ///
 /// A new key also goes into `tests/data/every-key.lock` (the test reads it with every
 /// key required, and checks that every list in it has an item).
-pub const LOCK_SHAPE: u64 = 0x761c_1bec_dcf0_bb7e;
+pub const LOCK_SHAPE: u64 = 0x59e1_0c19_e60f_4fc1;
 
 /// A bridge's ageing time, in seconds (IEEE 802.1Q 8.8.3, the recommended value).
 pub const BRIDGE_AGING_TIME: u32 = 300;

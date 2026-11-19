@@ -537,3 +537,94 @@ fn an_unwrapped_packet_to_the_router_or_neighbor_discovery_is_dropped() {
         assert_eq!(fe.counters().dropped, dropped + 1, "{sid}");
     }
 }
+
+/// The bench with End with PSP & USD at fc00:1::50 and End.X with USD at
+/// fc00:1::51 (to the WAN gateway).
+fn bench_with_flavors() -> Fe<SimIo> {
+    use ruster_proto::table::Srv6Flavors;
+    let mut fe = bench();
+    let both = Srv6Flavors {
+        psp: true,
+        usd: true,
+        ..Srv6Flavors::default()
+    };
+    let usd = Srv6Flavors {
+        usd: true,
+        ..Srv6Flavors::default()
+    };
+    let changes = [
+        route(
+            "default",
+            v6("fc00:1::50").into(),
+            128,
+            RouteAction::Srv6Local(Srv6Local::End { flavors: both }),
+        ),
+        route(
+            "default",
+            v6("fc00:1::51").into(),
+            128,
+            RouteAction::Srv6Local(Srv6Local::EndX {
+                interface: "wan".into(),
+                next_hop: v6("fe80::fe"),
+                flavors: usd,
+            }),
+        ),
+    ];
+    let (a, b) = UnixStream::pair().unwrap();
+    fe.attach(a, writers::ROUTE).unwrap();
+    let mut client = Client::new(b).unwrap();
+    let token = client.patch(&changes).unwrap();
+    assert_eq!(settle(&mut fe, &mut client, token), Code::CHANGED);
+    fe
+}
+
+#[test]
+fn psp_takes_the_srh_off_when_its_last_segment_becomes_the_destination() {
+    let mut fe = bench_with_flavors();
+    // To fc00:1::50 with one segment left: then to fc00:9::1, the last.
+    let inner = ipv6("2001:db8:ff::9", "2001:db8:99::1");
+    let mut frame = WAN_MAC.to_vec();
+    frame.extend_from_slice(&GATEWAY_MAC);
+    frame.extend_from_slice(&[0x86, 0xdd, 0x60, 0, 0, 0]);
+    frame.extend_from_slice(&u16::try_from(40 + inner.len()).unwrap().to_be_bytes());
+    frame.extend_from_slice(&[43, 64]);
+    frame.extend_from_slice(&v6("2001:db8:ff::9").octets());
+    frame.extend_from_slice(&v6("fc00:1::50").octets());
+    frame.extend_from_slice(&[41, 4, 4, 1, 1, 0, 0, 0]);
+    frame.extend_from_slice(&v6("fc00:9::1").octets());
+    frame.extend_from_slice(&v6("fc00:1::50").octets());
+    frame.extend_from_slice(&inner);
+    let out = send(&mut fe, WAN, frame);
+    assert_eq!(out.len(), 1);
+    let (port, sent) = &out[0];
+    assert_eq!(*port, WAN);
+    assert_eq!(&sent[14 + 24..14 + 40], &v6("fc00:9::1").octets());
+    assert_eq!(
+        sent[14 + 6],
+        41,
+        "the SRH is gone: the inner packet follows"
+    );
+    assert_eq!(
+        u16::from_be_bytes([sent[14 + 4], sent[14 + 5]]),
+        u16::try_from(inner.len()).unwrap()
+    );
+    assert_eq!(&sent[14 + 40..], &inner[..]);
+}
+
+#[test]
+fn usd_unwraps_the_inner_packet_with_no_segment_left() {
+    let mut fe = bench_with_flavors();
+    let inner = ipv6("2001:db8:ff::9", "2001:db8:99::1");
+    // End with USD: the inner packet is routed in the default VRF (out to WAN).
+    let out = send(&mut fe, WAN, to_sid("fc00:1::50", 0, 41, &inner));
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].0, WAN);
+    assert_eq!(&out[0].1[14 + 24..14 + 40], &v6("2001:db8:99::1").octets());
+    assert_eq!(out[0].1[14 + 7], 63);
+    // End.X with USD: to its next hop.
+    let out = send(&mut fe, WAN, to_sid("fc00:1::51", 0, 41, &inner));
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].0, WAN);
+    assert_eq!(&out[0].1[0..6], &GATEWAY_MAC);
+    assert_eq!(&out[0].1[14 + 24..14 + 40], &v6("2001:db8:99::1").octets());
+}

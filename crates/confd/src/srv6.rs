@@ -19,7 +19,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv6Addr};
 
-use ruster_proto::table::{Key, RouteAction, Srv6Encap, Srv6Local, Value, DEFAULT_VRF};
+use ruster_proto::table::{
+    Key, RouteAction, Srv6Encap, Srv6Flavors, Srv6Local, Value, DEFAULT_VRF,
+};
 
 use crate::{InterfaceConfig, StaticRoute};
 
@@ -114,8 +116,24 @@ pub(crate) fn check(
         let vrf = at_most_one(&at, "vrf", &entry.vrf)?;
         let interface = at_most_one(&at, "interface", &entry.interface)?;
         let next_hop = at_most_one(&at, "next-hop", &entry.next_hop)?;
+        let mut flavors = Srv6Flavors::default();
+        for name in &entry.flavors {
+            let on = match name.as_str() {
+                "PSP" => &mut flavors.psp,
+                "USP" => &mut flavors.usp,
+                "USD" => &mut flavors.usd,
+                _ => return Err(format!("{at}: flavors are PSP, USP and USD, not {name:?}")),
+            };
+            if std::mem::replace(on, true) {
+                return Err(format!("{at}: flavor {name} given twice"));
+            }
+        }
+        if flavors != Srv6Flavors::default() && !matches!(entry.behavior.as_str(), "End" | "End.X")
+        {
+            return Err(format!("{at}: only End and End.X take flavors"));
+        }
         let local = match (entry.behavior.as_str(), vrf, interface, next_hop) {
-            ("End", None, None, None) => Srv6Local::End,
+            ("End", None, None, None) => Srv6Local::End { flavors },
             ("End.X", None, Some(interface), Some(next_hop)) => {
                 if !interfaces
                     .iter()
@@ -133,6 +151,7 @@ pub(crate) fn check(
                 Srv6Local::EndX {
                     interface: interface.to_owned(),
                     next_hop,
+                    flavors,
                 }
             }
             (dx @ ("End.DX4" | "End.DX6"), None, Some(interface), Some(next_hop)) => {
