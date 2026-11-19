@@ -150,6 +150,11 @@ behavior = "End.DT46"
 vrf = "red"
 
 [[srv6.sid]]
+sid = "fc00:1::5"
+behavior = "End"
+flavors = ["PSP"]
+
+[[srv6.sid]]
 sid = "fc00:1::d4"
 behavior = "End.DX4"
 interface = "p1"
@@ -212,6 +217,12 @@ echo "ok: a two-segment SRH through ruster's End.X"
 back4 fc00:1::1,fc00:1::4
 pings "$b" 192.168.1.10 || pings "$b" 192.168.1.10 || fail "b does not reach a through ruster's End"
 echo "ok: a two-segment SRH through ruster's End"
+
+# Through ruster's End with PSP: the SRH comes off before End.DT4 (which, with no
+# SRH, takes the packet as it does Linux's one-segment ones).
+back4 fc00:1::5,fc00:1::4
+pings "$b" 192.168.1.10 || pings "$b" 192.168.1.10 || fail "b does not reach a through ruster's End with PSP"
+echo "ok: a two-segment SRH through ruster's End with PSP"
 
 # To ruster's End.DT46 SID, IPv4 and IPv6, and to its End.DX4 and End.DX6 SIDs,
 # which send the inner packet to a without a lookup.

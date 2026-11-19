@@ -30,6 +30,11 @@ pub struct Srv6Sid {
     pub interface: Vec<String>,
     /// None or one: their next hop.
     pub next_hop: Vec<String>,
+    /// The flavors of End and End.X: `PSP`, `USP` and `USD` (RFC 8986 section
+    /// 4.16), each at most once. A lock written before they were added has none,
+    /// and reads as none.
+    #[serde(default)]
+    pub flavors: Vec<String>,
 }
 
 /// One SR policy: packets to `prefix` in `vrf` leave wrapped toward `segments`.
@@ -64,6 +69,8 @@ struct SidEntry {
     vrf: Option<String>,
     interface: Option<String>,
     next_hop: Option<String>,
+    #[serde(default)]
+    flavors: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -88,6 +95,7 @@ pub(crate) fn resolve(entry: Srv6Entry) -> Srv6 {
                 vrf: s.vrf.into_iter().collect(),
                 interface: s.interface.into_iter().collect(),
                 next_hop: s.next_hop.into_iter().collect(),
+                flavors: s.flavors,
             })
             .collect(),
         policy: entry

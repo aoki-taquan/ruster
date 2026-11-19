@@ -1516,14 +1516,18 @@ fn srv6_sid(
             .ok_or_else(|| format!("SRv6 SID {prefix}/{len}: VRF {name}"))
     };
     let behaviour = match local {
-        table::Srv6Local::End => Srv6Behaviour::End,
+        table::Srv6Local::End { flavors } => Srv6Behaviour::End {
+            flavors: srv6_flavors(*flavors),
+        },
         table::Srv6Local::EndX {
             interface,
             next_hop,
+            flavors,
         } => match active.get(interface.as_str()) {
             Some(&(egress, _)) => Srv6Behaviour::EndX {
                 egress,
                 next_hop: next_hop.octets(),
+                flavors: srv6_flavors(*flavors),
             },
             None => return Ok(None),
         },
@@ -1555,6 +1559,14 @@ fn srv6_sid(
     ruster_core::Srv6Sid::new(prefix, len, behaviour)
         .map(Some)
         .map_err(|e| format!("SRv6 SID {len}: {e:?}"))
+}
+
+fn srv6_flavors(flavors: table::Srv6Flavors) -> ruster_core::Srv6Flavors {
+    ruster_core::Srv6Flavors {
+        psp: flavors.psp,
+        usp: flavors.usp,
+        usd: flavors.usd,
+    }
 }
 
 /// Core's NAPT for the table's entry, or `None` when one of its interfaces is
@@ -2083,7 +2095,9 @@ mod tests {
                 segments: vec![rng.pick(&["fc00:1::", "fc00:2::"]).parse().unwrap()],
                 reduced: false,
             }),
-            _ if v6 && default => RouteAction::Srv6Local(table::Srv6Local::End),
+            _ if v6 && default => RouteAction::Srv6Local(table::Srv6Local::End {
+                flavors: table::Srv6Flavors::default(),
+            }),
             _ => RouteAction::Discard,
         };
         Change::set(key, Value::Route(action))

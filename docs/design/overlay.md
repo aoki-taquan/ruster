@@ -195,7 +195,7 @@ SIDは、RFC 8986では経路の表の一部として扱われる。そのため
 
 | 表 | キー | 値 |
 |---|---|---|
-| ローカルのSID（`ruster-fib`の経路の動作`srv6-local`） | defaultのVRF、SIDのプレフィックス（IPv6） | 動作: End / End.X、End.DX4、End.DX6（インターフェースと次の転送先のアドレス） / End.DT4、End.DT6、End.DT46（VRF） |
+| ローカルのSID（`ruster-fib`の経路の動作`srv6-local`） | defaultのVRF、SIDのプレフィックス（IPv6） | 動作: End / End.X、End.DX4、End.DX6（インターフェースと次の転送先のアドレス） / End.DT4、End.DT6、End.DT46（VRF）。EndとEnd.Xのflavor（PSP、USP、USD）は、動作の名前に付ける（RFC 8986の10.2の名前、`End with PSP & USD`など） |
 | 包む方針（`ruster-fib`の経路の動作`srv6-encap`） | VRF、経路のプレフィックス | 外側の送信元、SIDのリスト（1から8個）、H.Encaps.Redか。外側はdefaultのVRFで送る |
 
 - SIDはdefaultのVRFにだけ置く（下側のVRFを選ぶのは、要る場面が出てから）。
@@ -223,7 +223,10 @@ End（4.1）、End.X（4.2）:
    └ Segments Leftを1減らし、宛先をSegment List[Segments Left]にする。Hop Limitは続く転送で1減る
        End: defaultのVRFで引き直す（新しい宛先もローカルのSIDなら、続けて扱う。4個まで）
        End.X: 値の次の転送先へ送る
-  それ以外 → 「上位のヘッダ」
+       PSP（4.16.1）なら、Segments Leftが0になったところでSRHを外す
+  USD（4.16.3）で、上位のヘッダが41か4 → 内側を外す。EndはdefaultのVRFで経路を引き、End.Xは値の
+      次の転送先へ送る（内側がIPv4ならdefaultのVRFで引く）。内側がルータ宛てかNDなら捨てる
+  それ以外 → 「上位のヘッダ」（USP（4.16.2）は受けるが、処理する上位のヘッダが無いので何も変わらない）
 End.DT6（4.6）、End.DT4（4.7）、End.DT46（4.8）、End.DX6（4.4）、End.DX4（4.5）:
   SRHがあり、Segments Left != 0 → ICMPv6 Parameter Problem（code 0、Segments Leftの位置）
   上位のヘッダが41（End.DT6、End.DT46、End.DX6）か4（End.DT4、End.DT46、End.DX4）

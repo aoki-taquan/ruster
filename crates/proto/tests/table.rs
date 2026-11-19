@@ -1584,7 +1584,7 @@ fn vxlan_entries_round_trip_and_are_checked() {
 
 #[test]
 fn srv6_sids_and_policies_round_trip_and_are_checked() {
-    use ruster_proto::table::{Srv6Encap, Srv6Local};
+    use ruster_proto::table::{Srv6Encap, Srv6Flavors, Srv6Local};
     let v6 = |t: &str| t.parse::<std::net::Ipv6Addr>().unwrap();
     let sid = |action| {
         Change::set(
@@ -1611,14 +1611,33 @@ fn srv6_sids_and_policies_round_trip_and_are_checked() {
         )
     };
     let good = [
-        sid(Srv6Local::End),
+        sid(Srv6Local::End {
+            flavors: Default::default(),
+        }),
         sid(Srv6Local::EndX {
             interface: "wan".into(),
             next_hop: v6("fe80::1"),
+            flavors: Default::default(),
         }),
         sid(Srv6Local::EndDt4 { vrf: "red".into() }),
         sid(Srv6Local::EndDt6 { vrf: "red".into() }),
         sid(Srv6Local::EndDt46 { vrf: "red".into() }),
+        sid(Srv6Local::End {
+            flavors: Srv6Flavors {
+                psp: true,
+                usp: false,
+                usd: true,
+            },
+        }),
+        sid(Srv6Local::EndX {
+            interface: "wan".into(),
+            next_hop: v6("fe80::1"),
+            flavors: Srv6Flavors {
+                psp: true,
+                usp: true,
+                usd: true,
+            },
+        }),
         sid(Srv6Local::EndDx6 {
             interface: "lan".into(),
             next_hop: v6("fe80::2"),
@@ -1637,15 +1656,35 @@ fn srv6_sids_and_policies_round_trip_and_are_checked() {
     assert!(entry_line(&good[1].key, good[1].value.as_ref().unwrap())
         .unwrap()
         .contains("End.X"));
+    // The flavors are named as RFC 8986 section 10.2 does.
+    let names: Vec<String> = good
+        .iter()
+        .filter_map(|change| match &change.value {
+            Some(Value::Route(RouteAction::Srv6Local(local))) => Some(local.name()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        names.contains(&"End with PSP & USD".to_owned()),
+        "{names:?}"
+    );
+    assert!(
+        names.contains(&"End.X with PSP, USP & USD".to_owned()),
+        "{names:?}"
+    );
     // A SID outside the default VRF, or IPv4.
-    let mut other_vrf = sid(Srv6Local::End);
+    let mut other_vrf = sid(Srv6Local::End {
+        flavors: Default::default(),
+    });
     other_vrf.key = Key::Route {
         vrf: "red".into(),
         prefix: ip6("fc00:1::4"),
         len: 128,
     };
     assert!(other_vrf.validate().is_err());
-    let mut ipv4 = sid(Srv6Local::End);
+    let mut ipv4 = sid(Srv6Local::End {
+        flavors: Default::default(),
+    });
     ipv4.key = Key::Route {
         vrf: DEFAULT_VRF.into(),
         prefix: ip([10, 0, 0, 1]),

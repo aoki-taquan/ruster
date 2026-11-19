@@ -35,6 +35,14 @@
 //!   packet. Sections 4.4 (End.DX6) and 4.5 (End.DX4): the same checks and
 //!   unwrapping, but the inner packet goes out of the SID's interface to its next
 //!   hop without a route lookup, as forwarded in that interface's VRF.
+//! - RFC 8986 section 4.16 (flavors of End and End.X): PSP (4.16.1) takes the
+//!   Segment Routing Header off once Segments Left reaches 0 (the Next Header
+//!   before it takes its next header, the Payload Length its length less); USD
+//!   (4.16.3) unwraps an inner IPv4 or IPv6 packet when no segment is left, End's
+//!   routed in the default VRF and End.X's sent to its next hop. USP (4.16.2) is
+//!   accepted: it would pop the header before the upper-layer header is
+//!   processed, but no upper-layer header is processed (below), so it changes
+//!   nothing.
 //! - RFC 8986 section 4.1.1 and RFC 8754 section 4.3.1.2: any other upper-layer
 //!   header, or No Next Header, gets Parameter Problem code 4 (SR Upper-layer
 //!   Header Error) pointing at it. No upper-layer header is allowed by
@@ -64,6 +72,8 @@
 //! Deviations:
 //!
 //! - The SIDs are the default VRF's; the router does not take SIDs in another VRF.
+//! - End.X with USD routes an inner IPv4 packet in the default VRF: its next hop is
+//!   an IPv6 address.
 //! - A fragment to a SID (a Fragment header before the upper-layer header) is
 //!   dropped: it is not put back together.
 //! - No HMAC (RFC 8754 section 2.1.2) is checked, and the source address is not
@@ -117,9 +127,13 @@ const MAX_LOCAL_SEGMENTS: usize = 4;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Srv6Behaviour {
     /// End (section 4.1): on to the next segment, routed in the default VRF.
-    End,
+    End { flavors: Srv6Flavors },
     /// End.X (section 4.2): on to the next segment, out of `egress` to `next_hop`.
-    EndX { egress: IfId, next_hop: [u8; 16] },
+    EndX {
+        egress: IfId,
+        next_hop: [u8; 16],
+        flavors: Srv6Flavors,
+    },
     /// End.DT6 (section 4.6): the inner IPv6 packet, routed in VRF `vrf` (an index
     /// into the snapshots of [`with_vrfs`](crate::ForwardingSnapshot::with_vrfs)).
     EndDt6 { vrf: u16 },
@@ -133,11 +147,27 @@ pub enum Srv6Behaviour {
     EndDx4 { egress: IfId, next_hop: [u8; 4] },
 }
 
+/// The flavors of End and End.X (RFC 8986 section 4.16).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Srv6Flavors {
+    /// Penultimate Segment Pop: the Segment Routing Header comes off when its
+    /// last segment becomes the destination.
+    pub psp: bool,
+    /// Ultimate Segment Pop: the header comes off before the upper-layer header
+    /// is processed.
+    pub usp: bool,
+    /// Ultimate Segment Decapsulation: with no segment left, an inner IPv4 or IPv6
+    /// packet is unwrapped (End: routed in the default VRF; End.X: to its next hop).
+    pub usd: bool,
+}
+
 impl Srv6Behaviour {
     /// Whether the behaviour unwraps an inner packet of upper-layer header `next`.
     fn takes(self, next: u8) -> bool {
         match self {
-            Self::End | Self::EndX { .. } => false,
+            Self::End { flavors } | Self::EndX { flavors, .. } => {
+                flavors.usd && (next == IPV4 || next == IPV6)
+            }
             Self::EndDt4 { .. } | Self::EndDx4 { .. } => next == IPV4,
             Self::EndDt6 { .. } | Self::EndDx6 { .. } => next == IPV6,
             Self::EndDt46 { .. } => next == IPV4 || next == IPV6,
@@ -271,8 +301,8 @@ pub(crate) enum Rejected {
 /// The headers of a packet to a SID, as [`walk`] found them.
 enum Chain {
     /// A Segment Routing Header at this offset (in the frame) with Segments Left
-    /// other than 0.
-    Segments(usize),
+    /// other than 0, and the offset of the Next Header field that names it.
+    Segments(usize, usize),
     /// The upper-layer header (or No Next Header): its type and offset.
     Upper(u8, usize),
 }
@@ -313,11 +343,15 @@ pub(crate) fn receive<S: PacketSlot>(
     if end > bytes.len() {
         return Err(Rejected::Drop(DropReason::Ipv6PayloadLengthExceedsPacket));
     }
-    let bytes = &mut bytes[..end];
+    let mut end = end;
     for segment in 0..MAX_LOCAL_SEGMENTS {
+        let bytes = &mut packet.bytes_mut()[..end];
         let chain = walk(bytes)?;
         match (sid.behaviour, chain) {
-            (Srv6Behaviour::End | Srv6Behaviour::EndX { .. }, Chain::Segments(srh)) => {
+            (
+                Srv6Behaviour::End { flavors } | Srv6Behaviour::EndX { flavors, .. },
+                Chain::Segments(srh, before),
+            ) => {
                 // RFC 8986 4.1 S05: before anything is changed. For a further SID
                 // in a row, the Hop Limit counts the decrement the routing after
                 // this still makes.
@@ -335,18 +369,25 @@ pub(crate) fn receive<S: PacketSlot>(
                 if segment > 0 {
                     bytes[ip + 7] -= 1;
                 }
-                if let Srv6Behaviour::EndX { egress, next_hop } = sid.behaviour {
+                // PSP (4.16.1): the last segment is now the destination.
+                if flavors.psp && bytes[srh + 3] == 0 {
+                    end = pop(packet, srh, before, end)?;
+                }
+                if let Srv6Behaviour::EndX {
+                    egress, next_hop, ..
+                } = sid.behaviour
+                {
                     return Ok(Received::Forward {
                         via: Some((egress, next_hop)),
                     });
                 }
-                match table.sid(address(bytes, ip + 24)) {
+                match table.sid(address(packet.bytes_mut(), ip + 24)) {
                     Some(next) => sid = next,
                     None => return Ok(Received::Forward { via: None }),
                 }
             }
             // End and End.X are taken above: every other behaviour unwraps.
-            (_, Chain::Segments(srh)) => {
+            (_, Chain::Segments(srh, _)) => {
                 return Err(segments_left_error(srh));
             }
             (behaviour, Chain::Upper(next, at)) if behaviour.takes(next) => {
@@ -374,9 +415,14 @@ pub(crate) fn receive<S: PacketSlot>(
                         hop[..4].copy_from_slice(&next_hop);
                         (snapshot.vrf_of(egress), Some((egress, hop)))
                     }
-                    Srv6Behaviour::End | Srv6Behaviour::EndX { .. } => {
-                        unreachable!("takes no inner packet")
-                    }
+                    // USD (4.16.3): End's inner packet is routed in the default
+                    // VRF; End.X's goes to its next hop (an IPv6 one: an inner
+                    // IPv4 packet is routed in the default VRF too).
+                    Srv6Behaviour::End { .. } => (0, None),
+                    Srv6Behaviour::EndX {
+                        egress, next_hop, ..
+                    } if next == IPV6 => (snapshot.vrf_of(egress), Some((egress, next_hop))),
+                    Srv6Behaviour::EndX { .. } => (0, None),
                 };
                 let target = snapshot
                     .vrf_snapshot(vrf)
@@ -447,6 +493,7 @@ fn segments_left_error(srh: usize) -> Rejected {
 fn walk(frame: &[u8]) -> Result<Chain, Rejected> {
     let invalid = Rejected::Drop(DropReason::Srv6HeaderInvalid);
     let mut next = frame[ETHERNET + 6];
+    let mut named_at = ETHERNET + 6;
     let mut at = ETHERNET + IPV6_HEADER;
     for _ in 0..MAX_EXTENSION_HEADERS {
         match next {
@@ -458,7 +505,7 @@ fn walk(frame: &[u8]) -> Result<Chain, Rejected> {
                 }
                 if next == ROUTING && header[3] != 0 {
                     if header[2] == SEGMENT_ROUTING {
-                        return Ok(Chain::Segments(at));
+                        return Ok(Chain::Segments(at, named_at));
                     }
                     // RFC 8200 4.4: an unrecognized Routing Type with segments left.
                     return Err(Rejected::Error(
@@ -469,6 +516,7 @@ fn walk(frame: &[u8]) -> Result<Chain, Rejected> {
                     ));
                 }
                 next = header[0];
+                named_at = at;
                 at += len;
             }
             FRAGMENT => return Err(invalid),
@@ -521,6 +569,34 @@ fn unwrap<S: PacketSlot>(
         return Err(Rejected::Drop(DropReason::Srv6NoRoom));
     }
     Ok(())
+}
+
+/// Takes the Segment Routing Header at `srh` out of `packet` (RFC 8986 4.16.1
+/// S14.2 to S14.4): the Next Header field at `before` takes its next header, the
+/// Payload Length goes down by its length. What follows the outer packet (`end`)
+/// goes. Returns the new end of the packet.
+fn pop<S: PacketSlot>(
+    packet: &mut PacketLease<S>,
+    srh: usize,
+    before: usize,
+    end: usize,
+) -> Result<usize, Rejected> {
+    if !packet.truncate(end) {
+        return Err(Rejected::Drop(DropReason::Srv6NoRoom));
+    }
+    let bytes = packet.bytes_mut();
+    let len = (usize::from(bytes[srh + 1]) + 1) * 8;
+    bytes[before] = bytes[srh];
+    let ip = ETHERNET;
+    let payload = u16::from_be_bytes([bytes[ip + 4], bytes[ip + 5]]);
+    let payload =
+        payload - u16::try_from(len).map_err(|_| Rejected::Drop(DropReason::Srv6HeaderInvalid))?;
+    bytes[ip + 4..ip + 6].copy_from_slice(&payload.to_be_bytes());
+    bytes.copy_within(0..srh, len);
+    if !packet.resize_front(len as isize) {
+        return Err(Rejected::Drop(DropReason::Srv6NoRoom));
+    }
+    Ok(end - len)
 }
 
 /// Segments one policy holds, at most.

@@ -533,11 +533,14 @@ pub enum RouteAction {
 /// What the router does with a packet to one of its SRv6 SIDs (RFC 8986 section 4).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Srv6Local {
-    End,
+    End {
+        flavors: Srv6Flavors,
+    },
     /// Out of `interface` to `next_hop`.
     EndX {
         interface: String,
         next_hop: std::net::Ipv6Addr,
+        flavors: Srv6Flavors,
     },
     /// The inner IPv4 packet, routed in `vrf`.
     EndDt4 {
@@ -563,17 +566,69 @@ pub enum Srv6Local {
     },
 }
 
+/// The flavors of End and End.X (RFC 8986 section 4.16).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Srv6Flavors {
+    /// Penultimate Segment Pop.
+    pub psp: bool,
+    /// Ultimate Segment Pop.
+    pub usp: bool,
+    /// Ultimate Segment Decapsulation.
+    pub usd: bool,
+}
+
+impl Srv6Flavors {
+    /// As RFC 8986 section 10.2 names them after the behaviour: "" for none,
+    /// " with PSP", " with PSP & USD", " with PSP, USP & USD".
+    fn suffix(self) -> String {
+        let names: Vec<&str> = [(self.psp, "PSP"), (self.usp, "USP"), (self.usd, "USD")]
+            .into_iter()
+            .filter_map(|(on, name)| on.then_some(name))
+            .collect();
+        match names.as_slice() {
+            [] => String::new(),
+            [one] => format!(" with {one}"),
+            [first @ .., last] => format!(" with {} & {last}", first.join(", ")),
+        }
+    }
+
+    /// The behaviour's name and flavors of `name` (as [`Srv6Local::name`] writes it).
+    fn parse(name: &str) -> Option<(&str, Self)> {
+        let Some((base, list)) = name.split_once(" with ") else {
+            return Some((name, Self::default()));
+        };
+        let mut flavors = Self::default();
+        let (first, last) = list.rsplit_once(" & ").unwrap_or(("", list));
+        let names = first.split(", ").filter(|n| !n.is_empty()).chain([last]);
+        for name in names {
+            let on = match name {
+                "PSP" => &mut flavors.psp,
+                "USP" => &mut flavors.usp,
+                "USD" => &mut flavors.usd,
+                _ => return None,
+            };
+            if *on {
+                return None;
+            }
+            *on = true;
+        }
+        // Only in the order and form `suffix` writes.
+        (flavors.suffix() == format!(" with {list}")).then_some((base, flavors))
+    }
+}
+
 impl Srv6Local {
-    /// The behaviour's name, as RFC 8986 section 10.2 writes it.
-    pub const fn name(&self) -> &'static str {
+    /// The behaviour's name, as RFC 8986 section 10.2 writes it (with its
+    /// flavors).
+    pub fn name(&self) -> String {
         match self {
-            Self::End => "End",
-            Self::EndX { .. } => "End.X",
-            Self::EndDt4 { .. } => "End.DT4",
-            Self::EndDt6 { .. } => "End.DT6",
-            Self::EndDt46 { .. } => "End.DT46",
-            Self::EndDx6 { .. } => "End.DX6",
-            Self::EndDx4 { .. } => "End.DX4",
+            Self::End { flavors } => format!("End{}", flavors.suffix()),
+            Self::EndX { flavors, .. } => format!("End.X{}", flavors.suffix()),
+            Self::EndDt4 { .. } => "End.DT4".into(),
+            Self::EndDt6 { .. } => "End.DT6".into(),
+            Self::EndDt46 { .. } => "End.DT46".into(),
+            Self::EndDx6 { .. } => "End.DX6".into(),
+            Self::EndDx4 { .. } => "End.DX4".into(),
         }
     }
 }
@@ -845,7 +900,7 @@ impl Change {
                             return Err(ModelError::Invalid("SRv6 SID (IPv6, default VRF)"));
                         }
                         match local {
-                            Srv6Local::End => {}
+                            Srv6Local::End { .. } => {}
                             Srv6Local::EndX { interface, .. }
                             | Srv6Local::EndDx6 { interface, .. }
                             | Srv6Local::EndDx4 { interface, .. } => name(interface)?,
@@ -1330,7 +1385,7 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
         }
         Value::Route(action) => {
             e.map(match action {
-                RouteAction::Srv6Local(Srv6Local::End) => 1,
+                RouteAction::Srv6Local(Srv6Local::End { .. }) => 1,
                 RouteAction::Srv6Local(
                     Srv6Local::EndX { .. } | Srv6Local::EndDx6 { .. } | Srv6Local::EndDx4 { .. },
                 ) => 3,
@@ -1803,12 +1858,13 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
 
 fn encode_srv6_local(e: &mut Encoder, local: &Srv6Local) {
     let d = |member: u64| member - sid::ROUTE;
-    e.u64(d(sid::ROUTE_SRV6_BEHAVIOUR)).text(local.name());
+    e.u64(d(sid::ROUTE_SRV6_BEHAVIOUR)).text(&local.name());
     match local {
-        Srv6Local::End => {}
+        Srv6Local::End { .. } => {}
         Srv6Local::EndX {
             interface,
             next_hop,
+            ..
         }
         | Srv6Local::EndDx6 {
             interface,
@@ -1902,12 +1958,17 @@ impl Srv6Members {
             return Ok(None);
         }
         let behaviour = self.behaviour.ok_or(ModelError::Missing("behavior"))?;
-        let local = match (behaviour.as_str(), self.vrf, self.interface, self.next_hop) {
-            ("End", None, None, None) => Srv6Local::End,
+        let (name, flavors) =
+            Srv6Flavors::parse(&behaviour).ok_or(ModelError::Invalid("SRv6 behavior"))?;
+        let flavored = flavors != Srv6Flavors::default();
+        let local = match (name, self.vrf, self.interface, self.next_hop) {
+            ("End", None, None, None) => Srv6Local::End { flavors },
             ("End.X", None, Some(interface), Some(IpAddr::V6(next_hop))) => Srv6Local::EndX {
                 interface,
                 next_hop,
+                flavors,
             },
+            _ if flavored => return Err(ModelError::Invalid("SRv6 behavior and its members")),
             ("End.DX6", None, Some(interface), Some(IpAddr::V6(next_hop))) => Srv6Local::EndDx6 {
                 interface,
                 next_hop,
@@ -2180,11 +2241,12 @@ pub fn entry_line(key: &Key, value: &Value) -> Option<String> {
                 RouteAction::Reject => "reject".into(),
                 RouteAction::LookupVrf(other) => format!("lookup-vrf {other}"),
                 RouteAction::Srv6Local(local) => match local {
-                    Srv6Local::End => "srv6 End".into(),
+                    Srv6Local::End { .. } => format!("srv6 {}", local.name()),
                     Srv6Local::EndX {
                         interface,
                         next_hop,
-                    } => format!("srv6 End.X via {next_hop} dev {interface}"),
+                        ..
+                    } => format!("srv6 {} via {next_hop} dev {interface}", local.name()),
                     Srv6Local::EndDx6 {
                         interface,
                         next_hop,
@@ -2901,6 +2963,42 @@ mod ip_text_tests {
             "::ffff:c000:201",
         ] {
             assert!(parse_ip(text).is_err(), "{text}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod flavor_tests {
+    use super::*;
+
+    #[test]
+    fn flavors_are_read_only_as_rfc_8986_names_them() {
+        let all = Srv6Flavors {
+            psp: true,
+            usp: true,
+            usd: true,
+        };
+        assert_eq!(
+            Srv6Flavors::parse("End"),
+            Some(("End", Srv6Flavors::default()))
+        );
+        assert_eq!(
+            Srv6Flavors::parse("End.X with PSP, USP & USD"),
+            Some(("End.X", all))
+        );
+        let usd = Srv6Flavors {
+            usd: true,
+            ..Srv6Flavors::default()
+        };
+        assert_eq!(Srv6Flavors::parse("End with USD"), Some(("End", usd)));
+        for bad in [
+            "End with USD & PSP",
+            "End with PSP, USD",
+            "End with PSP & PSP",
+            "End with XYZ",
+            "End with PSP, USP, USD",
+        ] {
+            assert_eq!(Srv6Flavors::parse(bad), None, "{bad}");
         }
     }
 }

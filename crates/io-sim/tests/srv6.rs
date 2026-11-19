@@ -102,12 +102,18 @@ fn tables() -> Tables {
         .unwrap(),
         red4: [Route::new(a([192, 168, 0, 0]), 24, LAN, None).unwrap()],
         srv6: Srv6Table::new(vec![
-            sid(END, Srv6Behaviour::End),
+            sid(
+                END,
+                Srv6Behaviour::End {
+                    flavors: Default::default(),
+                },
+            ),
             sid(
                 END_X,
                 Srv6Behaviour::EndX {
                     egress: SIDE,
                     next_hop: ip6("fe80::fd"),
+                    flavors: Default::default(),
                 },
             ),
             sid(DT4, Srv6Behaviour::EndDt4 { vrf: 1 }),

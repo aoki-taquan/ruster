@@ -68,11 +68,14 @@ fn sids_and_policies_become_routes_for_ribd() {
         Some(&Value::Route(RouteAction::Srv6Local(Srv6Local::EndX {
             interface: "wan".into(),
             next_hop: "fe80::2".parse().unwrap(),
+            flavors: Default::default(),
         })))
     );
     assert_eq!(
         routes.get(&route("default", "fc00:1::1", 128)),
-        Some(&Value::Route(RouteAction::Srv6Local(Srv6Local::End)))
+        Some(&Value::Route(RouteAction::Srv6Local(Srv6Local::End {
+            flavors: Default::default()
+        })))
     );
     assert_eq!(
         routes.get(&route("red", "10.2.0.0", 16)),
@@ -227,6 +230,41 @@ vrf = "red"
     ] {
         let text = format!("{INTERFACES}{GOOD}{}", sids.replacen(from, to, 1));
         let error = parse(&text).expect_err(says);
+        assert!(error.contains(says), "{says}: {error}");
+    }
+}
+
+#[test]
+fn flavors_of_end_and_end_x_become_routes_for_ribd() {
+    use ruster_proto::table::Srv6Flavors;
+    let text = GOOD.replacen(
+        "behavior = \"End\"\n",
+        "behavior = \"End\"\nflavors = [\"PSP\", \"USD\"]\n",
+        1,
+    );
+    let config = parse(&format!("{INTERFACES}{text}")).unwrap();
+    let mut confd = Confd::new(Config::default());
+    let [_, [_, routes]] = confd.tables_now_and_with(&config);
+    assert_eq!(
+        routes.get(&route("default", "fc00:1::1", 128)),
+        Some(&Value::Route(RouteAction::Srv6Local(Srv6Local::End {
+            flavors: Srv6Flavors {
+                psp: true,
+                usp: false,
+                usd: true,
+            }
+        })))
+    );
+    for (flavors, behavior, says) in [
+        ("[\"PSP\", \"PSP\"]", "End", "given twice"),
+        ("[\"PSX\"]", "End", "flavors are"),
+        ("[\"USD\"]", "End.DT4", "only End and End.X"),
+    ] {
+        let sid = format!(
+            "\n[[srv6.sid]]\nsid = \"fc00:1::9\"\nbehavior = \"{behavior}\"\nflavors = {flavors}\n{}",
+            if behavior == "End.DT4" { "vrf = \"red\"\n" } else { "" }
+        );
+        let error = parse(&format!("{INTERFACES}{GOOD}{sid}")).expect_err(says);
         assert!(error.contains(says), "{says}: {error}");
     }
 }

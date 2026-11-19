@@ -285,6 +285,7 @@ behavior = "End.X"
 vrf = ["red"]
 interface = ["lan"]
 next-hop = ["fe80::2"]
+flavors = ["PSP"]
 
 [[srv6.policy]]
 prefix = "10.2.0.0/16"
