@@ -440,6 +440,9 @@ type-3のVTEP、相手の近隣、L2のMACの送り直しを運ばないので�
 `ruster evpn add|del --source NAME`で、ルーティングデーモンの代わりにこの3つの表を書ける。netns `evpn`は、
 VTEPを書かないVXLANとLinuxのvxlanの間で、これで`flood`、`mac`、`neighbor`を書き、届くこと、ARPとNDの代理応答を
 Linuxのホストが受けること、VTEPを消すと届かなくなることを確かめる。
+bird-rs（a4a7e02）とつなぐ通しの試験は、bird-rsの`testenv/ruster-evpn.sh`にある。ruster 2台にそれぞれbird-rsを
+付けてIBGP EVPNでつなぎ、VXLANとSRv6の両方で、フラッディング、遠くのMAC、ARPの代理応答、片方を止めると消える
+ことを確かめた（ruster 9b620208、AF_XDPとAF_PACKET）。
 
 ## 8. 作る順番
 
