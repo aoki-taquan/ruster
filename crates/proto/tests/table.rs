@@ -1937,7 +1937,8 @@ fn evpn_neighbors_round_trip_and_are_checked() {
     };
     let v4 = neighbor("192.0.2.20", [2, 0, 0, 0, 0, 0x22], false);
     let v6 = neighbor("2001:db8::20", [2, 0, 0, 0, 0, 0x22], true);
-    for change in [&v4, &v6] {
+    let link_local = neighbor("fe80::20", [2, 0, 0, 0, 0, 0x22], false);
+    for change in [&v4, &v6, &link_local] {
         assert!(change.validate().is_ok());
         assert_eq!(&round_trip(change), change);
     }

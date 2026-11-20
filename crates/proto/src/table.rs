@@ -927,7 +927,12 @@ impl Change {
                 }
             }
             Key::EvpnNeighbor { vni, address } => {
-                if !(1..=VXLAN_VNI_MAX).contains(vni) || !tunnel_end(*address) {
+                // A host's address: link-local ones too (RFC 9161 covers them).
+                let host = !(address.is_unspecified()
+                    || address.is_loopback()
+                    || address.is_multicast()
+                    || matches!(address, IpAddr::V4(v4) if v4.is_broadcast()));
+                if !(1..=VXLAN_VNI_MAX).contains(vni) || !host {
                     return Err(ModelError::Invalid("EVPN VNI and address"));
                 }
             }

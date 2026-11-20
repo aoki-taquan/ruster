@@ -78,8 +78,7 @@ pub struct BridgeCounters {
     pub flood_dropped: u64,
     /// Frames dropped because their destination is on the member they came in on.
     pub filtered: u64,
-    /// ARP requests and Neighbor Solicitations the bridge answered for a remote
-    /// host (RFC 9161).
+    /// ARP requests the bridge answered for a remote host (RFC 9161).
     pub proxied: u64,
     /// Frames dropped because their destination is reserved (IEEE 802.1Q table 8-1)
     /// or their source is not a unicast address.
@@ -693,8 +692,7 @@ pub struct BridgeConfig {
     pub proxy: Option<Proxy>,
 }
 
-/// The remote hosts a bridge answers ARP requests (and Neighbor Solicitations) for,
-/// on its local members (RFC 9161: a routing daemon learned them from EVPN).
+/// The remote hosts a bridge answers ARP requests for, on its local members (RFC 9161: a routing daemon learned them from EVPN).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Proxy {
     /// The members requests are answered on: ports and VLAN sub-interfaces, not

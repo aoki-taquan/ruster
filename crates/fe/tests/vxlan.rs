@@ -741,4 +741,18 @@ fn an_arp_request_for_an_evpn_host_is_answered_on_the_local_port() {
         bench.send(WAN, outer(VTEP2, 100, &from_vtep)),
         vec![(P1, from_vtep)]
     );
+    // The address is the bridge's own (its IRB's): not answered for the remote
+    // host.
+    bench.change(&[
+        iface("br0", [2, 0, 0, 0, 0, 0xb]),
+        Change::set(
+            Key::Address {
+                interface: "br0".into(),
+                address: Ipv4Addr::new(192, 0, 2, 20).into(),
+            },
+            Value::Address { prefix_len: 24 },
+        ),
+    ]);
+    bench.send(P1, request([192, 0, 2, 20]));
+    assert_eq!(bench.fe.counters().bridge_proxied, 1);
 }

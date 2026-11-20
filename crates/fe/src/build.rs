@@ -425,10 +425,14 @@ fn evpn_macs(
 }
 
 /// Gives each bridge with a VXLAN member of an EVPN VNI the remote hosts' addresses
-/// of that VNI, to answer ARP and ND with on its other members (RFC 9161).
+/// of that VNI, to answer ARP with on its other members (RFC 9161). Not an address
+/// of the bridge's own interface (IRB): a remote router's gateway entry with the
+/// same address must not take the place of the local IRB. When the same address
+/// is in two VNIs of one bridge, the first in the table's order is answered with.
 fn evpn_neighbors(
     store: &Store,
     bridges: &mut [(String, ruster_core::BridgeConfig)],
+    names: &[String],
     overlays: &[ruster_core::Overlay],
 ) {
     for (key, value) in store.table(sid::EVPN_NEIGHBOR) {
@@ -441,7 +445,16 @@ fn evpn_neighbors(
             mac: *mac,
             router: *router,
         };
-        for (_, bridge) in bridges.iter_mut() {
+        for (name, (_, bridge)) in names.iter().zip(bridges.iter_mut()) {
+            let own = store
+                .get(&Key::Address {
+                    interface: name.clone(),
+                    address: *address,
+                })
+                .is_some();
+            if own {
+                continue;
+            }
             let in_vni = overlays.iter().any(|o| {
                 bridge.members.contains(&o.interface)
                     && matches!(o.kind, ruster_core::OverlayKind::Vxlan { vni: v, .. } if v == *vni)
@@ -1259,7 +1272,7 @@ pub(crate) fn build(
         }
     }
     evpn_macs(store, &bridges, &overlays, &mut bridge_statics);
-    evpn_neighbors(store, &mut bridges, &overlays);
+    evpn_neighbors(store, &mut bridges, &bridge_names, &overlays);
     let mut names: BTreeSet<&str> = active.values().map(|&(_, vrf)| vrf).collect();
     if let Some(sid_vrfs) = &kept_sid_vrfs {
         // The VRFs the routes are in, as before: the change kept them.
