@@ -595,6 +595,24 @@
       },
       {
         "namespace": "data",
+        "identifier": "/ruster-bridge:bridges/bridge/learned-entry",
+        "sid": 60265,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-bridge:bridges/bridge/learned-entry/port",
+        "sid": 60266,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-bridge:bridges/bridge/learned-entry/vtep",
+        "sid": 60267,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
         "identifier": "/ruster-if-tunnel:etherip",
         "sid": 60270,
         "status": "unstable"

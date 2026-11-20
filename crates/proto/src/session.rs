@@ -394,6 +394,19 @@ impl Server {
         }
     }
 
+    /// Makes `changes` to state the owner keeps itself (as [`Server::set_state`]),
+    /// and tells every connection that observes `s` of them: the notification's
+    /// payload is the changes, as a GET of the tables encodes them.
+    pub fn change_state(&mut self, changes: &[Change]) {
+        if changes.is_empty() {
+            return;
+        }
+        let _ = self.store.apply(changes);
+        if let Ok(payload) = encode_changes(changes) {
+            self.notify(&payload);
+        }
+    }
+
     /// Queues the answers kept back, for the connections that are still there.
     pub fn release_changed(&mut self) {
         for (id, token) in std::mem::take(&mut self.held) {

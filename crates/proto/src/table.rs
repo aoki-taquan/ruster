@@ -123,6 +123,13 @@ pub enum Key {
         bridge: String,
         mac: [u8; 6],
     },
+    /// An address bridge `bridge` learned (state the FE keeps: no writer writes it;
+    /// its value is a [`Value::BridgeMac`]). For a routing daemon that advertises
+    /// the router's addresses (EVPN, RFC 7432 section 9.1).
+    BridgeLearned {
+        bridge: String,
+        mac: [u8; 6],
+    },
     /// An EtherIP interface (`ruster-if-tunnel`, RFC 3378): the interface of this
     /// name carries its frames inside IP. It is only a bridge member.
     EtherIp {
@@ -781,6 +788,7 @@ impl Key {
             Self::Bridge { .. } => sid::BRIDGE,
             Self::BridgePort { .. } => sid::BRIDGE_PORT,
             Self::BridgeMac { .. } => sid::BRIDGE_MAC,
+            Self::BridgeLearned { .. } => sid::BRIDGE_LEARNED,
             Self::EtherIp { .. } => sid::ETHERIP,
             Self::Vxlan { .. } => sid::VXLAN,
             Self::Srv6L2 { .. } => sid::SRV6_L2,
@@ -860,7 +868,9 @@ impl Change {
             | Key::SourcePrefix { source }
             | Key::SourceIpv6 { source }
             | Key::SourceDns { source } => name(source)?,
-            Key::Bridge { name: n } | Key::BridgeMac { bridge: n, .. } => name(n)?,
+            Key::Bridge { name: n }
+            | Key::BridgeMac { bridge: n, .. }
+            | Key::BridgeLearned { bridge: n, .. } => name(n)?,
             Key::BridgePort { interface }
             | Key::EtherIp { interface }
             | Key::Vxlan { interface }
@@ -904,6 +914,7 @@ impl Change {
                         | (Key::Bridge { .. }, Value::Bridge { .. })
                         | (Key::BridgePort { .. }, Value::BridgePort { .. })
                         | (Key::BridgeMac { .. }, Value::BridgeMac { .. })
+                        | (Key::BridgeLearned { .. }, Value::BridgeMac { .. })
                         | (Key::EtherIp { .. }, Value::EtherIp { .. })
                         | (Key::Vxlan { .. }, Value::Vxlan { .. })
                         | (Key::Srv6L2 { .. }, Value::Srv6L2 { .. })
@@ -1376,6 +1387,12 @@ pub fn encode_key(key: &Key, e: &mut Encoder<'_>) {
                 .text(bridge)
                 .text(&format_mac(mac));
         }
+        Key::BridgeLearned { bridge, mac } => {
+            e.array(3)
+                .u64(sid::BRIDGE_LEARNED)
+                .text(bridge)
+                .text(&format_mac(mac));
+        }
         Key::FirewallRule { vrf, id } => {
             e.array(3)
                 .u64(sid::FIREWALL_RULE)
@@ -1405,7 +1422,12 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
         | sid::VXLAN
         | sid::SRV6_L2
         | sid::SRV6_SID_COUNTERS => 2,
-        sid::ADDRESS | sid::ROUTE | sid::NEIGHBOR | sid::FIREWALL_RULE | sid::BRIDGE_MAC => 3,
+        sid::ADDRESS
+        | sid::ROUTE
+        | sid::NEIGHBOR
+        | sid::FIREWALL_RULE
+        | sid::BRIDGE_MAC
+        | sid::BRIDGE_LEARNED => 3,
         other => return Err(ModelError::UnknownTable(other)),
     };
     if len != expected {
@@ -1440,6 +1462,10 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
             Key::Srv6SidCounters { prefix, len }
         }
         sid::BRIDGE_MAC => Key::BridgeMac {
+            bridge: first,
+            mac: parse_mac(d.text()?)?,
+        },
+        sid::BRIDGE_LEARNED => Key::BridgeLearned {
             bridge: first,
             mac: parse_mac(d.text()?)?,
         },
@@ -1879,6 +1905,7 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
             | sid::VXLAN
             | sid::SRV6_L2
             | sid::SRV6_SID_COUNTERS
+            | sid::BRIDGE_LEARNED
     ) {
         return decode_policy_value(table, d);
     }
@@ -2502,6 +2529,13 @@ pub fn entry_line(key: &Key, value: &Value) -> Option<String> {
             let vtep = vtep.map(|v| format!(" vtep {v}")).unwrap_or_default();
             format!("bridge-mac {bridge} {} {interface}{vtep}", format_mac(mac))
         }
+        (Key::BridgeLearned { bridge, mac }, Value::BridgeMac { interface, vtep }) => {
+            let vtep = vtep.map(|v| format!(" vtep {v}")).unwrap_or_default();
+            format!(
+                "bridge-learned {bridge} {} {interface}{vtep}",
+                format_mac(mac)
+            )
+        }
         (Key::EtherIp { interface }, Value::EtherIp { local, remote }) => {
             format!("etherip {interface} {local} to {remote}")
         }
@@ -2673,12 +2707,11 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
             bridge: text(sid::BRIDGE_PORT_BRIDGE, "bridge-name")?
                 .ok_or(ModelError::Missing("bridge-name"))?,
         }
-    } else if table == sid::BRIDGE_MAC {
+    } else if table == sid::BRIDGE_MAC || table == sid::BRIDGE_LEARNED {
+        // A learned entry has a static entry's members, at the same offsets.
         Value::BridgeMac {
-            interface: text(sid::BRIDGE_MAC_PORT, "port")?.ok_or(ModelError::Missing("port"))?,
-            vtep: text(sid::BRIDGE_MAC_VTEP, "vtep")?
-                .map(|t| parse_ip(&t))
-                .transpose()?,
+            interface: text(table + 1, "port")?.ok_or(ModelError::Missing("port"))?,
+            vtep: text(table + 2, "vtep")?.map(|t| parse_ip(&t)).transpose()?,
         }
     } else if table == sid::ETHERIP {
         let mut address = |member: u64, what: &'static str| {

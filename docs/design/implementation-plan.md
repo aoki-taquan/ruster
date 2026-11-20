@@ -166,7 +166,6 @@ charterの「作るもの」は上の表のとおりそろい、2026-11-10 にow
 
 - VRFごとのBGP。
 - `ruster diff`に消えるNATセッションを出すことと、FE、ribd、neighdを候補の確認に加えること。
-- ブリッジのMACの表をFEの状態のsocketで見せること（今は数をログに出すだけ）。
 - FRRからFPMでSRv6の経路（`seg6local`と`seg6`のencap）を受けることと、SIDごとの数を見せること。
 - `backlog`のissueに残したMediumとLow（試験の不足、数え方、説明の細かい点、作らないと決めて理由を書いた点）は、
   backlogのまま置き、使う場面が出たものから片付ける。
@@ -180,10 +179,9 @@ backlogと同じく、使う場面が出たものから片付ける。
 
 ルーティングデーモン（bird-rsなど）がEVPNを話し、rusterはそのL2の転送を受け持つ。次の順に作る。
 
-1. FEが学んだMACを、状態の表として見せる（FEの状態のsocket、observeで変化が届く）。
-2. 遠くのMACとVNIごとのフラッディングの相手（VTEP）を、送り手からribdが受けて選び、FEへ書く。
-3. ARPとNDの代理応答。送り手から受けたMACとIPの組で、ブリッジのARPとNDにルータが答える。
-4. SRv6で運ぶ: End.DT2UとEnd.DT2M、遠くのMACの後ろをSRv6のSIDにする。
+1. 遠くのMACとVNIごとのフラッディングの相手（VTEP）を、送り手からribdが受けて選び、FEへ書く。
+2. ARPとNDの代理応答。送り手から受けたMACとIPの組で、ブリッジのARPとNDにルータが答える。
+3. SRv6で運ぶ: End.DT2UとEnd.DT2M、遠くのMACの後ろをSRv6のSIDにする。
 
 #### 経路や通信の数が増えたとき
 
