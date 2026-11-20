@@ -30,6 +30,12 @@
 //!   and advertises it. While the daemon still gives the same remote entry, the
 //!   learned one stays; given otherwise (another VTEP, or withdrawn and given
 //!   again), the remote one replaces it.
+//! - RFC 9161 section 3.3 (proxy ARP): a broadcast ARP request (RFC 826) received on
+//!   a local member (a port or VLAN sub-interface, not an overlay) for a remote host
+//!   a routing daemon gave is answered there, with the host's addresses as the
+//!   source and sender; it is not flooded. Not answered: gratuitous requests, those
+//!   for unknown addresses (flooded), and those for a host learned on the asking
+//!   member.
 //!
 //! Deviations: a movable static entry is changed by learning (802.1Q 8.7 keeps
 //! static entries); no spanning tree (the operator keeps the topology free of loops); a
@@ -37,8 +43,8 @@
 //! sub-interfaces as members); a frame with a group or all-zero source address is
 //! dropped, not relayed.
 
-use std::collections::BTreeSet;
-use std::net::IpAddr;
+use std::collections::{BTreeMap, BTreeSet};
+use std::net::{IpAddr, Ipv4Addr};
 
 use crate::fixed_directory::DirectoryHashDomain;
 use crate::{IfId, ResolutionHashKey};
@@ -72,6 +78,8 @@ pub struct BridgeCounters {
     pub flood_dropped: u64,
     /// Frames dropped because their destination is on the member they came in on.
     pub filtered: u64,
+    /// ARP requests the bridge answered for a remote host (RFC 9161).
+    pub proxied: u64,
     /// Frames dropped because their destination is reserved (IEEE 802.1Q table 8-1)
     /// or their source is not a unicast address.
     pub dropped: u64,
@@ -616,6 +624,12 @@ impl MacTable {
     }
 
     /// Counts a frame sent out of one member.
+    pub fn count_proxied(&mut self, bridge: u16) {
+        if let Some(b) = self.bridges.get_mut(usize::from(bridge)) {
+            b.counters.proxied += 1;
+        }
+    }
+
     pub fn count_forwarded(&mut self, bridge: u16) {
         if let Some(b) = self.bridges.get_mut(usize::from(bridge)) {
             b.counters.forwarded += 1;
@@ -674,6 +688,52 @@ pub struct BridgeConfig {
     pub irb: Option<(IfId, [u8; 6])>,
     /// The members: ports, VLAN sub-interfaces and overlays.
     pub members: Vec<IfId>,
+    /// What the bridge answers ARP and ND with for remote hosts, when it does.
+    pub proxy: Option<Proxy>,
+}
+
+/// The remote hosts a bridge answers ARP requests for, on its local members (RFC 9161: a routing daemon learned them from EVPN).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Proxy {
+    /// The members requests are answered on: ports and VLAN sub-interfaces, not
+    /// overlays (the remote ends answer their own hosts).
+    pub members: Vec<IfId>,
+    pub hosts: BTreeMap<IpAddr, ProxyHost>,
+}
+
+/// A remote host's MAC address, and whether it is a router.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProxyHost {
+    pub mac: [u8; 6],
+    pub router: bool,
+}
+
+/// The address an ARP request in `frame` (Ethernet, RFC 826 for IPv4 over
+/// Ethernet) asks for, unless it is a gratuitous one (its sender's own address):
+/// those are not answered (RFC 9161 section 3.3).
+fn arp_request_target(frame: &[u8]) -> Option<Ipv4Addr> {
+    let arp = frame.get(12..42)?;
+    if arp[0..10] != [0x08, 0x06, 0, 1, 0x08, 0, 6, 4, 0, 1] {
+        return None;
+    }
+    let (sender, target) = (&arp[16..20], &arp[26..30]);
+    (sender != target).then(|| Ipv4Addr::new(target[0], target[1], target[2], target[3]))
+}
+
+/// Makes the ARP request in `frame` (see [`arp_request_target`]) the reply of the
+/// host `mac` (RFC 9161 section 3.3: its MAC address the source of the frame and
+/// the sender's hardware address, the address asked for the sender's).
+fn make_arp_reply(frame: &mut [u8], mac: [u8; 6]) {
+    let mut asker = [0; 10];
+    asker.copy_from_slice(&frame[22..32]);
+    let mut target = [0; 4];
+    target.copy_from_slice(&frame[38..42]);
+    frame[0..6].copy_from_slice(&asker[0..6]);
+    frame[6..12].copy_from_slice(&mac);
+    frame[21] = 2;
+    frame[22..28].copy_from_slice(&mac);
+    frame[28..32].copy_from_slice(&target);
+    frame[32..42].copy_from_slice(&asker);
 }
 
 /// The longest frame a flood copies out (an Ethernet frame with a 9216-byte payload).
@@ -867,6 +927,9 @@ impl Bridges {
             return Received::Pass;
         };
         let irb = self.bridges[usize::from(bridge)].irb;
+        if let Some(out) = self.proxy(bridge, member, packet.bytes_mut(), now_ms) {
+            return out;
+        }
         let decision = self.table.receive(
             bridge,
             member,
@@ -900,6 +963,40 @@ impl Bridges {
             }
             BridgeDecision::Drop => Received::Dropped,
         }
+    }
+
+    /// Answers an ARP request received on a local member of `bridge` for a remote
+    /// host the bridge knows, in place of flooding it: the frame becomes the reply
+    /// and goes back out of `member`. Not when the host is learned on `member`
+    /// itself (it answers; RFC 9161 section 3.3). The source is learned as for any
+    /// frame.
+    fn proxy(
+        &mut self,
+        bridge: u16,
+        member: IfId,
+        frame: &mut [u8],
+        now_ms: u64,
+    ) -> Option<Received> {
+        let proxy = self.bridges.get(usize::from(bridge))?.proxy.as_ref()?;
+        if !proxy.members.contains(&member) || frame.get(0..6)? != [0xff; 6] {
+            return None;
+        }
+        let host = *proxy.hosts.get(&IpAddr::V4(arp_request_target(frame)?))?;
+        let source: [u8; 6] = frame.get(6..12)?.try_into().ok()?;
+        if source[0] & 1 != 0 || source == [0; 6] {
+            return None;
+        }
+        if self
+            .table
+            .lookup(bridge, &host.mac, now_ms)
+            .is_some_and(|(at, _)| at == member)
+        {
+            return None;
+        }
+        self.table.learn(bridge, source, member, None, now_ms);
+        make_arp_reply(frame, host.mac);
+        self.table.count_proxied(bridge);
+        Some(Received::Forward(member, None))
     }
 
     /// Where a frame sent out of `egress` goes when `egress` is an IRB: the member its
@@ -1220,6 +1317,74 @@ mod tests {
     }
 
     #[test]
+    fn an_arp_request_for_a_remote_host_is_answered_on_a_local_member() {
+        let key = ResolutionHashKey::new(3, 4).unwrap();
+        let mut bridges = Bridges::new(16, 1, key);
+        let remote = [2, 0, 0, 0, 0, 0x22];
+        let asker = [2, 0, 0, 0, 0, 0x11];
+        let config = BridgeConfig {
+            limits: BridgeLimits {
+                aging_ms: 1_000,
+                max_macs: 8,
+            },
+            irb: None,
+            members: vec![P1, P2, P3],
+            proxy: Some(Proxy {
+                members: vec![P1, P2],
+                hosts: [(
+                    IpAddr::from([192, 0, 2, 20]),
+                    ProxyHost {
+                        mac: remote,
+                        router: false,
+                    },
+                )]
+                .into(),
+            }),
+        };
+        bridges.publish(vec![config], &[None], &[], |_, _| true);
+        let request = |sender: [u8; 4], target: [u8; 4]| {
+            let mut f = vec![0xff; 6];
+            f.extend_from_slice(&asker);
+            f.extend_from_slice(&[0x08, 0x06, 0, 1, 0x08, 0, 6, 4, 0, 1]);
+            f.extend_from_slice(&asker);
+            f.extend_from_slice(&sender);
+            f.extend_from_slice(&[0; 6]);
+            f.extend_from_slice(&target);
+            f.resize(60, 0);
+            f
+        };
+        let mut frame = request([192, 0, 2, 10], [192, 0, 2, 20]);
+        assert_eq!(
+            bridges.proxy(0, P1, &mut frame, 0),
+            Some(Received::Forward(P1, None))
+        );
+        let mut reply = asker.to_vec();
+        reply.extend_from_slice(&remote);
+        reply.extend_from_slice(&[0x08, 0x06, 0, 1, 0x08, 0, 6, 4, 0, 2]);
+        reply.extend_from_slice(&remote);
+        reply.extend_from_slice(&[192, 0, 2, 20]);
+        reply.extend_from_slice(&asker);
+        reply.extend_from_slice(&[192, 0, 2, 10]);
+        reply.resize(60, 0);
+        assert_eq!(frame, reply);
+        assert_eq!(bridges.table.counters().next().unwrap().proxied, 1);
+        // The asker was learned.
+        assert_eq!(bridges.table.send(0, &asker, 1), Some((P1, None)));
+        // Not for: another address, a gratuitous request, a request from an
+        // overlay member, or when the host is on the asking member.
+        for (member, mut frame) in [
+            (P1, request([192, 0, 2, 10], [192, 0, 2, 21])),
+            (P1, request([192, 0, 2, 20], [192, 0, 2, 20])),
+            (P3, request([192, 0, 2, 10], [192, 0, 2, 20])),
+        ] {
+            assert_eq!(bridges.proxy(0, member, &mut frame, 2), None);
+        }
+        bridges.table.learn(0, remote, P2, None, 3);
+        let mut frame = request([192, 0, 2, 10], [192, 0, 2, 20]);
+        assert_eq!(bridges.proxy(0, P2, &mut frame, 4), None);
+    }
+
+    #[test]
     fn many_entries_survive_removals() {
         let mut t = table(512, 500);
         let mac = |i: u16| {
@@ -1273,6 +1438,7 @@ mod tests {
             },
             irb: Some((IfId(9), IRB)),
             members: vec![P1, P2],
+            proxy: None,
         };
         bridges.publish(vec![config], &[None], &[], |_, _| true);
         assert_eq!(bridges.member_of(P2), Some(0));

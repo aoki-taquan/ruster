@@ -213,6 +213,13 @@ pub const EVPN_MAC_VTEP: u64 = 60321;
 /// `ruster-evpn`: a VTEP that takes the flooded frames of a VNI (RFC 7432 Inclusive
 /// Multicast Ethernet Tag route, ingress replication), by VNI and VTEP.
 pub const EVPN_FLOOD: u64 = 60325;
+/// `ruster-evpn`: the MAC address of a remote host's IP address in an EVPN VNI (the
+/// IP of an RFC 7432 MAC/IP route), by VNI and address, and whether it is a router
+/// (RFC 9047 ARP/ND extended community): what the bridge answers ARP and ND with
+/// (RFC 9161).
+pub const EVPN_NEIGHBOR: u64 = 60330;
+pub const EVPN_NEIGHBOR_MAC: u64 = 60331;
+pub const EVPN_NEIGHBOR_ROUTER: u64 = 60332;
 
 /// Notification: the FE has a packet for a next hop that is not in the neighbor table.
 pub const RESOLVE_REQUEST: u64 = 60050;
@@ -407,6 +414,9 @@ pub const ALL: &[(&str, u64)] = &[
     ("/ruster-evpn:evpn/mac", EVPN_MAC),
     ("/ruster-evpn:evpn/mac/vtep", EVPN_MAC_VTEP),
     ("/ruster-evpn:evpn/flood", EVPN_FLOOD),
+    ("/ruster-evpn:evpn/neighbor", EVPN_NEIGHBOR),
+    ("/ruster-evpn:evpn/neighbor/mac", EVPN_NEIGHBOR_MAC),
+    ("/ruster-evpn:evpn/neighbor/router", EVPN_NEIGHBOR_ROUTER),
     ("/ruster-neighbor:resolve-request", RESOLVE_REQUEST),
     (
         "/ruster-neighbor:resolve-request/interface",

@@ -109,14 +109,19 @@ struct Source {
 }
 
 /// The tables a source writes and ribd selects from: routes, and the remote
-/// addresses and flooding VTEPs of EVPN VNIs.
-const SOURCE_TABLES: &[u64] = &[sid::ROUTE, sid::EVPN_MAC, sid::EVPN_FLOOD];
+/// addresses, flooding VTEPs and remote hosts' IP addresses of EVPN VNIs.
+const SOURCE_TABLES: &[u64] = &[
+    sid::ROUTE,
+    sid::EVPN_MAC,
+    sid::EVPN_FLOOD,
+    sid::EVPN_NEIGHBOR,
+];
 
 /// Whether ribd selects `key` for the FE.
 fn selects(key: &Key) -> bool {
     matches!(
         key,
-        Key::Route { .. } | Key::EvpnMac { .. } | Key::EvpnFlood { .. }
+        Key::Route { .. } | Key::EvpnMac { .. } | Key::EvpnFlood { .. } | Key::EvpnNeighbor { .. }
     )
 }
 

@@ -688,3 +688,71 @@ fn an_evpn_address_seen_on_a_local_port_has_moved_there() {
     assert_eq!(out.len(), 1);
     assert_eq!(vtep_of(&out[0].1, &from_h1), VTEP2);
 }
+
+#[test]
+fn an_arp_request_for_an_evpn_host_is_answered_on_the_local_port() {
+    let mut bench = Bench::new();
+    let token = bench
+        .routes
+        .patch(&[Change::set(
+            Key::EvpnNeighbor {
+                vni: 100,
+                address: Ipv4Addr::new(192, 0, 2, 20).into(),
+            },
+            Value::EvpnNeighbor {
+                mac: H2,
+                router: false,
+            },
+        )])
+        .unwrap();
+    assert_eq!(
+        settle(&mut bench.fe, &mut bench.routes, token),
+        Code::CHANGED
+    );
+    let request = |target: [u8; 4]| {
+        let mut f = vec![0xff; 6];
+        f.extend_from_slice(&H1);
+        f.extend_from_slice(&[0x08, 0x06, 0, 1, 0x08, 0, 6, 4, 0, 1]);
+        f.extend_from_slice(&H1);
+        f.extend_from_slice(&[192, 0, 2, 10]);
+        f.extend_from_slice(&[0; 6]);
+        f.extend_from_slice(&target);
+        f.resize(60, 0);
+        f
+    };
+    // Answered on p1, not flooded to the VTEPs.
+    let out = bench.send(P1, request([192, 0, 2, 20]));
+    assert_eq!(out.len(), 1, "{out:?}");
+    let (port, reply) = &out[0];
+    assert_eq!(*port, P1);
+    assert_eq!(&reply[0..6], &H1);
+    assert_eq!(&reply[6..12], &H2);
+    assert_eq!(&reply[20..22], &[0, 2]);
+    assert_eq!(
+        &reply[22..32],
+        &[H2[0], H2[1], H2[2], H2[3], H2[4], H2[5], 192, 0, 2, 20]
+    );
+    assert_eq!(bench.fe.counters().bridge_proxied, 1);
+    // Another address: flooded to both VTEPs, as before.
+    assert_eq!(bench.send(P1, request([192, 0, 2, 21])).len(), 2);
+    // From a VTEP: not answered; it goes to p1.
+    let from_vtep = request([192, 0, 2, 20]);
+    assert_eq!(
+        bench.send(WAN, outer(VTEP2, 100, &from_vtep)),
+        vec![(P1, from_vtep)]
+    );
+    // The address is the bridge's own (its IRB's): not answered for the remote
+    // host.
+    bench.change(&[
+        iface("br0", [2, 0, 0, 0, 0, 0xb]),
+        Change::set(
+            Key::Address {
+                interface: "br0".into(),
+                address: Ipv4Addr::new(192, 0, 2, 20).into(),
+            },
+            Value::Address { prefix_len: 24 },
+        ),
+    ]);
+    bench.send(P1, request([192, 0, 2, 20]));
+    assert_eq!(bench.fe.counters().bridge_proxied, 1);
+}
