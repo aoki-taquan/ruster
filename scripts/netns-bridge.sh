@@ -161,6 +161,17 @@ wait_counter bridge_aged $((aged + 1)) 8 || fail "no learned address aged out"
 nsx "$a" ping -c 2 -i 0.2 -W 1 192.0.2.20 >/dev/null || fail "a to b's address after ageing"
 echo "ok: learned addresses age out and are learned again"
 
+# The addresses the bridge learned are state the FE shows (for EVPN).
+learned=""
+for _ in $(seq 1 5); do
+  learned=$(ip netns exec "$router" "$bin/ruster" --run-dir "$run_dir" show 2>/dev/null |
+    grep "^bridge-learned br0 " || true)
+  [[ -n "$learned" ]] && break
+  sleep 1
+done
+[[ -n "$learned" ]] || fail "ruster show has no learned addresses"
+echo "ok: ruster show has the learned addresses: $(wc -l <<<"$learned") of br0"
+
 fe=${pids[0]}
 pids=("${pids[@]:1}")
 kill "$fe"

@@ -171,6 +171,12 @@ pub const BRIDGE_MAC: u64 = 60260;
 pub const BRIDGE_MAC_PORT: u64 = 60261;
 /// The remote VTEP of a static entry on a VXLAN member.
 pub const BRIDGE_MAC_VTEP: u64 = 60262;
+/// State (config false): an address a bridge learned, by bridge and address; the
+/// member it is on and the remote VTEP behind a VXLAN member (the same members as
+/// a static entry's). Only the FE writes it.
+pub const BRIDGE_LEARNED: u64 = 60265;
+pub const BRIDGE_LEARNED_PORT: u64 = 60266;
+pub const BRIDGE_LEARNED_VTEP: u64 = 60267;
 /// `ruster-if-tunnel`: an EtherIP interface (RFC 3378), by interface, its local and
 /// remote addresses.
 pub const ETHERIP: u64 = 60270;
@@ -370,6 +376,9 @@ pub const ALL: &[(&str, u64)] = &[
     ("/ruster-bridge:bridges/bridge/filtering-entry", BRIDGE_MAC),
     ("/ruster-bridge:bridges/bridge/filtering-entry/port", BRIDGE_MAC_PORT),
     ("/ruster-bridge:bridges/bridge/filtering-entry/vtep", BRIDGE_MAC_VTEP),
+    ("/ruster-bridge:bridges/bridge/learned-entry", BRIDGE_LEARNED),
+    ("/ruster-bridge:bridges/bridge/learned-entry/port", BRIDGE_LEARNED_PORT),
+    ("/ruster-bridge:bridges/bridge/learned-entry/vtep", BRIDGE_LEARNED_VTEP),
     ("/ruster-if-tunnel:etherip", ETHERIP),
     ("/ruster-if-tunnel:etherip/local", ETHERIP_LOCAL),
     ("/ruster-if-tunnel:etherip/remote", ETHERIP_REMOTE),

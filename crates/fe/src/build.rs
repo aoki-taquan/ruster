@@ -264,7 +264,8 @@ impl Routes {
                 | Key::BridgePort { .. }
                 | Key::BridgeMac { .. }
                 // State the FE keeps itself: no table change.
-                | Key::Srv6SidCounters { .. } => {
+                | Key::Srv6SidCounters { .. }
+                | Key::BridgeLearned { .. } => {
                     afters.push(None);
                     continue;
                 }

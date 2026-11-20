@@ -1828,3 +1828,23 @@ fn srv6_sid_counters_round_trip() {
     };
     assert!(host_bits.validate().is_err());
 }
+
+#[test]
+fn learned_bridge_addresses_round_trip() {
+    let learned = Change::set(
+        Key::BridgeLearned {
+            bridge: "br0".into(),
+            mac: [2, 0, 0, 0, 0, 0x11],
+        },
+        Value::BridgeMac {
+            interface: "vx0".into(),
+            vtep: Some("198.51.100.2".parse().unwrap()),
+        },
+    );
+    assert!(learned.validate().is_ok());
+    assert_eq!(round_trip(&learned), learned);
+    assert_eq!(
+        entry_line(&learned.key, learned.value.as_ref().unwrap()).unwrap(),
+        "bridge-learned br0 02:00:00:00:00:11 vx0 vtep 198.51.100.2"
+    );
+}

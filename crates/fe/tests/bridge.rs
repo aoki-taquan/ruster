@@ -451,3 +451,53 @@ fn links_follow_the_ports_and_a_disabled_interface_is_down() {
     assert!(!bench.fe.link_up("wan", &[true, true, true]));
     assert!(!bench.fe.link_up("wan.10", &[true, true, true]));
 }
+
+#[test]
+fn learned_addresses_are_state_an_observer_is_told_of() {
+    let mut bench = Bench::new(300, &[]);
+    let (a, b) = UnixStream::pair().unwrap();
+    bench.fe.attach(a, writers::READ_ONLY).unwrap();
+    let mut observer = Client::new(b).unwrap();
+    observer.observe();
+    bench.fe.step(0);
+    observer.poll();
+    // H1 is learned on p1; a second later the observer is told.
+    bench.send(P1, udp(H2, H1, [192, 0, 2, 10], [192, 0, 2, 20]), 10);
+    bench.fe.step(1_000);
+    bench.fe.step(1_001);
+    let learned = Key::BridgeLearned {
+        bridge: "br0".into(),
+        mac: H1,
+    };
+    let told = |observer: &mut Client, fe: &mut Fe<SimIo>, now: u64| {
+        let mut changes = Vec::new();
+        for _ in 0..100 {
+            fe.step(now);
+            let (_, events) = observer.poll();
+            for event in events {
+                if let Event::Notification { payload } = event {
+                    if let Ok(mut c) = ruster_proto::session::decode_changes(&payload) {
+                        changes.append(&mut c);
+                    }
+                }
+            }
+        }
+        changes
+    };
+    let changes = told(&mut observer, &mut bench.fe, 1_002);
+    assert!(
+        changes.contains(&Change::set(
+            learned.clone(),
+            Value::BridgeMac {
+                interface: "p1".into(),
+                vtep: None,
+            }
+        )),
+        "{changes:?}"
+    );
+    // It ages out (300 s): the observer is told it went.
+    bench.fe.step(400_000);
+    bench.fe.step(401_000);
+    let changes = told(&mut observer, &mut bench.fe, 402_000);
+    assert!(changes.contains(&Change::delete(learned)), "{changes:?}");
+}

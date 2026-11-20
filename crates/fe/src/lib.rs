@@ -77,7 +77,7 @@ mod tap;
 pub use handover::HandoverTask;
 pub use local::LocalPipe;
 pub use punt_table::PuntCounters;
-use ruster_proto::table::{Key, PuntDestination, PuntKind, PuntMatch, Value};
+use ruster_proto::table::{Change, Key, PuntDestination, PuntKind, PuntMatch, Value};
 
 /// The tables each kind of writer may change (one writer per table).
 pub mod writers {
@@ -518,6 +518,8 @@ enum FromWorker {
     OtherUsing(Arc<build::Built>),
     /// The counters of the SRv6 SIDs: prefix, length, packets and bytes.
     Srv6Counters(Vec<SidCount>),
+    /// How the addresses the bridges learned changed since the last such message.
+    BridgeLearned(Vec<Change>),
 }
 
 /// The steps of the control task after which a [`FromWorker::Sync`] is answered
@@ -587,6 +589,7 @@ impl ControlTask {
                     .collect();
                 self.server.set_state(sid::SRV6_SID_COUNTERS, entries);
             }
+            FromWorker::BridgeLearned(changes) => self.server.change_state(&changes),
         }
     }
 
@@ -738,7 +741,15 @@ struct Worker<B> {
     /// The counters of the SRv6 SIDs (RFC 8986 section 6), in the order of the
     /// SIDs of the tables in use, and when they were last sent to the control task.
     srv6: Srv6Counters,
+    /// The addresses the bridges had learned when last told to the control task, and
+    /// when.
+    learned: BTreeMap<(String, [u8; 6]), (String, Option<IpAddr>)>,
+    learned_ms: u64,
 }
+
+/// How often the addresses the bridges learned are compared with the last told,
+/// at most.
+const LEARNED_EVERY_MS: u64 = 1_000;
 
 /// A local SRv6 SID's prefix and length, and the packets and bytes it handled.
 type SidCount = ([u8; 16], u8, u64, u64);
@@ -938,6 +949,8 @@ where
             from_others,
             hand_all,
             srv6: Srv6Counters::default(),
+            learned: BTreeMap::new(),
+            learned_ms: 0,
         };
         let others_counters = other_workers
             .iter()
@@ -1277,10 +1290,68 @@ where
         if let Some(counters) = self.srv6.due(now_ms) {
             let _ = self.to_control.send(FromWorker::Srv6Counters(counters));
         }
+        self.tell_learned(now_ms);
         // Frames held for the control task's answer go out whatever the ports do.
         let injected = (read_handed_in || self.held.is_some()) && self.inject();
         self.write_handed();
         worked || injected
+    }
+
+    /// Tells the control task how the addresses the bridges learned changed (state
+    /// for a routing daemon that advertises them), at most every
+    /// [`LEARNED_EVERY_MS`].
+    fn tell_learned(&mut self, now_ms: u64) {
+        if now_ms.saturating_sub(self.learned_ms) < LEARNED_EVERY_MS {
+            return;
+        }
+        self.learned_ms = now_ms;
+        let names = &self.tables.interface_names;
+        let now: BTreeMap<(String, [u8; 6]), (String, Option<IpAddr>)> = self
+            .bridges
+            .table
+            .entries()
+            .filter(|entry| !entry.fixed)
+            // Past its age it is gone, also before the sweep takes it out.
+            .filter(|entry| {
+                self.tables
+                    .bridges
+                    .get(usize::from(entry.bridge))
+                    .is_some_and(|(_, b)| now_ms.saturating_sub(entry.seen_ms) <= b.limits.aging_ms)
+            })
+            .filter_map(|entry| {
+                let bridge = self.bridge_names.get(usize::from(entry.bridge))?;
+                let member = names.get(usize::from(entry.member.0))?;
+                Some(((bridge.clone(), entry.mac), (member.clone(), entry.vtep)))
+            })
+            .collect();
+        if now == self.learned {
+            return;
+        }
+        let key = |(bridge, mac): &(String, [u8; 6])| Key::BridgeLearned {
+            bridge: bridge.clone(),
+            mac: *mac,
+        };
+        let mut changes: Vec<Change> = self
+            .learned
+            .keys()
+            .filter(|k| !now.contains_key(*k))
+            .map(|k| Change::delete(key(k)))
+            .collect();
+        changes.extend(
+            now.iter()
+                .filter(|(k, v)| self.learned.get(*k) != Some(*v))
+                .map(|(k, (interface, vtep))| {
+                    Change::set(
+                        key(k),
+                        Value::BridgeMac {
+                            interface: interface.clone(),
+                            vtep: *vtep,
+                        },
+                    )
+                }),
+        );
+        self.learned = now;
+        let _ = self.to_control.send(FromWorker::BridgeLearned(changes));
     }
 
     /// Leaves the bytes `fill` writes (if it says they are good) to the handover,
