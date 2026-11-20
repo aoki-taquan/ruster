@@ -270,7 +270,8 @@ pub enum Value {
         remote: IpAddr,
     },
     /// VXLAN network `vni` (1 to 16777215) from the router's address `local` to the
-    /// remote VTEPs `remotes` (1 to 64, the same family), routed in the default VRF.
+    /// remote VTEPs `remotes` (at most 64, the same family; none when EVPN gives
+    /// them), routed in the default VRF.
     Vxlan {
         vni: u32,
         local: IpAddr,
@@ -1189,7 +1190,6 @@ impl Change {
                                 || remotes[..at].contains(a)
                         };
                         if !unicast(local)
-                            || remotes.is_empty()
                             || remotes.len() as u64 > MEMBER_LIST_MAX
                             || remotes.iter().enumerate().any(bad)
                         {

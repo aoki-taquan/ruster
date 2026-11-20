@@ -12,7 +12,8 @@
 //! - RFC 7348 section 5: a 24-bit VNI; the outer header IPv4 or IPv6.
 //!
 //! Deviations: the remote VTEPs are a list (no multicast underlay, RFC 7348 section
-//! 4.2); the local address must be an address given to an interface of the default
+//! 4.2), which may be empty when EVPN gives them (`docs/design/overlay.md`, section
+//! 7); the local address must be an address given to an interface of the default
 //! VRF. A static MAC address on it is behind one of its VTEPs.
 
 use std::collections::BTreeMap;
@@ -82,9 +83,10 @@ pub(crate) fn check(
                 .ok_or_else(|| format!("{at}: vxlan {what} must be a unicast IP address"))
         };
         let local = address(&local, "local")?;
-        if remote.is_empty() || remote.len() > REMOTES_MAX {
+        // None: the VTEPs come from EVPN (routing daemons, through ribd) only.
+        if remote.len() > REMOTES_MAX {
             return Err(format!(
-                "{at}: vxlan remote must list 1 to {REMOTES_MAX} VTEPs"
+                "{at}: vxlan remote must list at most {REMOTES_MAX} VTEPs"
             ));
         }
         let mut remotes: Vec<IpAddr> = Vec::with_capacity(remote.len());

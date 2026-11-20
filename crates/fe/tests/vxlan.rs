@@ -596,3 +596,31 @@ fn evpn_vteps_take_floods_and_evpn_addresses_go_to_their_vtep() {
         vec![VTEP2, VTEP3]
     );
 }
+
+#[test]
+fn a_vxlan_interface_with_no_vtep_gets_them_from_evpn() {
+    const VTEP4: [u8; 4] = [203, 0, 113, 4];
+    let mut bench = Bench::new();
+    bench.change(&[vxlan("vx0", 100, &[])]);
+    // No VTEP yet: a broadcast goes nowhere, and is not counted as dropped.
+    let broadcast = frame([0xff; 6], H1, 60);
+    assert_eq!(bench.send(P1, broadcast.clone()), vec![]);
+    assert_eq!(bench.fe.counters().bridge_flood_dropped, 0);
+    let token = bench
+        .routes
+        .patch(&[Change::set(
+            Key::EvpnFlood {
+                vni: 100,
+                vtep: IpAddr::from(VTEP4),
+            },
+            Value::EvpnFlood,
+        )])
+        .unwrap();
+    assert_eq!(
+        settle(&mut bench.fe, &mut bench.routes, token),
+        Code::CHANGED
+    );
+    let out = bench.send(P1, broadcast.clone());
+    assert_eq!(out.len(), 1);
+    assert_eq!(vtep_of(&out[0].1, &broadcast), VTEP4);
+}

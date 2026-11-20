@@ -1570,6 +1570,10 @@ fn vxlan_entries_round_trip_and_are_checked() {
     assert_eq!(round_trip(&good), good);
     let v6 = entry(16_777_215, "2001:db8::1", &["2001:db8:1::2"]);
     assert_eq!(round_trip(&v6), v6);
+    // None: EVPN gives them.
+    let none = entry(100, "192.0.2.1", &[]);
+    assert!(none.validate().is_ok());
+    assert_eq!(round_trip(&none), none);
     assert_eq!(
         entry_line(&good.key, good.value.as_ref().unwrap()).unwrap(),
         "vxlan vx0 vni 100 192.0.2.1 to 198.51.100.2 198.51.100.3"
@@ -1577,7 +1581,6 @@ fn vxlan_entries_round_trip_and_are_checked() {
     for bad in [
         entry(0, "192.0.2.1", &["198.51.100.2"]),
         entry(16_777_216, "192.0.2.1", &["198.51.100.2"]),
-        entry(100, "192.0.2.1", &[]),
         entry(100, "192.0.2.1", &["2001:db8::2"]),
         entry(100, "192.0.2.1", &["192.0.2.1"]),
         entry(100, "192.0.2.1", &["198.51.100.2", "198.51.100.2"]),

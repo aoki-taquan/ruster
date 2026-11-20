@@ -199,6 +199,8 @@ struct PppoeEntry {
 struct VxlanEntry {
     vni: u32,
     local: String,
+    /// None when EVPN gives the VTEPs.
+    #[serde(default)]
     remote: Vec<String>,
     port: Option<u16>,
     underlay_vrf: Option<String>,
