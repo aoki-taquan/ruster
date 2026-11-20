@@ -954,10 +954,12 @@ pub enum Kind {
     EtherIp { local: String, remote: String },
     /// A VXLAN network (RFC 7348) `vni` from the router's address `local` to the
     /// remote VTEPs `remote`, on UDP port `port`; only a bridge member. A lock
-    /// written before the port was added has none: 4789.
+    /// written before the port was added has none: 4789. `remote` may be left out
+    /// (none) when EVPN gives the VTEPs.
     Vxlan {
         vni: u32,
         local: String,
+        #[serde(default)]
         remote: Vec<String>,
         #[serde(default = "vxlan_port")]
         port: u16,

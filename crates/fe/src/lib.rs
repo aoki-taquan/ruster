@@ -2451,7 +2451,8 @@ impl<'f, 't, B: GeneratedPacketIo> Members<'f, 't, B> {
 
     /// [`Self::send`], with how many copies did not go out: one for a port that
     /// could not take it; for an overlay, one per remote end it was not sent to (one
-    /// when it has none).
+    /// when it has none, but for a VXLAN interface: its VTEPs may all come from
+    /// EVPN, and before they do there is no one to send to).
     fn send_counted(&mut self, member: IfId, vtep: Option<IpAddr>, frame: &[u8]) -> (bool, u64) {
         let Some(overlay) = self.outer.overlay(member) else {
             let sent = send_member(self.io, self.vlans, member, frame);
@@ -2463,7 +2464,7 @@ impl<'f, 't, B: GeneratedPacketIo> Members<'f, 't, B> {
         };
         let bridges = self.bridges;
         let mut sent = false;
-        let mut failed = u64::from(remotes.is_empty());
+        let mut failed = u64::from(remotes.is_empty() && !overlay.is_vxlan());
         for &remote in remotes {
             let irb = |id: IfId| bridges.irb_of(id).is_some();
             match self.outer.overlay_header_in(

@@ -86,6 +86,23 @@ fn a_vxlan_member_becomes_its_row() {
 }
 
 #[test]
+fn a_vxlan_member_may_list_no_vtep_when_evpn_gives_them() {
+    let config = parse(&with(
+        r#"vxlan = { vni = 100, local = "192.0.2.1" }"#,
+        MEMBERS,
+    ))
+    .unwrap();
+    let mut confd = Confd::new(Config::default());
+    let [[_, tables], _] = confd.tables_now_and_with(&config);
+    assert!(matches!(
+        tables.get(&Key::Vxlan {
+            interface: "vx0".into()
+        }),
+        Some(Value::Vxlan { remotes, .. }) if remotes.is_empty()
+    ));
+}
+
+#[test]
 fn bad_vxlan_interfaces_are_refused() {
     let good = r#"vxlan = { vni = 100, local = "192.0.2.1", remote = ["198.51.100.2"] }"#;
     for (vxlan, bridge, says) in [
@@ -98,11 +115,6 @@ fn bad_vxlan_interfaces_are_refused() {
             r#"vxlan = { vni = 16777216, local = "192.0.2.1", remote = ["198.51.100.2"] }"#,
             MEMBERS,
             "vni must be",
-        ),
-        (
-            r#"vxlan = { vni = 100, local = "192.0.2.1", remote = [] }"#,
-            MEMBERS,
-            "1 to 64",
         ),
         (
             r#"vxlan = { vni = 100, local = "192.0.2.1", remote = ["2001:db8::2"] }"#,
