@@ -12,6 +12,10 @@
 //! ruster [--run-dir DIR] show             print every table the FE holds
 //! ruster [--run-dir DIR] route add --source NAME [--vrf VRF] PREFIX dev IFACE [via ADDR]
 //! ruster [--run-dir DIR] route del --source NAME [--vrf VRF] PREFIX
+//! ruster [--run-dir DIR] evpn add --source NAME mac VNI MAC vtep ADDR
+//! ruster [--run-dir DIR] evpn add --source NAME flood VNI ADDR
+//! ruster [--run-dir DIR] evpn add --source NAME neighbor VNI ADDR MAC [router]
+//! ruster [--run-dir DIR] evpn del --source NAME (mac VNI MAC | flood VNI ADDR | neighbor VNI ADDR)
 //! ruster [--run-dir DIR] source NAME [--lifetime SECONDS] [pppoe SESSION PEER MTU] [ipv4 ADDRESS/LEN]
 //! ```
 //!
@@ -36,6 +40,11 @@
 //! (ribd must have been started with that source). ribd picks between sources by
 //! preference and sends the result to the FE.
 //!
+//! `evpn` writes to ribd as the source NAME what a routing daemon learns from EVPN
+//! routes (`docs/design/overlay.md`, section 7): a remote MAC address behind a VTEP,
+//! a VTEP that takes a VNI's flooded frames, and a remote host's IP address with its
+//! MAC address, which the bridges answer ARP and ND for.
+//!
 //! `source` writes to confd as the source NAME, the way `ruster-pppoed` does
 //! ([`ruster_confd::source`]): the values given replace all the source had, each
 //! for SECONDS (3600 when left out), and with none it has none. It ends with
@@ -51,7 +60,7 @@ use ruster_proto::coap::Code;
 use ruster_proto::daemon::{self, socket};
 use ruster_proto::session::{decode_changes, Client, Event};
 use ruster_proto::table::{
-    entry_line, network, Change, Key, NextHop, RouteAction, Value, DEFAULT_VRF,
+    entry_line, network, parse_mac, Change, Key, NextHop, RouteAction, Value, DEFAULT_VRF,
 };
 
 /// How long to wait for an answer: confd waits up to 3 s for the processes' checks
@@ -69,6 +78,10 @@ const USAGE: &str = "usage:
   ruster [--run-dir DIR] show
   ruster [--run-dir DIR] route add --source NAME [--vrf VRF] PREFIX dev IFACE [via ADDR]
   ruster [--run-dir DIR] route del --source NAME [--vrf VRF] PREFIX
+  ruster [--run-dir DIR] evpn add --source NAME mac VNI MAC vtep ADDR
+  ruster [--run-dir DIR] evpn add --source NAME flood VNI ADDR
+  ruster [--run-dir DIR] evpn add --source NAME neighbor VNI ADDR MAC [router]
+  ruster [--run-dir DIR] evpn del --source NAME (mac VNI MAC | flood VNI ADDR | neighbor VNI ADDR)
   ruster [--run-dir DIR] source NAME [--lifetime SECONDS] [pppoe SESSION PEER MTU] [ipv4 ADDRESS/LEN]";
 
 /// How long the values of `ruster source` last when no lifetime is given.
@@ -190,8 +203,76 @@ fn route(run_dir: &Path, args: &[String]) -> Result<(), String> {
         ("del", []) => Change::delete(key),
         _ => return Err(USAGE.into()),
     };
+    write_source(run_dir, &source, change)
+}
+
+fn evpn(run_dir: &Path, args: &[String]) -> Result<(), String> {
+    let (op, rest) = args.split_first().ok_or(USAGE)?;
+    let mut source = None;
+    let mut words = Vec::new();
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--source" => source = it.next().cloned(),
+            _ => words.push(arg.as_str()),
+        }
+    }
+    let source = source.ok_or("evpn needs --source NAME")?;
+    let vni = |text: &str| -> Result<u32, String> {
+        text.parse().map_err(|_| format!("{text}: not a VNI"))
+    };
+    let address = |text: &str| -> Result<IpAddr, String> {
+        text.parse().map_err(|_| format!("{text}: not an address"))
+    };
+    let mac = |text: &str| parse_mac(text).map_err(|_| format!("{text}: not a MAC address"));
+    let change = match (op.as_str(), words.as_slice()) {
+        ("add", ["mac", v, m, "vtep", a]) => Change::set(
+            Key::EvpnMac {
+                vni: vni(v)?,
+                mac: mac(m)?,
+            },
+            Value::EvpnMac { vtep: address(a)? },
+        ),
+        ("del", ["mac", v, m]) => Change::delete(Key::EvpnMac {
+            vni: vni(v)?,
+            mac: mac(m)?,
+        }),
+        ("add", ["flood", v, a]) => Change::set(
+            Key::EvpnFlood {
+                vni: vni(v)?,
+                vtep: address(a)?,
+            },
+            Value::EvpnFlood,
+        ),
+        ("del", ["flood", v, a]) => Change::delete(Key::EvpnFlood {
+            vni: vni(v)?,
+            vtep: address(a)?,
+        }),
+        ("add", ["neighbor", v, a, m, flags @ ..]) if matches!(flags, [] | ["router"]) => {
+            Change::set(
+                Key::EvpnNeighbor {
+                    vni: vni(v)?,
+                    address: address(a)?,
+                },
+                Value::EvpnNeighbor {
+                    mac: mac(m)?,
+                    router: !flags.is_empty(),
+                },
+            )
+        }
+        ("del", ["neighbor", v, a]) => Change::delete(Key::EvpnNeighbor {
+            vni: vni(v)?,
+            address: address(a)?,
+        }),
+        _ => return Err(USAGE.into()),
+    };
+    write_source(run_dir, &source, change)
+}
+
+/// Writes `change` to ribd as the source `source`.
+fn write_source(run_dir: &Path, source: &str, change: Change) -> Result<(), String> {
     change.validate().map_err(|e| e.to_string())?;
-    let path = run_dir.join(socket::ribd_source(&source));
+    let path = run_dir.join(socket::ribd_source(source));
     let (code, _) = request(&path, |c| {
         let token = c.patch(&[change]).map_err(|e| e.to_string())?;
         c.sync_done();
@@ -419,6 +500,7 @@ fn run() -> Result<(), String> {
             ("rollback", [number]) => rollback(&run_dir, number),
             ("show", []) => show(&run_dir),
             ("route", args) => route(&run_dir, args),
+            ("evpn", args) => evpn(&run_dir, args),
             ("source", args) => source(&run_dir, args),
             _ => Err(USAGE.into()),
         },
