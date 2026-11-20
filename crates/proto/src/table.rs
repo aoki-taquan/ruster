@@ -151,6 +151,18 @@ pub enum Key {
         prefix: std::net::Ipv6Addr,
         len: u8,
     },
+    /// A remote address of the EVPN VNI `vni` (RFC 7432 section 9.2.2, RFC 8365):
+    /// frames to it go to the VTEP of its [`Value::EvpnMac`].
+    EvpnMac {
+        vni: u32,
+        mac: [u8; 6],
+    },
+    /// VTEP `vtep` takes the flooded frames of the EVPN VNI `vni` (RFC 7432 section
+    /// 11, ingress replication). Its value is [`Value::EvpnFlood`].
+    EvpnFlood {
+        vni: u32,
+        vtep: IpAddr,
+    },
 }
 
 /// The value of one entry.
@@ -275,6 +287,12 @@ pub enum Value {
         packets: u64,
         bytes: u64,
     },
+    /// The VTEP behind which an EVPN remote address is.
+    EvpnMac {
+        vtep: IpAddr,
+    },
+    /// The VTEP of the key takes the VNI's flooded frames.
+    EvpnFlood,
     /// Frames leave wrapped from `source` toward `segments` (the first first;
     /// H.Encaps.L2, or H.Encaps.L2.Red with `reduced`), and packets to the
     /// router's End.DX2 SID `sid` bring frames in. Routed in the default VRF.
@@ -793,6 +811,8 @@ impl Key {
             Self::Vxlan { .. } => sid::VXLAN,
             Self::Srv6L2 { .. } => sid::SRV6_L2,
             Self::Srv6SidCounters { .. } => sid::SRV6_SID_COUNTERS,
+            Self::EvpnMac { .. } => sid::EVPN_MAC,
+            Self::EvpnFlood { .. } => sid::EVPN_FLOOD,
         }
     }
 }
@@ -880,6 +900,17 @@ impl Change {
                     return Err(ModelError::Invalid("SID prefix"));
                 }
             }
+            Key::EvpnMac { vni, mac } => {
+                // A unicast address: a group's frames are flooded.
+                if !(1..=VXLAN_VNI_MAX).contains(vni) || mac[0] & 1 != 0 {
+                    return Err(ModelError::Invalid("EVPN VNI and MAC address"));
+                }
+            }
+            Key::EvpnFlood { vni, vtep } => {
+                if !(1..=VXLAN_VNI_MAX).contains(vni) || !tunnel_end(*vtep) {
+                    return Err(ModelError::Invalid("EVPN VNI and VTEP"));
+                }
+            }
             Key::Route { vrf, prefix, len } => {
                 name(vrf)?;
                 // The prefix is an address already: what a text of it is checked
@@ -919,6 +950,8 @@ impl Change {
                         | (Key::Vxlan { .. }, Value::Vxlan { .. })
                         | (Key::Srv6L2 { .. }, Value::Srv6L2 { .. })
                         | (Key::Srv6SidCounters { .. }, Value::Srv6SidCounters { .. })
+                        | (Key::EvpnMac { .. }, Value::EvpnMac { .. })
+                        | (Key::EvpnFlood { .. }, Value::EvpnFlood)
                 );
                 if !table_matches {
                     return Err(ModelError::WrongTable);
@@ -926,6 +959,9 @@ impl Change {
                 match value {
                     Value::Interface { mtu, .. } if *mtu < MIN_MTU => {
                         return Err(ModelError::Invalid("mtu"));
+                    }
+                    Value::EvpnMac { vtep } if !tunnel_end(*vtep) => {
+                        return Err(ModelError::Invalid("EVPN VTEP"));
                     }
                     Value::Interface {
                         vlan,
@@ -1378,6 +1414,18 @@ pub fn encode_key(key: &Key, e: &mut Encoder<'_>) {
                 .u64(sid::SRV6_SID_COUNTERS)
                 .text(&format!("{prefix}/{len}"));
         }
+        Key::EvpnMac { vni, mac } => {
+            e.array(3)
+                .u64(sid::EVPN_MAC)
+                .text(&vni.to_string())
+                .text(&format_mac(mac));
+        }
+        Key::EvpnFlood { vni, vtep } => {
+            e.array(3)
+                .u64(sid::EVPN_FLOOD)
+                .text(&vni.to_string())
+                .text(&vtep.to_string());
+        }
         Key::Vxlan { interface } => {
             e.array(2).u64(sid::VXLAN).text(interface);
         }
@@ -1427,7 +1475,9 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
         | sid::NEIGHBOR
         | sid::FIREWALL_RULE
         | sid::BRIDGE_MAC
-        | sid::BRIDGE_LEARNED => 3,
+        | sid::BRIDGE_LEARNED
+        | sid::EVPN_MAC
+        | sid::EVPN_FLOOD => 3,
         other => return Err(ModelError::UnknownTable(other)),
     };
     if len != expected {
@@ -1465,6 +1515,23 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
             bridge: first,
             mac: parse_mac(d.text()?)?,
         },
+        sid::EVPN_MAC | sid::EVPN_FLOOD => {
+            let vni = first
+                .parse::<u32>()
+                .map_err(|_| ModelError::Invalid("VNI"))?;
+            let second = d.text()?;
+            if table == sid::EVPN_MAC {
+                Key::EvpnMac {
+                    vni,
+                    mac: parse_mac(second)?,
+                }
+            } else {
+                Key::EvpnFlood {
+                    vni,
+                    vtep: parse_ip(second)?,
+                }
+            }
+        }
         sid::BRIDGE_LEARNED => Key::BridgeLearned {
             bridge: first,
             mac: parse_mac(d.text()?)?,
@@ -1833,6 +1900,14 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
             }
             e.u64(d(sid::SRV6_L2_REDUCED)).bool(*reduced);
         }
+        Value::EvpnMac { vtep } => {
+            e.map(1)
+                .u64(sid::EVPN_MAC_VTEP - sid::EVPN_MAC)
+                .text(&vtep.to_string());
+        }
+        Value::EvpnFlood => {
+            e.map(0);
+        }
         Value::Srv6SidCounters { packets, bytes } => {
             e.map(2)
                 .u64(sid::SRV6_SID_PACKETS - sid::SRV6_SID_COUNTERS)
@@ -1906,6 +1981,8 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
             | sid::SRV6_L2
             | sid::SRV6_SID_COUNTERS
             | sid::BRIDGE_LEARNED
+            | sid::EVPN_MAC
+            | sid::EVPN_FLOOD
     ) {
         return decode_policy_value(table, d);
     }
@@ -2542,6 +2619,12 @@ pub fn entry_line(key: &Key, value: &Value) -> Option<String> {
         (Key::Srv6SidCounters { prefix, len }, Value::Srv6SidCounters { packets, bytes }) => {
             format!("srv6-sid {prefix}/{len} packets {packets} bytes {bytes}")
         }
+        (Key::EvpnMac { vni, mac }, Value::EvpnMac { vtep }) => {
+            format!("evpn-mac vni {vni} {} vtep {vtep}", format_mac(mac))
+        }
+        (Key::EvpnFlood { vni, vtep }, Value::EvpnFlood) => {
+            format!("evpn-flood vni {vni} vtep {vtep}")
+        }
         (
             Key::Srv6L2 { interface },
             Value::Srv6L2 {
@@ -2721,6 +2804,12 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
             local: address(sid::ETHERIP_LOCAL, "local")?,
             remote: address(sid::ETHERIP_REMOTE, "remote")?,
         }
+    } else if table == sid::EVPN_MAC {
+        Value::EvpnMac {
+            vtep: parse_ip(&text(sid::EVPN_MAC_VTEP, "vtep")?.ok_or(ModelError::Missing("vtep"))?)?,
+        }
+    } else if table == sid::EVPN_FLOOD {
+        Value::EvpnFlood
     } else if table == sid::SRV6_SID_COUNTERS {
         let mut count = |member: u64, what: &'static str| match got.remove(&member) {
             Some(Member::Uint(n)) => Ok(n),

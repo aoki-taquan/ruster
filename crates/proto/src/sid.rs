@@ -205,6 +205,14 @@ pub const SRV6_L2_REDUCED: u64 = 60304;
 pub const SRV6_SID_COUNTERS: u64 = 60310;
 pub const SRV6_SID_PACKETS: u64 = 60311;
 pub const SRV6_SID_BYTES: u64 = 60312;
+/// `ruster-evpn`: a remote MAC address of an EVPN (RFC 7432 MAC/IP route, RFC 8365),
+/// by VNI and address: the VTEP it is behind. Written by ribd from what routing
+/// daemons give.
+pub const EVPN_MAC: u64 = 60320;
+pub const EVPN_MAC_VTEP: u64 = 60321;
+/// `ruster-evpn`: a VTEP that takes the flooded frames of a VNI (RFC 7432 Inclusive
+/// Multicast Ethernet Tag route, ingress replication), by VNI and VTEP.
+pub const EVPN_FLOOD: u64 = 60325;
 
 /// Notification: the FE has a packet for a next hop that is not in the neighbor table.
 pub const RESOLVE_REQUEST: u64 = 60050;
@@ -396,6 +404,9 @@ pub const ALL: &[(&str, u64)] = &[
     ("/ruster-fib:fib/srv6-sid-counters", SRV6_SID_COUNTERS),
     ("/ruster-fib:fib/srv6-sid-counters/packets", SRV6_SID_PACKETS),
     ("/ruster-fib:fib/srv6-sid-counters/bytes", SRV6_SID_BYTES),
+    ("/ruster-evpn:evpn/mac", EVPN_MAC),
+    ("/ruster-evpn:evpn/mac/vtep", EVPN_MAC_VTEP),
+    ("/ruster-evpn:evpn/flood", EVPN_FLOOD),
     ("/ruster-neighbor:resolve-request", RESOLVE_REQUEST),
     (
         "/ruster-neighbor:resolve-request/interface",

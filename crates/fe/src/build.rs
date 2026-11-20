@@ -263,6 +263,7 @@ impl Routes {
                 | Key::SourceDns { .. }
                 | Key::BridgePort { .. }
                 | Key::BridgeMac { .. }
+                | Key::EvpnMac { .. }
                 // State the FE keeps itself: no table change.
                 | Key::Srv6SidCounters { .. }
                 | Key::BridgeLearned { .. } => {
@@ -275,7 +276,9 @@ impl Routes {
                 | Key::EtherIp { .. }
                 | Key::Vxlan { .. }
                 | Key::Srv6L2 { .. }
-                | Key::Bridge { .. } => return None,
+                | Key::Bridge { .. }
+                // It changes the VTEPs of a VXLAN interface.
+                | Key::EvpnFlood { .. } => return None,
             };
             let after = match store.get(key) {
                 None => None,
@@ -313,6 +316,94 @@ impl Routes {
                 stays(self.policies.get(vrf).and_then(|p| p.get(encap)), *by)
             });
         kept.then_some(afters)
+    }
+}
+
+/// Adds the VTEPs that take the flooded frames of an EVPN VNI (routes of the
+/// writer [`crate::writers::ROUTE`]) to the VXLAN interfaces of that VNI: of the
+/// local address's family, not the local address, and not a VTEP of another VXLAN
+/// member of the same bridge (the frames would come back, as for configured ones).
+/// What a routing daemon gives never makes the build fail: a VTEP that does not
+/// fit is left out.
+fn evpn_floods(
+    store: &Store,
+    bridges: &[(String, ruster_core::BridgeConfig)],
+    overlays: &mut [ruster_core::Overlay],
+) {
+    let mut floods: BTreeMap<u32, Vec<IpAddr>> = BTreeMap::new();
+    for (key, _) in store.table(sid::EVPN_FLOOD) {
+        if let Key::EvpnFlood { vni, vtep } = key {
+            floods.entry(*vni).or_default().push(*vtep);
+        }
+    }
+    if floods.is_empty() {
+        return;
+    }
+    // The VTEPs each bridge's VXLAN members have, by bridge (`None`: in no bridge).
+    let bridge_of = |member: IfId| {
+        bridges
+            .iter()
+            .position(|(_, b)| b.members.contains(&member))
+    };
+    let mut taken: BTreeMap<Option<usize>, BTreeSet<IpAddr>> = BTreeMap::new();
+    for overlay in overlays.iter() {
+        taken
+            .entry(bridge_of(overlay.interface))
+            .or_default()
+            .extend(overlay.remotes().iter().copied());
+    }
+    for overlay in overlays.iter_mut() {
+        let at = bridge_of(overlay.interface);
+        let local = overlay.local;
+        let ruster_core::OverlayKind::Vxlan { vni, remotes, .. } = &mut overlay.kind else {
+            continue;
+        };
+        let taken = taken.entry(at).or_default();
+        for &vtep in floods.get(vni).into_iter().flatten() {
+            let fits = vtep.is_ipv4() == local.is_ipv4() && vtep != local;
+            // Outside a bridge two interfaces may share a VTEP.
+            if fits && (at.is_none() || !taken.contains(&vtep)) && !remotes.contains(&vtep) {
+                remotes.push(vtep);
+                taken.insert(vtep);
+            }
+        }
+    }
+}
+
+/// Adds the remote addresses of the EVPN VNIs to the static addresses of the
+/// bridges, behind their VTEPs, on the bridge's VXLAN members of that VNI whose
+/// VTEPs (configured, or taking the VNI's flooded frames) include it. A configured
+/// static address of the same bridge comes first; an address behind a VTEP the
+/// member does not have is left out (RFC 7432 asks for no such case: a VTEP that
+/// sends MAC routes of a VNI also floods in it).
+fn evpn_macs(
+    store: &Store,
+    bridges: &[(String, ruster_core::BridgeConfig)],
+    overlays: &[ruster_core::Overlay],
+    statics: &mut Vec<(u16, [u8; 6], IfId, Option<IpAddr>)>,
+) {
+    let mut have: BTreeSet<(u16, [u8; 6])> = statics.iter().map(|s| (s.0, s.1)).collect();
+    for (key, value) in store.table(sid::EVPN_MAC) {
+        let (Key::EvpnMac { vni, mac }, Value::EvpnMac { vtep }) = (key, value) else {
+            continue;
+        };
+        for overlay in overlays {
+            let same =
+                matches!(overlay.kind, ruster_core::OverlayKind::Vxlan { vni: v, .. } if v == *vni);
+            if !same || !overlay.remotes().contains(vtep) {
+                continue;
+            }
+            let Some(at) = bridges
+                .iter()
+                .position(|(_, b)| b.members.contains(&overlay.interface))
+                .and_then(|at| u16::try_from(at).ok())
+            else {
+                continue;
+            };
+            if have.insert((at, *mac)) {
+                statics.push((at, *mac, overlay.interface, Some(*vtep)));
+            }
+        }
     }
 }
 
@@ -1073,6 +1164,7 @@ pub(crate) fn build(
             }
         }
     }
+    evpn_floods(store, &bridges, &mut overlays);
     for (key, value) in store.table(sid::BRIDGE_MAC) {
         if let (Key::BridgeMac { bridge, mac }, Value::BridgeMac { interface, vtep }) = (key, value)
         {
@@ -1108,6 +1200,7 @@ pub(crate) fn build(
             }
         }
     }
+    evpn_macs(store, &bridges, &overlays, &mut bridge_statics);
     let mut names: BTreeSet<&str> = active.values().map(|&(_, vrf)| vrf).collect();
     if let Some(sid_vrfs) = &kept_sid_vrfs {
         // The VRFs the routes are in, as before: the change kept them.
@@ -2233,6 +2326,10 @@ mod tests {
             Key::FirewallPolicy { vrf: name() },
             Key::IcmpErrors { vrf: name() },
             Key::BridgePort { interface: name() },
+            Key::EvpnMac {
+                vni: 100,
+                mac: [2, 0, 0, 0, 0, 1],
+            },
         ] {
             assert!(follows(key.clone()), "{key:?}");
         }
@@ -2241,6 +2338,7 @@ mod tests {
             Key::EtherIp { interface: name() },
             Key::Vxlan { interface: name() },
             Key::Bridge { name: name() },
+            Key::EvpnFlood { vni: 100, vtep: v4 },
         ] {
             assert!(!follows(key.clone()), "{key:?}");
         }

@@ -179,7 +179,7 @@ backlogと同じく、使う場面が出たものから片付ける。
 
 ルーティングデーモン（bird-rsなど）がEVPNを話し、rusterはそのL2の転送を受け持つ。次の順に作る。
 
-1. 遠くのMACとVNIごとのフラッディングの相手（VTEP）を、送り手からribdが受けて選び、FEへ書く。
+1. 設定のVXLANで、VTEPの一覧を空にできるようにする（VTEPをEVPNだけで受けるとき）。
 2. ARPとNDの代理応答。送り手から受けたMACとIPの組で、ブリッジのARPとNDにルータが答える。
 3. SRv6で運ぶ: End.DT2UとEnd.DT2M、遠くのMACの後ろをSRv6のSIDにする。
 

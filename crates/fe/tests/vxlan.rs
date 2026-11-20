@@ -26,6 +26,8 @@ struct Bench {
     fe: Fe<SimIo>,
     /// The client that wrote the configuration, for changes after.
     config: Client,
+    /// The client that wrote the routes (ribd's place), for EVPN entries.
+    routes: Client,
 }
 
 impl Bench {
@@ -101,8 +103,10 @@ impl Bench {
             assert_eq!(settle(&mut fe, &mut client, token), Code::CHANGED);
             clients.push(client);
         }
-        let config = clients.swap_remove(0);
-        Self { fe, config }
+        clients.truncate(2);
+        let routes = clients.pop().unwrap();
+        let config = clients.pop().unwrap();
+        Self { fe, config, routes }
     }
 
     fn change(&mut self, changes: &[Change]) {
@@ -532,4 +536,63 @@ fn the_inner_frame_ends_with_the_udp_datagram_and_carries_no_vlan_tag() {
     let mut tagged = frame(H1, H2, 60);
     tagged[12..14].copy_from_slice(&[0x88, 0xa8]);
     assert_eq!(bench.send(WAN, outer(VTEP2, 100, &tagged)), vec![]);
+}
+
+#[test]
+fn evpn_vteps_take_floods_and_evpn_addresses_go_to_their_vtep() {
+    const VTEP4: [u8; 4] = [203, 0, 113, 4];
+    const H3: [u8; 6] = [2, 0, 0, 0, 0, 0x13];
+    let mut bench = Bench::new();
+    let mac = |mac: [u8; 6], vtep: [u8; 4]| {
+        Change::set(
+            Key::EvpnMac { vni: 100, mac },
+            Value::EvpnMac {
+                vtep: IpAddr::from(vtep),
+            },
+        )
+    };
+    let flood = Key::EvpnFlood {
+        vni: 100,
+        vtep: IpAddr::from(VTEP4),
+    };
+    let evpn = |bench: &mut Bench, changes: &[Change]| {
+        let token = bench.routes.patch(changes).unwrap();
+        assert_eq!(
+            settle(&mut bench.fe, &mut bench.routes, token),
+            Code::CHANGED
+        );
+    };
+    // H3 is behind a VTEP that takes no floods of the VNI: left out.
+    evpn(
+        &mut bench,
+        &[
+            Change::set(flood.clone(), Value::EvpnFlood),
+            mac(H2, VTEP4),
+            mac(H3, [203, 0, 113, 99]),
+        ],
+    );
+    let vteps = |out: &[(IfId, Vec<u8>)], inner: &[u8]| {
+        let mut vteps: Vec<[u8; 4]> = out.iter().map(|(_, w)| vtep_of(w, inner)).collect();
+        vteps.sort_unstable();
+        vteps
+    };
+    let broadcast = frame([0xff; 6], H1, 60);
+    let out = bench.send(P1, broadcast.clone());
+    assert_eq!(vteps(&out, &broadcast), vec![VTEP2, VTEP3, VTEP4]);
+    let to_h2 = frame(H2, H1, 100);
+    assert_eq!(vteps(&bench.send(P1, to_h2.clone()), &to_h2), vec![VTEP4]);
+    let to_h3 = frame(H3, H1, 100);
+    assert_eq!(
+        vteps(&bench.send(P1, to_h3.clone()), &to_h3),
+        vec![VTEP2, VTEP3, VTEP4]
+    );
+    // Frames from the EVPN VTEP are taken.
+    let back = frame(H1, H2, 60);
+    assert_eq!(bench.send(WAN, outer(VTEP4, 100, &back)), vec![(P1, back)]);
+    // The VTEP goes: so do the floods to it and the address behind it.
+    evpn(&mut bench, &[Change::delete(flood)]);
+    assert_eq!(
+        vteps(&bench.send(P1, to_h2.clone()), &to_h2),
+        vec![VTEP2, VTEP3]
+    );
 }

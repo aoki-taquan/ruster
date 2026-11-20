@@ -98,7 +98,7 @@ pub mod writers {
         sid::VXLAN,
         sid::SRV6_L2,
     ];
-    pub const ROUTE: &[u64] = &[sid::ROUTE];
+    pub const ROUTE: &[u64] = &[sid::ROUTE, sid::EVPN_MAC, sid::EVPN_FLOOD];
     pub const NEIGHBOR: &[u64] = &[sid::NEIGHBOR];
     pub const READ_ONLY: &[u64] = &[];
 }
