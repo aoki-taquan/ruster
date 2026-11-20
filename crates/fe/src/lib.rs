@@ -97,6 +97,7 @@ pub mod writers {
         sid::ETHERIP,
         sid::VXLAN,
         sid::SRV6_L2,
+        sid::SRV6_EVPN,
     ];
     pub const ROUTE: &[u64] = &[
         sid::ROUTE,
@@ -2466,12 +2467,12 @@ impl<'f, 't, B: GeneratedPacketIo> Members<'f, 't, B> {
             return (sent, u64::from(!sent));
         };
         let remotes = match &vtep {
-            Some(vtep) if overlay.is_vxlan() => std::slice::from_ref(vtep),
+            Some(vtep) if overlay.is_multipoint() => std::slice::from_ref(vtep),
             _ => overlay.remotes(),
         };
         let bridges = self.bridges;
         let mut sent = false;
-        let mut failed = u64::from(remotes.is_empty() && !overlay.is_vxlan());
+        let mut failed = u64::from(remotes.is_empty() && !overlay.is_multipoint());
         for &remote in remotes {
             let irb = |id: IfId| bridges.irb_of(id).is_some();
             match self.outer.overlay_header_in(

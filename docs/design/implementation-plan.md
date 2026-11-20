@@ -179,7 +179,8 @@ backlogと同じく、使う場面が出たものから片付ける。
 
 ルーティングデーモン（bird-rsなど）がEVPNを話し、rusterはそのL2の転送を受け持つ。次の順に作る。
 
-1. SRv6で運ぶ: End.DT2UとEnd.DT2M、遠くのMACの後ろをSRv6のSIDにする。
+1. SRv6で運ぶ: 設定にSRv6のEVPNのインターフェース（End.DT2UとEnd.DT2MのSID）を足し（confd、lock）、ruster 2台の
+   netnsで確かめる。FEとcoreはできた。
 
 #### 経路や通信の数が増えたとき
 

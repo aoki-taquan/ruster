@@ -200,6 +200,14 @@ pub const SRV6_L2_SOURCE: u64 = 60301;
 pub const SRV6_L2_SID: u64 = 60302;
 pub const SRV6_L2_SEGMENTS: u64 = 60303;
 pub const SRV6_L2_REDUCED: u64 = 60304;
+/// `ruster-if-srv6-evpn`: an interface that carries EVPN over SRv6 (RFC 8986
+/// End.DT2U and End.DT2M, RFC 9252), by interface: its outer source, the routing
+/// daemon's VNI it is, and its End.DT2U and End.DT2M SIDs.
+pub const SRV6_EVPN: u64 = 60305;
+pub const SRV6_EVPN_SOURCE: u64 = 60306;
+pub const SRV6_EVPN_VNI: u64 = 60307;
+pub const SRV6_EVPN_UNICAST: u64 = 60308;
+pub const SRV6_EVPN_MULTICAST: u64 = 60309;
 /// `ruster-fib` (state, config false): the counters of each local SRv6 SID (RFC 8986
 /// section 6), by SID prefix: packets and bytes. Only the FE writes them.
 pub const SRV6_SID_COUNTERS: u64 = 60310;
@@ -408,6 +416,11 @@ pub const ALL: &[(&str, u64)] = &[
     ("/ruster-if-srv6-l2:srv6-l2/sid", SRV6_L2_SID),
     ("/ruster-if-srv6-l2:srv6-l2/segment", SRV6_L2_SEGMENTS),
     ("/ruster-if-srv6-l2:srv6-l2/reduced", SRV6_L2_REDUCED),
+    ("/ruster-if-srv6-evpn:srv6-evpn", SRV6_EVPN),
+    ("/ruster-if-srv6-evpn:srv6-evpn/source-address", SRV6_EVPN_SOURCE),
+    ("/ruster-if-srv6-evpn:srv6-evpn/vni", SRV6_EVPN_VNI),
+    ("/ruster-if-srv6-evpn:srv6-evpn/unicast-sid", SRV6_EVPN_UNICAST),
+    ("/ruster-if-srv6-evpn:srv6-evpn/multicast-sid", SRV6_EVPN_MULTICAST),
     ("/ruster-fib:fib/srv6-sid-counters", SRV6_SID_COUNTERS),
     ("/ruster-fib:fib/srv6-sid-counters/packets", SRV6_SID_PACKETS),
     ("/ruster-fib:fib/srv6-sid-counters/bytes", SRV6_SID_BYTES),

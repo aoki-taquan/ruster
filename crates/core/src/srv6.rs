@@ -399,10 +399,12 @@ pub(crate) fn receive<S: PacketSlot, T: TraceSink>(
     trace: &mut T,
 ) -> Result<Received, Rejected> {
     let table = snapshot.srv6;
-    let members = snapshot
-        .overlays
-        .iter()
-        .any(|o| matches!(o.kind, crate::OverlayKind::Srv6L2 { .. }));
+    let members = snapshot.overlays.iter().any(|o| {
+        matches!(
+            o.kind,
+            crate::OverlayKind::Srv6L2 { .. } | crate::OverlayKind::Srv6Evpn { .. }
+        )
+    });
     if table.is_none_or(|t| t.sids.is_empty()) && !members {
         return Ok(Received::NotSid);
     }
@@ -413,6 +415,17 @@ pub(crate) fn receive<S: PacketSlot, T: TraceSink>(
         let member = snapshot.overlays.iter().find_map(|o| match o.kind {
             crate::OverlayKind::Srv6L2 { sid, .. } if sid == destination => Some(Srv6Sid {
                 prefix: sid,
+                len: 128,
+                behaviour: Srv6Behaviour::EndDx2 {
+                    member: o.interface,
+                },
+            }),
+            // End.DT2U and End.DT2M take the frame to the member as End.DX2 does;
+            // its bridge then looks up and floods.
+            crate::OverlayKind::Srv6Evpn {
+                unicast, multicast, ..
+            } if unicast == destination || multicast == destination => Some(Srv6Sid {
+                prefix: destination,
                 len: 128,
                 behaviour: Srv6Behaviour::EndDx2 {
                     member: o.interface,
