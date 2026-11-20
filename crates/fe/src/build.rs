@@ -321,6 +321,16 @@ impl Routes {
     }
 }
 
+/// Whether `address` is one of the router's own SRv6 EVPN SIDs.
+fn own_sid(overlays: &[ruster_core::Overlay], address: IpAddr) -> bool {
+    overlays.iter().any(|o| match o.kind {
+        ruster_core::OverlayKind::Srv6Evpn {
+            unicast, multicast, ..
+        } => [IpAddr::from(unicast), IpAddr::from(multicast)].contains(&address),
+        _ => false,
+    })
+}
+
 /// The EVPN VNI an overlay is in: a VXLAN or SRv6 EVPN interface's.
 fn evpn_vni(kind: &ruster_core::OverlayKind) -> Option<u32> {
     match kind {
@@ -368,6 +378,16 @@ fn evpn_floods(
             .or_default()
             .extend(overlay.remotes().iter().copied());
     }
+    // The router's own SRv6 EVPN SIDs are no remote end's.
+    let own: BTreeSet<IpAddr> = overlays
+        .iter()
+        .flat_map(|o| match o.kind {
+            ruster_core::OverlayKind::Srv6Evpn {
+                unicast, multicast, ..
+            } => vec![IpAddr::from(unicast), IpAddr::from(multicast)],
+            _ => Vec::new(),
+        })
+        .collect();
     for overlay in overlays.iter_mut() {
         let at = bridge_of(overlay.interface);
         let local = overlay.local;
@@ -378,7 +398,7 @@ fn evpn_floods(
         };
         let taken = taken.entry(at).or_default();
         for &vtep in floods.get(vni).into_iter().flatten() {
-            let fits = vtep.is_ipv4() == local.is_ipv4() && vtep != local;
+            let fits = vtep.is_ipv4() == local.is_ipv4() && vtep != local && !own.contains(&vtep);
             // Outside a bridge two interfaces may share a VTEP.
             // No more than a configured list may have: each received packet and
             // each flooded frame goes through the list.
@@ -415,7 +435,9 @@ fn evpn_macs(
                 ruster_core::OverlayKind::Vxlan { vni: v, .. } => {
                     v == *vni && overlay.remotes().contains(vtep)
                 }
-                ruster_core::OverlayKind::Srv6Evpn { vni: v, .. } => v == *vni && vtep.is_ipv6(),
+                ruster_core::OverlayKind::Srv6Evpn { vni: v, .. } => {
+                    v == *vni && vtep.is_ipv6() && !own_sid(overlays, *vtep)
+                }
                 _ => false,
             };
             if !fits {
@@ -1128,7 +1150,7 @@ pub(crate) fn build(
             }
             if active.contains_key(name.as_str()) {
                 return Err(format!(
-                    "{name} is more than one of an EtherIP, VXLAN and SRv6 L2 interface"
+                    "{name} is more than one of an EtherIP, VXLAN, SRv6 L2 and SRv6 EVPN interface"
                 ));
             }
             // A received packet finds its VXLAN interface by the local address and
@@ -1143,6 +1165,21 @@ pub(crate) fn build(
                         "VXLAN interface {name}: another has the same local address and VNI"
                     ));
                 }
+            }
+            // A packet to an SRv6 L2 or EVPN SID finds its interface by the SID.
+            let sids = |k: &ruster_core::OverlayKind| match k {
+                ruster_core::OverlayKind::Srv6L2 { sid, .. } => vec![*sid],
+                ruster_core::OverlayKind::Srv6Evpn {
+                    unicast, multicast, ..
+                } => vec![*unicast, *multicast],
+                _ => Vec::new(),
+            };
+            let mine = sids(&kind);
+            if overlays
+                .iter()
+                .any(|o| sids(&o.kind).iter().any(|s| mine.contains(s)))
+            {
+                return Err(format!("SRv6 interface {name}: another has the same SID"));
             }
             let id = ids.take(name)?;
             interfaces.push(Interface {
@@ -1187,9 +1224,14 @@ pub(crate) fn build(
                         interface: name.clone(),
                     })
                     .is_some()
+                || store
+                    .get(&Key::Srv6Evpn {
+                        interface: name.clone(),
+                    })
+                    .is_some()
             {
                 return Err(format!(
-                    "bridge {name} has the name of an EtherIP, VXLAN or SRv6 L2 interface"
+                    "bridge {name} has the name of an EtherIP, VXLAN, SRv6 L2 or SRv6 EVPN interface"
                 ));
             }
             let limits = ruster_core::BridgeLimits {
@@ -1287,11 +1329,12 @@ pub(crate) fn build(
             if let (Some(at), Some(member)) = (bridge_at(bridge), member) {
                 // On a VXLAN member, behind one of its VTEPs; on any other, behind
                 // none.
-                let vxlan = overlays
-                    .iter()
-                    .find(|o| o.interface == member)
-                    .filter(|o| o.is_vxlan());
+                let overlay = overlays.iter().find(|o| o.interface == member);
+                let vxlan = overlay.filter(|o| o.is_vxlan());
+                // Over SRv6 EVPN, where a host is comes from the EVPN tables only.
+                let evpn = overlay.is_some_and(|o| o.is_multipoint() && !o.is_vxlan());
                 let fits = match (vxlan, vtep) {
+                    _ if evpn => false,
                     (Some(overlay), Some(vtep)) => overlay.remotes().contains(vtep),
                     (None, None) => true,
                     _ => false,
@@ -1300,7 +1343,8 @@ pub(crate) fn build(
                     let vtep = vtep.map_or_else(|| "none".to_owned(), |v| v.to_string());
                     return Err(format!(
                         "bridge {bridge}: static MAC {} on {interface} has VTEP {vtep}: one of \
-                         the interface's VTEPs on a VXLAN interface, none on any other",
+                         the interface's VTEPs on a VXLAN interface, none on any other (and \
+                         none on an SRv6 EVPN interface)",
                         table::format_mac(mac)
                     ));
                 }

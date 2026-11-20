@@ -274,4 +274,44 @@ fn frames_go_to_the_remote_sids_of_the_evpn_tables_and_come_in_on_the_router_s()
         sids(&bench.send(P1, to_h3.clone()), &to_h3),
         vec![v6("fc00:2::f"), v6("fc00:3::f")]
     );
+
+    // H2 moves to p1, then back behind its router (the EVPN tables unchanged):
+    // frames to it follow, back to its End.DT2U SID.
+    bench.send(P1, frame(H1, H2, 60));
+    let to_h2 = frame(H2, H1, 100);
+    assert_eq!(
+        bench.send(WAN, outer(DT2M, &to_h2)),
+        vec![(P1, to_h2.clone())]
+    );
+    bench.send(WAN, outer(DT2U, &frame(H1, H2, 60)));
+    assert_eq!(
+        sids(&bench.send(P1, to_h2.clone()), &to_h2),
+        vec![v6("fc00:2::e")]
+    );
+}
+
+#[test]
+fn the_router_s_own_sids_and_static_macs_are_not_remote_ends() {
+    let mut bench = Bench::new();
+    bench.evpn(&[
+        Change::set(
+            Key::EvpnFlood {
+                vni: 100,
+                vtep: IpAddr::V6(v6(DT2M)),
+            },
+            Value::EvpnFlood,
+        ),
+        Change::set(
+            Key::EvpnFlood {
+                vni: 100,
+                vtep: IpAddr::V6(v6("fc00:2::f")),
+            },
+            Value::EvpnFlood,
+        ),
+    ]);
+    let broadcast = frame([0xff; 6], H1, 60);
+    assert_eq!(
+        sids(&bench.send(P1, broadcast.clone()), &broadcast),
+        vec![v6("fc00:2::f")]
+    );
 }

@@ -537,6 +537,37 @@ impl MacTable {
         Learned::New
     }
 
+    /// `mac` was seen on `member`, whose frames are not learned from (where its hosts
+    /// are comes from the control side): a learned entry elsewhere is out of date.
+    /// One that took over the control side's static entry on this member gives it
+    /// back; any other goes (frames to it are flooded until the control side says).
+    fn seen_remote(&mut self, bridge: u16, mac: [u8; 6], member: IfId) {
+        let Some(at) = self.find(bridge, &mac) else {
+            return;
+        };
+        let slot = self.slots[at];
+        if slot.fixed || slot.member == member {
+            return;
+        }
+        match slot.moved_from {
+            Some((from, vtep)) if from == member => {
+                self.slots[at] = Slot {
+                    fixed: true,
+                    movable: true,
+                    moved_from: None,
+                    member: from,
+                    vtep,
+                    seen_ms: 0,
+                    ..slot
+                };
+                let state = &mut self.bridges[usize::from(bridge)];
+                state.learned = state.learned.saturating_sub(1);
+                state.counters.moved += 1;
+            }
+            _ => self.remove(at),
+        }
+    }
+
     /// The member `mac` of `bridge` is on (and the remote VTEP behind it), unless it
     /// is not known or has aged (then its entry goes).
     pub fn lookup(
@@ -619,6 +650,8 @@ impl MacTable {
         }
         if learn {
             self.learn(bridge, source, member, vtep, now_ms);
+        } else {
+            self.seen_remote(bridge, source, member);
         }
         if Some(destination) == irb {
             return BridgeDecision::Irb;
