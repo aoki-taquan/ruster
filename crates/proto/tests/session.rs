@@ -132,6 +132,37 @@ fn patch_commits_and_get_returns_the_writers_entries() {
 }
 
 #[test]
+fn a_reader_gets_one_table_by_its_sid() {
+    let mut bench = Bench::new();
+    let mut ifaces = bench.connect(&[sid::INTERFACE]);
+    let token = ifaces.patch(&[iface("eth0", 1)]).unwrap();
+    let events = bench.settle(&mut ifaces);
+    assert_eq!(response(&events, token).0, Code::CHANGED);
+    let mut neighbors = bench.connect(&[sid::NEIGHBOR]);
+    let token = neighbors.patch(&[neighbor([10, 0, 0, 1])]).unwrap();
+    let events = bench.settle(&mut neighbors);
+    assert_eq!(response(&events, token).0, Code::CHANGED);
+    let mut reader = bench.connect(&[]);
+    let token = reader.get_table(sid::NEIGHBOR);
+    let events = bench.settle(&mut reader);
+    let (code, payload) = response(&events, token);
+    assert_eq!(code, Code::CONTENT);
+    let changes = decode_changes(&payload).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].key.table(), sid::NEIGHBOR);
+    // A writer gets only its own tables, by SID too.
+    let token = ifaces.get_table(sid::NEIGHBOR);
+    let events = bench.settle(&mut ifaces);
+    let (code, payload) = response(&events, token);
+    assert_eq!(code, Code::CONTENT);
+    assert!(decode_changes(&payload).unwrap().is_empty());
+    // Not a SID: not found.
+    let token = reader.get(&["c", "x"]);
+    let events = bench.settle(&mut reader);
+    assert_eq!(response(&events, token).0, Code::NOT_FOUND);
+}
+
+#[test]
 fn a_rejected_patch_changes_nothing() {
     let mut bench = Bench::new();
     let mut client = bench.connect(&[sid::INTERFACE]);

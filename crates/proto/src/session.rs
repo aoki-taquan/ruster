@@ -7,6 +7,7 @@
 //! |---|---|
 //! | iPATCH `c` | apply the changes in the payload, all or none |
 //! | GET `c` | the entries of the tables this connection writes (all tables if it writes none) |
+//! | GET `c/<SID>` | the same, of the one table of that SID (decimal) |
 //! | POST `c/resync-begin` | mark this writer's entries as not yet sent again |
 //! | POST `c/resync-end` | delete this writer's entries that were not sent again |
 //! | POST `c/sync-done` | the writer has sent everything it has (see [`Server::sync_done`]) |
@@ -27,7 +28,8 @@
 //!
 //! Deviations: `c/resync-begin`, `c/resync-end` and `c/sync-done` are ruster's own (a
 //! writer resending everything after a restart). GET `c` answers only the tables the
-//! connection writes.
+//! connection writes. GET `c/<SID>` is ruster's own, so that a reader of one small table
+//! of a large store (the FE's state) stays within a message.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -510,11 +512,16 @@ impl Server {
                     }
                 }
             },
-            (Code::GET, ["c"]) => {
+            // Another second segment than a table's SID: not found, below.
+            (Code::GET, ["c"] | ["c", _])
+                if path.get(1).is_none_or(|t| t.parse::<u64>().is_ok()) =>
+            {
+                let only = path.get(1).and_then(|t| t.parse::<u64>().ok());
                 let changes: Vec<Change> = self
                     .store
                     .iter()
                     .filter(|(key, _)| writes.is_empty() || writes.contains(&key.table()))
+                    .filter(|(key, _)| only.is_none_or(|t| key.table() == t))
                     .map(|(key, value)| Change::set(key.clone(), value.clone()))
                     .collect();
                 let limit = self.peers[index].conn.peer_limit().unwrap_or(DEFAULT_LIMIT);
@@ -649,6 +656,12 @@ impl Client {
 
     pub fn get_all(&mut self) -> u32 {
         self.request(Code::GET, &["c"], None, &[])
+    }
+
+    /// GET `c/<table>`: the entries of the one table.
+    pub fn get_table(&mut self, table: u64) -> u32 {
+        let table = table.to_string();
+        self.request(Code::GET, &["c", &table], None, &[])
     }
 
     pub fn resync_begin(&mut self) -> u32 {
