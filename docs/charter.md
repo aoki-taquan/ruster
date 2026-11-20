@@ -41,11 +41,15 @@ rusterで何を作り、何を作らないかを決める文書です。作業�
   - フラグメント処理、ICMPとICMPv6のエラー生成
   - トンネル（MAP-E、DS-Lite）のカプセル化、PPPoEのカプセル化
   - L2のブリッジ（MACアドレスの学習、フラッディング、エージング）と、ルーティングとのつなぎ（IRB）
-  - L2を運ぶトンネル: VXLAN（RFC 7348。送り先のVTEPは設定に書く）、EtherIP（RFC 3378）
+  - L2を運ぶトンネル: VXLAN（RFC 7348。送り先のVTEPは設定に書くか、EVPNで受ける）、EtherIP（RFC 3378）
+  - EVPN（RFC 7432、RFC 8365）のL2の転送: ルーティングデーモンから受けた遠くのMACとフラッディングの相手、
+    FEが学んだMACを状態として見せること、ARPとNDの代理応答（RFC 7432の10.、RFC 9161）、SRv6で運ぶための
+    End.DT2UとEnd.DT2M（RFC 8986）
   - SRv6（RFC 8754のSRH。RFC 8986のEnd、End.X、End.DX2、End.DX4、End.DX6、End.DT4、End.DT6、End.DT46、
     H.Encaps、H.Encaps.Red、H.Encaps.L2、H.Encaps.L2.Red、PSP、USP、USD。RFC 9800の圧縮したSID（NEXT-CSID））
   - ルータ宛て通信の分類と流量制限、kernelへの受け渡し（TUN）
-- CE: 設定管理（`ruster-confd`）、経路の選択（`ruster-ribd`。SRv6の経路も、送り手から受ける）、ARPとND（`ruster-neighd`）。
+- CE: 設定管理（`ruster-confd`）、経路の選択（`ruster-ribd`。SRv6の経路と、EVPNの遠くのMACとフラッディングの相手も、
+  送り手から受ける）、ARPとND（`ruster-neighd`）。
 - FEをいろいろな環境で動かすためのI/O層（AF_XDP、AF_PACKET、sim）。
 - FEとCEをつなぐ小さなメッセージ形式と、それを読み書きするライブラリ。
 - 設定ファイルを検証してCEの各プロセスへ反映するCLI。

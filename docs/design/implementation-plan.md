@@ -176,6 +176,15 @@ charterの「作るもの」は上の表のとおりそろい、2026-11-10 にow
 全部できた。FPMでFRRからSRv6の経路を受けることとEVPNは作らない。SRv6とVXLANのbacklogの残りは、ほかの
 backlogと同じく、使う場面が出たものから片付ける。
 
+#### EVPN
+
+ルーティングデーモン（bird-rsなど）がEVPNを話し、rusterはそのL2の転送を受け持つ。次の順に作る。
+
+1. FEが学んだMACを、状態の表として見せる（FEの状態のsocket、observeで変化が届く）。
+2. 遠くのMACとVNIごとのフラッディングの相手（VTEP）を、送り手からribdが受けて選び、FEへ書く。
+3. ARPとNDの代理応答。送り手から受けたMACとIPの組で、ブリッジのARPとNDにルータが答える。
+4. SRv6で運ぶ: End.DT2UとEnd.DT2M、遠くのMACの後ろをSRv6のSIDにする。
+
 #### 経路や通信の数が増えたとき
 
 FRRの橋渡し役は100万経路まで受ける。2026-11-10に測ると、FEは表が大きいと更新に時間がかかり、その間は
@@ -332,7 +341,6 @@ ICMPは今の判定のまま。`ruster-bench`のcoreだけ、1パケット、32�
   workerは読まない。
 
 組み立ての作りは[`router-box.md`](router-box.md)、L2とトンネルとSRv6の作りは[`overlay.md`](overlay.md)にある。
-BGP EVPNは見送り（2026-11-10 owner決定）。
 
 今は作らないもの（2026-11-08 owner決定）: マルチキャスト（MLDを含む）、ルータのlink-localへのND以外の通信
 （IS-ISとOSPFがTAPで受けるものを除く）。
