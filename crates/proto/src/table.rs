@@ -138,6 +138,12 @@ pub enum Key {
     Srv6L2 {
         interface: String,
     },
+    /// The counters of the router's SRv6 SID `prefix/len` (RFC 8986 section 6).
+    /// State the FE keeps, not configuration: no writer writes it.
+    Srv6SidCounters {
+        prefix: std::net::Ipv6Addr,
+        len: u8,
+    },
 }
 
 /// The value of one entry.
@@ -256,6 +262,11 @@ pub enum Value {
         /// The VRF the outer packets are routed in and arrive in ([`DEFAULT_VRF`]
         /// when not given).
         underlay_vrf: String,
+    },
+    /// The packets and bytes the SID handled since the FE started or the SID came.
+    Srv6SidCounters {
+        packets: u64,
+        bytes: u64,
     },
     /// Frames leave wrapped from `source` toward `segments` (the first first;
     /// H.Encaps.L2, or H.Encaps.L2.Red with `reduced`), and packets to the
@@ -773,6 +784,7 @@ impl Key {
             Self::EtherIp { .. } => sid::ETHERIP,
             Self::Vxlan { .. } => sid::VXLAN,
             Self::Srv6L2 { .. } => sid::SRV6_L2,
+            Self::Srv6SidCounters { .. } => sid::SRV6_SID_COUNTERS,
         }
     }
 }
@@ -853,6 +865,11 @@ impl Change {
             | Key::EtherIp { interface }
             | Key::Vxlan { interface }
             | Key::Srv6L2 { interface } => name(interface)?,
+            Key::Srv6SidCounters { prefix, len } => {
+                if *len > 128 || network(IpAddr::V6(*prefix), *len) != IpAddr::V6(*prefix) {
+                    return Err(ModelError::Invalid("SID prefix"));
+                }
+            }
             Key::Route { vrf, prefix, len } => {
                 name(vrf)?;
                 // The prefix is an address already: what a text of it is checked
@@ -890,6 +907,7 @@ impl Change {
                         | (Key::EtherIp { .. }, Value::EtherIp { .. })
                         | (Key::Vxlan { .. }, Value::Vxlan { .. })
                         | (Key::Srv6L2 { .. }, Value::Srv6L2 { .. })
+                        | (Key::Srv6SidCounters { .. }, Value::Srv6SidCounters { .. })
                 );
                 if !table_matches {
                     return Err(ModelError::WrongTable);
@@ -1344,6 +1362,11 @@ pub fn encode_key(key: &Key, e: &mut Encoder<'_>) {
         Key::Srv6L2 { interface } => {
             e.array(2).u64(sid::SRV6_L2).text(interface);
         }
+        Key::Srv6SidCounters { prefix, len } => {
+            e.array(2)
+                .u64(sid::SRV6_SID_COUNTERS)
+                .text(&format!("{prefix}/{len}"));
+        }
         Key::Vxlan { interface } => {
             e.array(2).u64(sid::VXLAN).text(interface);
         }
@@ -1380,7 +1403,8 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
         | sid::BRIDGE_PORT
         | sid::ETHERIP
         | sid::VXLAN
-        | sid::SRV6_L2 => 2,
+        | sid::SRV6_L2
+        | sid::SRV6_SID_COUNTERS => 2,
         sid::ADDRESS | sid::ROUTE | sid::NEIGHBOR | sid::FIREWALL_RULE | sid::BRIDGE_MAC => 3,
         other => return Err(ModelError::UnknownTable(other)),
     };
@@ -1407,6 +1431,14 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
         sid::ETHERIP => Key::EtherIp { interface: first },
         sid::VXLAN => Key::Vxlan { interface: first },
         sid::SRV6_L2 => Key::Srv6L2 { interface: first },
+        sid::SRV6_SID_COUNTERS => {
+            let (prefix, len) = first
+                .split_once('/')
+                .and_then(|(p, l)| Some((parse_ipv6(p).ok()?, l.parse::<u8>().ok()?)))
+                .filter(|(_, len)| *len <= 128)
+                .ok_or(ModelError::Invalid("SID prefix"))?;
+            Key::Srv6SidCounters { prefix, len }
+        }
         sid::BRIDGE_MAC => Key::BridgeMac {
             bridge: first,
             mac: parse_mac(d.text()?)?,
@@ -1775,6 +1807,13 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
             }
             e.u64(d(sid::SRV6_L2_REDUCED)).bool(*reduced);
         }
+        Value::Srv6SidCounters { packets, bytes } => {
+            e.map(2)
+                .u64(sid::SRV6_SID_PACKETS - sid::SRV6_SID_COUNTERS)
+                .u64(*packets)
+                .u64(sid::SRV6_SID_BYTES - sid::SRV6_SID_COUNTERS)
+                .u64(*bytes);
+        }
         Value::EtherIp { local, remote } => {
             e.map(2)
                 .u64(sid::ETHERIP_LOCAL - sid::ETHERIP)
@@ -1839,6 +1878,7 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
             | sid::ETHERIP
             | sid::VXLAN
             | sid::SRV6_L2
+            | sid::SRV6_SID_COUNTERS
     ) {
         return decode_policy_value(table, d);
     }
@@ -2465,6 +2505,9 @@ pub fn entry_line(key: &Key, value: &Value) -> Option<String> {
         (Key::EtherIp { interface }, Value::EtherIp { local, remote }) => {
             format!("etherip {interface} {local} to {remote}")
         }
+        (Key::Srv6SidCounters { prefix, len }, Value::Srv6SidCounters { packets, bytes }) => {
+            format!("srv6-sid {prefix}/{len} packets {packets} bytes {bytes}")
+        }
         (
             Key::Srv6L2 { interface },
             Value::Srv6L2 {
@@ -2644,6 +2687,16 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
         Value::EtherIp {
             local: address(sid::ETHERIP_LOCAL, "local")?,
             remote: address(sid::ETHERIP_REMOTE, "remote")?,
+        }
+    } else if table == sid::SRV6_SID_COUNTERS {
+        let mut count = |member: u64, what: &'static str| match got.remove(&member) {
+            Some(Member::Uint(n)) => Ok(n),
+            Some(_) => Err(ModelError::Invalid(what)),
+            None => Err(ModelError::Missing(what)),
+        };
+        Value::Srv6SidCounters {
+            packets: count(sid::SRV6_SID_PACKETS, "packets")?,
+            bytes: count(sid::SRV6_SID_BYTES, "bytes")?,
         }
     } else if table == sid::SRV6_L2 {
         let mut address = |member: u64, what: &'static str| {

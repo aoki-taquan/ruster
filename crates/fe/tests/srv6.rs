@@ -737,3 +737,60 @@ fn a_cross_connect_sid_whose_interface_is_missing_drops_its_packets() {
     );
     assert_eq!(out, vec![]);
 }
+
+#[test]
+fn each_sid_counts_its_packets_and_bytes_in_the_state_tables() {
+    let mut fe = bench();
+    // Two packets to End.DT4 fc00:1::4.
+    for _ in 0..2 {
+        let out = send(&mut fe, WAN, to_sid("fc00:1::4", 0, 4, &ipv4(REMOTE, HOST)));
+        assert_eq!(out.len(), 1);
+    }
+    // A second later the worker hands the counts over.
+    fe.step(1_000);
+    fe.step(1_001);
+    let (a, b) = UnixStream::pair().unwrap();
+    fe.attach(a, writers::READ_ONLY).unwrap();
+    let mut reader = Client::new(b).unwrap();
+    let token = reader.get_all();
+    let mut payload = None;
+    for _ in 0..1_000 {
+        fe.step(1_002);
+        let (_, events) = reader.poll();
+        for event in events {
+            if let Event::Response {
+                token: t,
+                payload: p,
+                ..
+            } = event
+            {
+                if t == token {
+                    payload = Some(p);
+                }
+            }
+        }
+        if payload.is_some() {
+            break;
+        }
+    }
+    let changes = ruster_proto::session::decode_changes(&payload.expect("answer")).unwrap();
+    let counters = changes
+        .iter()
+        .find(|c| {
+            c.key
+                == Key::Srv6SidCounters {
+                    prefix: v6("fc00:1::4"),
+                    len: 128,
+                }
+        })
+        .and_then(|c| c.value.clone());
+    // Each packet is 40 + 40 (an SRH of two segments) + 28 bytes from its IPv6
+    // header.
+    assert_eq!(
+        counters,
+        Some(Value::Srv6SidCounters {
+            packets: 2,
+            bytes: 2 * (40 + 40 + 28),
+        })
+    );
+}

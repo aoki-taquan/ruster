@@ -1802,3 +1802,29 @@ fn srv6_l2_entries_round_trip_and_are_checked() {
         assert!(bad.validate().is_err(), "{bad:?}");
     }
 }
+
+#[test]
+fn srv6_sid_counters_round_trip() {
+    let counters = Change::set(
+        Key::Srv6SidCounters {
+            prefix: "fc00:1::4".parse().unwrap(),
+            len: 128,
+        },
+        Value::Srv6SidCounters {
+            packets: 7,
+            bytes: 7_000_000_000,
+        },
+    );
+    assert!(counters.validate().is_ok());
+    assert_eq!(round_trip(&counters), counters);
+    assert_eq!(
+        entry_line(&counters.key, counters.value.as_ref().unwrap()).unwrap(),
+        "srv6-sid fc00:1::4/128 packets 7 bytes 7000000000"
+    );
+    let mut host_bits = counters.clone();
+    host_bits.key = Key::Srv6SidCounters {
+        prefix: "fc00:1::4".parse().unwrap(),
+        len: 64,
+    };
+    assert!(host_bits.validate().is_err());
+}

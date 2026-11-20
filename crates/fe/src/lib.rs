@@ -516,6 +516,8 @@ enum FromWorker {
     /// Another worker ([`Fe::with_workers`]) now uses the last version sent, and
     /// gives back the tables it moved away from.
     OtherUsing(Arc<build::Built>),
+    /// The counters of the SRv6 SIDs: prefix, length, packets and bytes.
+    Srv6Counters(Vec<SidCount>),
 }
 
 /// The steps of the control task after which a [`FromWorker::Sync`] is answered
@@ -570,6 +572,21 @@ impl ControlTask {
                 self.sync_steps = 0;
             }
             FromWorker::Retired(tables) => drop(tables),
+            FromWorker::Srv6Counters(counters) => {
+                let entries = counters
+                    .into_iter()
+                    .map(|(prefix, len, packets, bytes)| {
+                        (
+                            Key::Srv6SidCounters {
+                                prefix: prefix.into(),
+                                len,
+                            },
+                            Value::Srv6SidCounters { packets, bytes },
+                        )
+                    })
+                    .collect();
+                self.server.set_state(sid::SRV6_SID_COUNTERS, entries);
+            }
         }
     }
 
@@ -718,6 +735,74 @@ struct Worker<B> {
     /// Told to the other workers: this worker's NAT or firewall could not move
     /// to the tables in use.
     hand_all: Arc<AtomicBool>,
+    /// The counters of the SRv6 SIDs (RFC 8986 section 6), in the order of the
+    /// SIDs of the tables in use, and when they were last sent to the control task.
+    srv6: Srv6Counters,
+}
+
+/// A local SRv6 SID's prefix and length, and the packets and bytes it handled.
+type SidCount = ([u8; 16], u8, u64, u64);
+
+/// The packets and bytes each local SRv6 SID handled, by SID.
+#[derive(Default)]
+struct Srv6Counters {
+    sids: Vec<([u8; 16], u8)>,
+    counts: Vec<(u64, u64)>,
+    changed: bool,
+    sent_ms: u64,
+}
+
+/// How often the SID counters go to the control task, at most.
+const SRV6_COUNTERS_EVERY_MS: u64 = 1_000;
+
+impl Srv6Counters {
+    /// Follows the SIDs of new tables: a SID that stays keeps its counts.
+    fn follow(&mut self, table: &ruster_core::Srv6Table) {
+        let sids: Vec<([u8; 16], u8)> = table.sids().collect();
+        if sids == self.sids {
+            return;
+        }
+        let counts = sids
+            .iter()
+            .map(|sid| {
+                self.sids
+                    .iter()
+                    .position(|old| old == sid)
+                    .map_or((0, 0), |at| self.counts[at])
+            })
+            .collect();
+        self.sids = sids;
+        self.counts = counts;
+        self.changed = true;
+    }
+
+    /// Adds what a batch counted (by index).
+    fn add(&mut self, batch: &[(u64, u64)]) {
+        for (count, (packets, bytes)) in self.counts.iter_mut().zip(batch) {
+            if *packets > 0 {
+                count.0 += packets;
+                count.1 += bytes;
+                self.changed = true;
+            }
+        }
+    }
+
+    /// The counters to send, when they changed and the last were sent long enough
+    /// ago.
+    fn due(&mut self, now_ms: u64) -> Option<Vec<SidCount>> {
+        if !self.changed || now_ms.saturating_sub(self.sent_ms) < SRV6_COUNTERS_EVERY_MS {
+            return None;
+        }
+        self.changed = false;
+        self.sent_ms = now_ms;
+        Some(
+            self.sids
+                .iter()
+                .zip(&self.counts)
+                .map(|(&(prefix, len), &(packets, bytes))| (prefix, len, packets, bytes))
+                .collect(),
+        )
+    }
 }
 
 impl<B> std::fmt::Debug for Fe<B> {
@@ -852,6 +937,7 @@ where
             counters: FeCounters::default(),
             from_others,
             hand_all,
+            srv6: Srv6Counters::default(),
         };
         let others_counters = other_workers
             .iter()
@@ -1187,6 +1273,10 @@ where
             self.unread_steps + 1
         };
         let worked = self.worker(now_ms, read_handed_in);
+        // Also when the ports are quiet: the last counts are not held back.
+        if let Some(counters) = self.srv6.due(now_ms) {
+            let _ = self.to_control.send(FromWorker::Srv6Counters(counters));
+        }
         // Frames held for the control task's answer go out whatever the ports do.
         let injected = (read_handed_in || self.held.is_some()) && self.inject();
         self.write_handed();
@@ -1428,6 +1518,7 @@ where
         self.punt_frames = built.punt.frame_matches();
         self.handover.controls.follow(built.punt.controls());
         self.kernel_bits = ruster_core::kernel_ingress_bits(&built.kernel);
+        self.srv6.follow(&built.srv6);
         let old = std::mem::replace(&mut self.tables, built);
         let old_overlays = old.overlays.clone();
         // Freed on the control task's side; here only when it is gone.
@@ -1728,6 +1819,7 @@ where
         if self.used.len() < USED_MAX {
             self.used.extend(trace.used.drain(..));
         }
+        self.srv6.add(&trace.srv6);
         for &(egress, target) in &trace.misses {
             self.resolve_request(egress, target, now_ms);
         }
@@ -2615,6 +2707,8 @@ struct FeTrace {
     /// reason.
     overlay_too_big: u64,
     overlay_dropped: u64,
+    /// The packets and bytes of each SRv6 SID, by its index in the tables.
+    srv6: Vec<(u64, u64)>,
 }
 
 impl TraceSink for FeTrace {
@@ -2655,6 +2749,14 @@ impl TraceSink for FeTrace {
                 self.miss(egress, IpAddr::V6(target.into()));
             }
             TraceEvent::Dropped { reason, .. } => self.overlay_drop(reason),
+            TraceEvent::Srv6Sid { index, bytes } => {
+                let at = usize::from(index);
+                if self.srv6.len() <= at {
+                    self.srv6.resize(at + 1, (0, 0));
+                }
+                self.srv6[at].0 += 1;
+                self.srv6[at].1 += u64::from(bytes);
+            }
             _ => {}
         }
     }
@@ -2669,6 +2771,7 @@ impl FeTrace {
         self.overflow = 0;
         self.overlay_too_big = 0;
         self.overlay_dropped = 0;
+        self.srv6.clear();
     }
 
     fn mark_used(&mut self, next_hop: (u16, IpAddr)) {

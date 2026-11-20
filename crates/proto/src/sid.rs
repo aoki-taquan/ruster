@@ -194,6 +194,11 @@ pub const SRV6_L2_SOURCE: u64 = 60301;
 pub const SRV6_L2_SID: u64 = 60302;
 pub const SRV6_L2_SEGMENTS: u64 = 60303;
 pub const SRV6_L2_REDUCED: u64 = 60304;
+/// `ruster-fib` (state, config false): the counters of each local SRv6 SID (RFC 8986
+/// section 6), by SID prefix: packets and bytes. Only the FE writes them.
+pub const SRV6_SID_COUNTERS: u64 = 60310;
+pub const SRV6_SID_PACKETS: u64 = 60311;
+pub const SRV6_SID_BYTES: u64 = 60312;
 
 /// Notification: the FE has a packet for a next hop that is not in the neighbor table.
 pub const RESOLVE_REQUEST: u64 = 60050;
@@ -379,6 +384,9 @@ pub const ALL: &[(&str, u64)] = &[
     ("/ruster-if-srv6-l2:srv6-l2/sid", SRV6_L2_SID),
     ("/ruster-if-srv6-l2:srv6-l2/segment", SRV6_L2_SEGMENTS),
     ("/ruster-if-srv6-l2:srv6-l2/reduced", SRV6_L2_REDUCED),
+    ("/ruster-fib:fib/srv6-sid-counters", SRV6_SID_COUNTERS),
+    ("/ruster-fib:fib/srv6-sid-counters/packets", SRV6_SID_PACKETS),
+    ("/ruster-fib:fib/srv6-sid-counters/bytes", SRV6_SID_BYTES),
     ("/ruster-neighbor:resolve-request", RESOLVE_REQUEST),
     (
         "/ruster-neighbor:resolve-request/interface",
