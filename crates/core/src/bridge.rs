@@ -410,6 +410,30 @@ impl MacTable {
             });
             self.bridges[usize::from(new)].learned += 1;
         }
+        // A static entry kept out for a learned one that did not come back in.
+        for kept in statics
+            .iter()
+            .filter(|s| kept_over.contains(&(s.bridge, s.mac)))
+        {
+            if self.find(kept.bridge, &kept.mac).is_some() {
+                continue;
+            }
+            if self.len >= self.capacity {
+                left_out += 1;
+                continue;
+            }
+            self.insert(Slot {
+                used: true,
+                fixed: true,
+                movable: true,
+                moved_from: None,
+                bridge: kept.bridge,
+                mac: kept.mac,
+                member: kept.member,
+                vtep: kept.vtep,
+                seen_ms: 0,
+            });
+        }
         left_out
     }
 
@@ -431,9 +455,11 @@ impl MacTable {
             let aged = self.aged(&self.slots[at], now_ms);
             let slot = &mut self.slots[at];
             if slot.fixed {
-                // A movable entry seen on another member has moved there (EVPN, RFC
-                // 7432 section 15): it is learned there, as far as there is room.
-                if !slot.movable || slot.member == member || full {
+                // A movable entry seen on another member, not behind a remote VTEP,
+                // has moved there (EVPN, RFC 7432 section 15: where remote hosts
+                // are comes from the routing daemon): it is learned there, as far
+                // as there is room.
+                if !slot.movable || slot.member == member || vtep.is_some() || full {
                     return Learned::Static;
                 }
                 *slot = Slot {
@@ -451,6 +477,11 @@ impl MacTable {
                 return Learned::Moved;
             }
             slot.seen_ms = now_ms;
+            // Behind a remote VTEP again: the routing daemon's entry is what holds
+            // from the next table change on.
+            if vtep.is_some() {
+                slot.moved_from = None;
+            }
             if slot.member == member && slot.vtep == vtep {
                 return Learned::Refreshed;
             }
@@ -1174,6 +1205,18 @@ mod tests {
         };
         publish(&mut t, &[other]);
         assert_eq!(t.send(0, &A, 8), Some((P3, other.vtep)));
+        // Not taken over from behind a VTEP, on another member either.
+        assert_eq!(t.learn(0, A, P2, Some(vtep), 9), Learned::Static);
+        // Taken over, then seen behind a VTEP again: the static one is back with
+        // the next change.
+        assert_eq!(t.learn(0, A, P1, None, 10), Learned::Moved);
+        assert_eq!(t.learn(0, A, P3, other.vtep, 11), Learned::Moved);
+        publish(&mut t, &[other]);
+        assert!(t.entries().any(|e| e.mac == A && e.fixed));
+        // Taken over, and the member leaves the bridge: the static one is back.
+        assert_eq!(t.learn(0, A, P1, None, 12), Learned::Moved);
+        t.republish(&limits, &[Some(0)], |_, member, _| member != P1, &[other]);
+        assert_eq!(t.send(0, &A, 13), Some((P3, other.vtep)));
     }
 
     #[test]
