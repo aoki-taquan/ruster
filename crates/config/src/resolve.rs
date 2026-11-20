@@ -164,6 +164,7 @@ struct InterfaceEntry {
     etherip: Option<TunnelEntry>,
     vxlan: Option<VxlanEntry>,
     srv6_l2: Option<Srv6L2Entry>,
+    srv6_evpn: Option<Srv6EvpnEntry>,
     pppoe: Option<PppoeEntry>,
     bridge: Option<BridgeEntry>,
 }
@@ -204,6 +205,14 @@ struct VxlanEntry {
     remote: Vec<String>,
     port: Option<u16>,
     underlay_vrf: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct Srv6EvpnEntry {
+    vni: u32,
+    unicast_sid: String,
+    multicast_sid: String,
 }
 
 #[derive(Deserialize)]
@@ -265,11 +274,27 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
         if u8::from(entry.vxlan.is_some())
             + u8::from(etherip.is_some())
             + u8::from(entry.srv6_l2.is_some())
+            + u8::from(entry.srv6_evpn.is_some())
             > 1
         {
-            return Err(format!("{at}: give one of etherip, vxlan and srv6-l2"));
+            return Err(format!(
+                "{at}: give one of etherip, vxlan, srv6-l2 and srv6-evpn"
+            ));
         }
         let kind = match (entry.parent, entry.vlan, entry.tunnel, entry.pppoe) {
+            (None, None, None, None) if entry.bridge.is_none() && entry.srv6_evpn.is_some() => {
+                let evpn = entry.srv6_evpn.expect("checked");
+                Kind::Srv6Evpn {
+                    vni: evpn.vni,
+                    unicast_sid: evpn.unicast_sid,
+                    multicast_sid: evpn.multicast_sid,
+                }
+            }
+            _ if entry.srv6_evpn.is_some() => {
+                return Err(format!(
+                "{at}: an SRv6 EVPN interface is not also a VLAN, a tunnel, a PPPoE session or a bridge"
+            ))
+            }
             (None, None, None, None) if entry.bridge.is_none() && entry.srv6_l2.is_some() => {
                 let l2 = entry.srv6_l2.expect("checked");
                 Kind::Srv6L2 {
@@ -419,7 +444,8 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
                 Kind::Tunnel { .. }
                 | Kind::EtherIp { .. }
                 | Kind::Vxlan { .. }
-                | Kind::Srv6L2 { .. },
+                | Kind::Srv6L2 { .. }
+                | Kind::Srv6Evpn { .. },
                 _,
             ) => TUNNEL_MAC.to_owned(),
             (None, Kind::Bridge(_), Some(Ok((mac, _)))) if mac.is_empty() => {
@@ -448,6 +474,9 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
                 },
                 _,
             ) => MTU.saturating_sub(crate::srv6_l2_overhead(segments.len(), *reduced)),
+            (None, Kind::Srv6Evpn { .. }, _) => {
+                MTU.saturating_sub(crate::srv6_l2_overhead(1, true))
+            }
             (None, _, Some(parent)) => parent.clone()?.1,
             (None, ..) => MTU,
         };

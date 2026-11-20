@@ -72,6 +72,11 @@
 //!                              # the End.DX2 sid (in [srv6]'s locator) bring frames in;
 //!                              # reduced = true for H.Encaps.L2.Red
 //!
+//! [[interface]]                # EVPN over SRv6 (RFC 8986 End.DT2U and End.DT2M), only
+//! name = "se0"                 # as a bridge member; the remote SIDs come from the
+//! srv6-evpn = { vni = 100, unicast-sid = "fc00:1::e", multicast-sid = "fc00:1::f" }
+//!                              # routing daemon (ribd's EVPN tables, by vni)
+//!
 //! [[interface]]                # a VXLAN network (RFC 7348), only as a bridge member
 //! name = "vx100"
 //! vxlan = { vni = 100, local = "192.0.2.1", remote = ["198.51.100.2", "198.51.100.3"] }
@@ -614,7 +619,7 @@ pub const VERSION: u32 = 1;
 ///
 /// A new key also goes into `tests/data/every-key.lock` (the test reads it with every
 /// key required, and checks that every list in it has an item).
-pub const LOCK_SHAPE: u64 = 0x8978_665c_4045_3114;
+pub const LOCK_SHAPE: u64 = 0x4dd6_8fd8_60f8_b7f4;
 
 /// A bridge's ageing time, in seconds (IEEE 802.1Q 8.8.3, the recommended value).
 pub const BRIDGE_AGING_TIME: u32 = 300;
@@ -976,6 +981,18 @@ pub enum Kind {
         sid: String,
         segments: Vec<String>,
         reduced: bool,
+    },
+    /// EVPN over SRv6 (RFC 8986 End.DT2U and End.DT2M, RFC 9252) of the routing
+    /// daemon's VNI `vni`: packets to the router's SIDs `unicast-sid` and
+    /// `multicast-sid` bring frames in; frames leave from `[srv6]`'s source to the
+    /// remote SIDs the routing daemon gives. Only a bridge member.
+    #[serde(rename = "srv6-evpn")]
+    Srv6Evpn {
+        vni: u32,
+        #[serde(rename = "unicast-sid")]
+        unicast_sid: String,
+        #[serde(rename = "multicast-sid")]
+        multicast_sid: String,
     },
     /// A bridge, and its own interface (IRB) of the same name.
     Bridge(Bridge),

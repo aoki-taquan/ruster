@@ -330,6 +330,70 @@ fn an_srv6_l2_interface_becomes_the_fe_s_row() {
     assert!(error.contains("needs [srv6]"), "{error}");
 }
 
+const EVPN: &str = r#"
+[[interface]]
+name = "p2"
+mac = "02:00:00:00:01:03"
+
+[[interface]]
+name = "se0"
+srv6-evpn = { vni = 100, unicast-sid = "fc00:1::e", multicast-sid = "fc00:1::f" }
+
+[[interface]]
+name = "br0"
+bridge = { members = ["p2", "se0"] }
+"#;
+
+#[test]
+fn an_srv6_evpn_interface_becomes_the_fe_s_row() {
+    let config = parse(&format!("{INTERFACES}{EVPN}{GOOD}")).unwrap();
+    let mut confd = Confd::new(Config::default());
+    let [[_, fe], _] = confd.tables_now_and_with(&config);
+    assert_eq!(
+        fe.get(&Key::Srv6Evpn {
+            interface: "se0".into()
+        }),
+        Some(&Value::Srv6Evpn {
+            source: "2001:db8::1".parse().unwrap(),
+            vni: 100,
+            unicast: "fc00:1::e".parse().unwrap(),
+            multicast: "fc00:1::f".parse().unwrap(),
+        })
+    );
+    // 1500 less the inner Ethernet header and IPv6: one SID, no SRH.
+    let se0 = config.interfaces.iter().find(|i| i.name == "se0").unwrap();
+    assert_eq!(se0.mtu, 1500 - 14 - 40);
+    for (from, to, says) in [
+        ("vni = 100", "vni = 0", "vni must be"),
+        (
+            "unicast-sid = \"fc00:1::e\"",
+            "unicast-sid = \"fc00:9::e\"",
+            "not in the locator",
+        ),
+        (
+            "multicast-sid = \"fc00:1::f\"",
+            "multicast-sid = \"fc00:1::e\"",
+            "another SID",
+        ),
+        (
+            "unicast-sid = \"fc00:1::e\"",
+            "unicast-sid = \"fc00:1::4\"",
+            "another SID",
+        ),
+        (
+            "members = [\"p2\", \"se0\"]",
+            "members = [\"p2\"]",
+            "member of a bridge",
+        ),
+    ] {
+        let text = format!("{INTERFACES}{}{GOOD}", EVPN.replacen(from, to, 1));
+        let error = parse(&text).expect_err(says);
+        assert!(error.contains(says), "{says}: {error}");
+    }
+    let error = parse(&format!("{INTERFACES}{EVPN}")).expect_err("no [srv6]");
+    assert!(error.contains("needs [srv6]"), "{error}");
+}
+
 #[test]
 fn a_next_csid_sid_is_a_route_of_its_block_and_csid() {
     use ruster_proto::table::{Srv6Csid, Srv6Flavors};

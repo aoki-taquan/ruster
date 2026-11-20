@@ -40,9 +40,24 @@ pub struct Srv6 {
     pub l2: Vec<(String, Value)>,
 }
 
-/// One SRv6 L2 interface of the lock form: its name, End.DX2 SID, segments and
-/// whether reduced.
-pub(crate) type L2Entry = (String, String, Vec<String>, bool);
+/// One SRv6 L2 or SRv6 EVPN interface of the lock form, by name.
+pub(crate) type L2Entry = (String, L2Kind);
+
+#[derive(Clone, Debug)]
+pub(crate) enum L2Kind {
+    /// End.DX2: its SID, segments and whether reduced.
+    Dx2 {
+        sid: String,
+        segments: Vec<String>,
+        reduced: bool,
+    },
+    /// EVPN (End.DT2U and End.DT2M): the routing daemon's VNI and the two SIDs.
+    Evpn {
+        vni: u32,
+        unicast: String,
+        multicast: String,
+    },
+}
 
 fn unicast6(text: &str) -> Option<Ipv6Addr> {
     text.parse::<Ipv6Addr>()
@@ -72,7 +87,7 @@ pub(crate) fn check(
     let Some(srv6) = lock.into_iter().next() else {
         if let Some((name, ..)) = l2.first() {
             return Err(format!(
-                "interface {name:?}: an SRv6 L2 interface needs [srv6] (its locator and source)"
+                "interface {name:?}: an SRv6 L2 or EVPN interface needs [srv6] (its locator and source)"
             ));
         }
         return Ok(Srv6::default());
@@ -357,64 +372,105 @@ pub(crate) fn check(
             },
         ));
     }
-    for (name, sid, segments, reduced) in l2 {
+    for (name, kind) in l2 {
         let at = format!("interface {name:?}");
-        let sid = unicast6(&sid)
-            .ok_or_else(|| format!("{at}: srv6-l2 sid must be a unicast IPv6 address"))?;
-        if ruster_proto::table::network(IpAddr::V6(sid), locator_len) != IpAddr::V6(locator) {
-            return Err(format!(
-                "{at}: srv6-l2 sid is not in the locator {:?}",
-                srv6.locator
-            ));
-        }
-        let used = out.sids.iter().any(|(other, _)| *other == sid)
-            || out
-                .l2
-                .iter()
-                .any(|(_, v)| matches!(v, Value::Srv6L2 { sid: other, .. } if *other == sid));
-        if own.contains(&sid) || used {
-            return Err(format!(
-                "{at}: srv6-l2 sid is an address of an interface or another SID"
-            ));
-        }
-        let covered = out.sids.iter().any(|(other, local)| match local {
-            Srv6Local::End { flavors } | Srv6Local::EndX { flavors, .. }
-                if flavors.next_csid.is_some() =>
-            {
-                ruster_proto::table::network(IpAddr::V6(sid), sid_len(flavors))
-                    == IpAddr::V6(*other)
+        let texts: Vec<(&str, &String)> = match &kind {
+            L2Kind::Dx2 { sid, .. } => vec![("srv6-l2 sid", sid)],
+            L2Kind::Evpn {
+                unicast, multicast, ..
+            } => vec![
+                ("srv6-evpn unicast-sid", unicast),
+                ("srv6-evpn multicast-sid", multicast),
+            ],
+        };
+        let mut sids: Vec<Ipv6Addr> = Vec::new();
+        for (what, text) in texts {
+            let sid = unicast6(text)
+                .ok_or_else(|| format!("{at}: {what} must be a unicast IPv6 address"))?;
+            if ruster_proto::table::network(IpAddr::V6(sid), locator_len) != IpAddr::V6(locator) {
+                return Err(format!(
+                    "{at}: {what} is not in the locator {:?}",
+                    srv6.locator
+                ));
             }
-            _ => false,
-        });
-        if covered {
-            return Err(format!(
-                "{at}: srv6-l2 sid is inside a NEXT-CSID SID's prefix"
-            ));
+            let used = out.sids.iter().any(|(other, _)| *other == sid)
+                || sids.contains(&sid)
+                || out.l2.iter().any(|(_, v)| match v {
+                    Value::Srv6L2 { sid: other, .. } => *other == sid,
+                    Value::Srv6Evpn {
+                        unicast, multicast, ..
+                    } => *unicast == sid || *multicast == sid,
+                    _ => false,
+                });
+            if own.contains(&sid) || used {
+                return Err(format!(
+                    "{at}: {what} is an address of an interface or another SID"
+                ));
+            }
+            let covered = out.sids.iter().any(|(other, local)| match local {
+                Srv6Local::End { flavors } | Srv6Local::EndX { flavors, .. }
+                    if flavors.next_csid.is_some() =>
+                {
+                    ruster_proto::table::network(IpAddr::V6(sid), sid_len(flavors))
+                        == IpAddr::V6(*other)
+                }
+                _ => false,
+            });
+            if covered {
+                return Err(format!("{at}: {what} is inside a NEXT-CSID SID's prefix"));
+            }
+            if taken.contains(&(DEFAULT_VRF.to_owned(), IpAddr::V6(sid), 128)) {
+                return Err(format!("{at}: the default VRF has a route for its {what}"));
+            }
+            sids.push(sid);
         }
-        if taken.contains(&(DEFAULT_VRF.to_owned(), IpAddr::V6(sid), 128)) {
-            return Err(format!("{at}: the default VRF has a route for its sid"));
-        }
-        if segments.is_empty() || segments.len() > ruster_proto::table::SRV6_SEGMENTS_MAX {
-            return Err(format!(
-                "{at}: srv6-l2 takes 1 to {} segments",
-                ruster_proto::table::SRV6_SEGMENTS_MAX
-            ));
-        }
-        let segments = segments
-            .iter()
-            .map(|s| {
-                unicast6(s).ok_or_else(|| {
-                    format!("{at}: srv6-l2 segment {s:?} is not a unicast IPv6 address")
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let (value, overhead) = match kind {
+            L2Kind::Dx2 {
+                segments, reduced, ..
+            } => {
+                if segments.is_empty() || segments.len() > ruster_proto::table::SRV6_SEGMENTS_MAX {
+                    return Err(format!(
+                        "{at}: srv6-l2 takes 1 to {} segments",
+                        ruster_proto::table::SRV6_SEGMENTS_MAX
+                    ));
+                }
+                let segments = segments
+                    .iter()
+                    .map(|s| {
+                        unicast6(s).ok_or_else(|| {
+                            format!("{at}: srv6-l2 segment {s:?} is not a unicast IPv6 address")
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let overhead = ruster_config::srv6_l2_overhead(segments.len(), reduced);
+                let value = Value::Srv6L2 {
+                    source,
+                    sid: sids[0],
+                    segments,
+                    reduced,
+                };
+                (value, overhead)
+            }
+            L2Kind::Evpn { vni, .. } => {
+                if !(1..=ruster_proto::table::VXLAN_VNI_MAX).contains(&vni) {
+                    return Err(format!("{at}: srv6-evpn vni must be 1 to 16777215"));
+                }
+                let value = Value::Srv6Evpn {
+                    source,
+                    vni,
+                    unicast: sids[0],
+                    multicast: sids[1],
+                };
+                // One SID: no Segment Routing Header.
+                (value, ruster_config::srv6_l2_overhead(1, true))
+            }
+        };
         if !crate::bridge::is_member(bridges, &name) {
             return Err(format!(
-                "{at}: an SRv6 L2 interface must be a member of a bridge"
+                "{at}: an SRv6 L2 or EVPN interface must be a member of a bridge"
             ));
         }
-        let most =
-            link_mtu.saturating_sub(ruster_config::srv6_l2_overhead(segments.len(), reduced));
+        let most = link_mtu.saturating_sub(overhead);
         let mtu = interfaces
             .iter()
             .find(|i| i.name == name)
@@ -424,15 +480,7 @@ pub(crate) fn check(
                 "{at}: mtu must be at most {most} ({link_mtu}, the largest MTU of the links, less the outer headers)"
             ));
         }
-        out.l2.push((
-            name,
-            Value::Srv6L2 {
-                source,
-                sid,
-                segments,
-                reduced,
-            },
-        ));
+        out.l2.push((name, value));
     }
     Ok(out)
 }
@@ -440,12 +488,12 @@ pub(crate) fn check(
 /// The FE's table rows of the SRv6 L2 interfaces.
 pub(crate) fn tables(srv6: &Srv6, out: &mut BTreeMap<Key, Value>) {
     for (name, value) in &srv6.l2 {
-        out.insert(
-            Key::Srv6L2 {
-                interface: name.clone(),
-            },
-            value.clone(),
-        );
+        let interface = name.clone();
+        let key = match value {
+            Value::Srv6Evpn { .. } => Key::Srv6Evpn { interface },
+            _ => Key::Srv6L2 { interface },
+        };
+        out.insert(key, value.clone());
     }
 }
 
