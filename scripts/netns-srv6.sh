@@ -266,4 +266,16 @@ sleep 1
 pings "$b" 192.168.1.10 || true
 wait "$dump" || fail "no Parameter Problem (code 0, pointer 43) for a packet to End.DT4 with segments left"
 echo "ok: Parameter Problem for End.DT4 with segments left"
+
+# RFC 8986 section 6: each SID's counters, in the FE's state tables. End.DT4
+# fc00:1::4 took the replies above.
+counted=""
+for _ in $(seq 1 5); do
+  counted=$(nsx "$router" "$bin/ruster" --run-dir "$run_dir" show 2>/dev/null |
+    grep "^srv6-sid fc00:1::4/128 packets [1-9]" || true)
+  [[ -n "$counted" ]] && break
+  sleep 1
+done
+[[ -n "$counted" ]] || fail "ruster show has no counts for the SID fc00:1::4"
+echo "ok: SID counters in ruster show: $counted"
 echo "PASS ($backend)"

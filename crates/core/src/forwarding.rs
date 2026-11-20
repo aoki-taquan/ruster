@@ -3002,6 +3002,13 @@ pub enum TraceEvent {
     Nat44TcpUnsolicitedSyn {
         disposition: Nat44TcpUnsolicitedSynDisposition,
     },
+    /// A packet (of `bytes` bytes from its IPv6 header) was handled by the router's
+    /// SRv6 SID at `index` of its [`crate::Srv6Table`] ([`crate::Srv6Table::sids`]):
+    /// RFC 8986 section 6's counters. Each SID a packet goes through counts it.
+    Srv6Sid {
+        index: u16,
+        bytes: u32,
+    },
     Dropped {
         ingress: IfId,
         reason: DropReason,
@@ -3847,7 +3854,7 @@ where
         }
         // A packet to one of the router's SRv6 SIDs: on to its next segment, or
         // unwrapped into the SID's VRF.
-        let (vrf, via) = match crate::srv6::receive(&mut packet, all_vrfs) {
+        let (vrf, via) = match crate::srv6::receive(&mut packet, all_vrfs, trace) {
             Ok(crate::srv6::Received::NotSid) => (None, None),
             Ok(crate::srv6::Received::Forward { via }) => (None, via),
             Ok(crate::srv6::Received::Unwrapped { vrf, via }) => (Some(vrf), via),

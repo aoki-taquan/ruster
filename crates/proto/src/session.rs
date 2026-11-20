@@ -371,6 +371,29 @@ impl Server {
         self.hold = true;
     }
 
+    /// Replaces the entries of `table` with `entries`: state the owner keeps itself
+    /// (counters), not a writer's tables. No hook is asked and no writer told; a
+    /// GET of the tables shows them.
+    pub fn set_state(&mut self, table: u64, entries: Vec<(Key, Value)>) {
+        self.store.tables.remove(&table);
+        let slots: BTreeMap<Key, Slot> = entries
+            .into_iter()
+            .filter(|(key, _)| key.table() == table)
+            .map(|(key, value)| {
+                (
+                    key,
+                    Slot {
+                        value,
+                        stale: false,
+                    },
+                )
+            })
+            .collect();
+        if !slots.is_empty() {
+            self.store.tables.insert(table, slots);
+        }
+    }
+
     /// Queues the answers kept back, for the connections that are still there.
     pub fn release_changed(&mut self) {
         for (id, token) in std::mem::take(&mut self.held) {

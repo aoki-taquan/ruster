@@ -679,6 +679,24 @@
       },
       {
         "namespace": "data",
+        "identifier": "/ruster-fib:fib/srv6-sid-counters",
+        "sid": 60310,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-fib:fib/srv6-sid-counters/packets",
+        "sid": 60311,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-fib:fib/srv6-sid-counters/bytes",
+        "sid": 60312,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
         "identifier": "/ruster-fib:fib/vrf/route/srv6-local/behavior",
         "sid": 60290,
         "status": "unstable"

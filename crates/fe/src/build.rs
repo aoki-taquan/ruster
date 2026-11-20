@@ -262,7 +262,9 @@ impl Routes {
                 | Key::SourceIpv6 { .. }
                 | Key::SourceDns { .. }
                 | Key::BridgePort { .. }
-                | Key::BridgeMac { .. } => {
+                | Key::BridgeMac { .. }
+                // State the FE keeps itself: no table change.
+                | Key::Srv6SidCounters { .. } => {
                     afters.push(None);
                     continue;
                 }

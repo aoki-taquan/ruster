@@ -125,7 +125,7 @@ ruster apply --confirm-within 10 router.toml  # 同じ。10分以内にconfirm�
 ruster confirm                               # 待っている版をそのまま使う
 ruster versions                              # confdが残した版の一覧（新しい順）
 ruster rollback 3                            # 版3の設定を、新しい版として使い直す
-ruster show                                  # FEが持っている表を全部表示する
+ruster show                                  # FEが持っている表とSRv6のSIDごとの数を表示する
 ruster route add --source routed 203.0.113.0/24 dev wan via 198.51.100.1
 ruster route del --source routed 203.0.113.0/24
 ```

@@ -173,8 +173,7 @@ charterの「作るもの」は上の表のとおりそろい、2026-11-10 にow
 
 #### SRv6とVXLAN
 
-残りは、SIDごとの数を見せること（RFC 8986の6.）。見せ方（FEの状態のsocketで値として返すか、ログに出すか）は
-ownerが決める。FPMでFRRからSRv6の経路を受けることとEVPNは作らない。SRv6とVXLANのbacklogの残りは、ほかの
+全部できた。FPMでFRRからSRv6の経路を受けることとEVPNは作らない。SRv6とVXLANのbacklogの残りは、ほかの
 backlogと同じく、使う場面が出たものから片付ける。
 
 #### 経路や通信の数が増えたとき

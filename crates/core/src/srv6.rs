@@ -57,6 +57,10 @@
 //!   or handled again when the new destination is the router's; End.X: to its next
 //!   hop) without reading the Segment Routing Header. With no argument the
 //!   behaviour reads the Segment Routing Header as without the flavor.
+//! - RFC 8986 section 6 (counters): every packet a local SID handles is recorded
+//!   (its index in the [`Srv6Table`] and its length from the IPv6 header) as
+//!   [`crate::TraceEvent::Srv6Sid`], once for each SID it goes through; the trace
+//!   sink keeps the counts. An SRv6 L2 interface's SID (End.DX2) is not counted.
 //! - RFC 8986 section 4.1.1 and RFC 8754 section 4.3.1.2: any other upper-layer
 //!   header, or No Next Header, gets Parameter Problem code 4 (SR Upper-layer
 //!   Header Error) pointing at it. No upper-layer header is allowed by
@@ -326,10 +330,18 @@ impl Srv6Table {
             .map(|at| &self.policies[at])
     }
 
-    fn sid(&self, destination: [u8; 16]) -> Option<&Srv6Sid> {
+    /// The SID `destination` is to, and its index in [`Self::sids`].
+    fn sid(&self, destination: [u8; 16]) -> Option<(usize, &Srv6Sid)> {
         self.sids
             .iter()
-            .find(|sid| masked(destination, sid.len) == sid.prefix)
+            .enumerate()
+            .find(|(_, sid)| masked(destination, sid.len) == sid.prefix)
+    }
+
+    /// The local SIDs (prefix and length), in the order of the indexes of
+    /// [`crate::TraceEvent::Srv6Sid`].
+    pub fn sids(&self) -> impl Iterator<Item = ([u8; 16], u8)> + '_ {
+        self.sids.iter().map(|sid| (sid.prefix, sid.len))
     }
 }
 
@@ -381,9 +393,10 @@ enum Chain {
 
 /// Handles `packet` when it is to one of the router's SIDs: see the module
 /// documentation. Only `snapshot`'s (the default VRF's) packets are looked at.
-pub(crate) fn receive<S: PacketSlot>(
+pub(crate) fn receive<S: PacketSlot, T: TraceSink>(
     packet: &mut PacketLease<S>,
     snapshot: &crate::ForwardingSnapshot<'_>,
+    trace: &mut T,
 ) -> Result<Received, Rejected> {
     let table = snapshot.srv6;
     let members = snapshot
@@ -393,7 +406,8 @@ pub(crate) fn receive<S: PacketSlot>(
     if table.is_none_or(|t| t.sids.is_empty()) && !members {
         return Ok(Received::NotSid);
     }
-    let lookup = |destination: [u8; 16]| -> Option<Srv6Sid> {
+    // With the SID's index in the table, for its counters (none for an L2 one).
+    let lookup = |destination: [u8; 16]| -> Option<(Option<u16>, Srv6Sid)> {
         // An SRv6 L2 interface's SID (a /128) first: a NEXT-CSID SID's prefix may
         // cover it.
         let member = snapshot.overlays.iter().find_map(|o| match o.kind {
@@ -406,7 +420,12 @@ pub(crate) fn receive<S: PacketSlot>(
             }),
             _ => None,
         });
-        member.or_else(|| table.and_then(|t| t.sid(destination)).copied())
+        match member {
+            Some(sid) => Some((None, sid)),
+            None => table
+                .and_then(|t| t.sid(destination))
+                .map(|(at, sid)| (u16::try_from(at).ok(), *sid)),
+        }
     };
     let ingress = packet.ingress();
     if snapshot.vrf_of(ingress) != 0 || snapshot.is_kernel_ingress(ingress) {
@@ -420,7 +439,7 @@ pub(crate) fn receive<S: PacketSlot>(
     if bytes[ip] >> 4 != 6 {
         return Ok(Received::NotSid);
     }
-    let Some(mut sid) = lookup(address(bytes, ip + 24)) else {
+    let Some((mut index, mut sid)) = lookup(address(bytes, ip + 24)) else {
         return Ok(Received::NotSid);
     };
     // Only a frame sent to the receiving interface itself.
@@ -437,6 +456,13 @@ pub(crate) fn receive<S: PacketSlot>(
     }
     let mut end = end;
     for segment in 0..MAX_LOCAL_SEGMENTS {
+        // RFC 8986 section 6: the packet counts for every SID it goes through.
+        if let Some(index) = index {
+            trace.record(TraceEvent::Srv6Sid {
+                index,
+                bytes: u32::try_from(end - ETHERNET).unwrap_or(u32::MAX),
+            });
+        }
         let bytes = &mut packet.bytes_mut()[..end];
         // NEXT-CSID (RFC 9800 4.1): the next compressed SID in the destination
         // comes first; the Segment Routing Header only when none is left.
@@ -469,7 +495,7 @@ pub(crate) fn receive<S: PacketSlot>(
                 }
                 match lookup(next) {
                     Some(following) => {
-                        sid = following;
+                        (index, sid) = following;
                         continue;
                     }
                     None => return Ok(Received::Forward { via: None }),
@@ -512,7 +538,7 @@ pub(crate) fn receive<S: PacketSlot>(
                     });
                 }
                 match lookup(address(packet.bytes_mut(), ip + 24)) {
-                    Some(next) => sid = next,
+                    Some(next) => (index, sid) = next,
                     None => return Ok(Received::Forward { via: None }),
                 }
             }
