@@ -383,10 +383,16 @@ TAPのデバイスを一つ置く。
   （netns `ospf`で、相手側のvethを落として1秒ほどで隣接が消えるのを確かめた）。
 - OSPFのbroadcastのリンクは、DRを選ぶまでRouterDeadInterval（40秒）待つ。netnsの`ospf`はそのため1分ほどかかる。
 
-## 7. BGP EVPN（見送り）
+## 7. BGP EVPN
 
-BGP EVPNは見送る（2026-11-10 owner決定。ルーティングデーモンの見直しと一緒に考え直す）。FRRのFPMは、type-3の
-VTEP、相手の近隣、L2のMACの送り直しを運ばないので、kernelを経路の入口に使う例外が要るため。
+BGPは経路の送り手のルーティングデーモン（bird-rsなど）が話し、rusterはL2の転送を受け持つ。FRRのFPMは
+type-3のVTEP、相手の近隣、L2のMACの送り直しを運ばないので、FRRとはつながない。
+
+- 遠くのMAC（type-2）とVNIごとのフラッディングの相手（type-3）: 送り手がribdへ渡し、ribdが選んでFEへ書く。
+- FEが学んだMAC: FEの状態の表として見せ、送り手がobserveで受けてtype-2として広告する。
+- ARPとNDの代理応答、SRv6で運ぶとき（End.DT2U、End.DT2M）。
+
+表の形と細かい決まりは、それぞれを作るときにこの節へ書く。
 
 ## 8. 作る順番
 
