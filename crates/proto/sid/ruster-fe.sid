@@ -697,6 +697,36 @@
       },
       {
         "namespace": "data",
+        "identifier": "/ruster-if-srv6-evpn:srv6-evpn",
+        "sid": 60305,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-if-srv6-evpn:srv6-evpn/source-address",
+        "sid": 60306,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-if-srv6-evpn:srv6-evpn/vni",
+        "sid": 60307,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-if-srv6-evpn:srv6-evpn/unicast-sid",
+        "sid": 60308,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-if-srv6-evpn:srv6-evpn/multicast-sid",
+        "sid": 60309,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
         "identifier": "/ruster-fib:fib/srv6-sid-counters",
         "sid": 60310,
         "status": "unstable"

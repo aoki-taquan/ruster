@@ -32,6 +32,15 @@
 //!   10.1). Section 4.9 (End.DX2): a packet to the interface's SID whose upper-layer
 //!   header is 143, with no Segment Routing Header or one with no segment left,
 //!   loses its outer headers and its frame is received on the interface.
+//! - RFC 8986 sections 4.11 and 4.12 (End.DT2U, End.DT2M) and RFC 9252 section 6 (EVPN
+//!   over SRv6): a packet to an SRv6 EVPN interface's End.DT2U or End.DT2M SID, taken
+//!   as for End.DX2, gives its frame to the interface's bridge, which forwards it to
+//!   the member its destination is on or floods it (S04 to S09; End.DT2M floods, as
+//!   a group destination is). Frames leave wrapped (H.Encaps.L2, one SID, no Segment
+//!   Routing Header) to the remote End.DT2U SID their destination is behind, and,
+//!   flooded, to each remote End.DT2M SID (ingress replication). Where hosts are is
+//!   learned from the control side only (section 4.11's note on S03 for EVPN): the
+//!   bridge does not learn from these frames.
 //! - RFC 791 and RFC 8200: the outer header, TTL or Hop Limit 64; an IPv4 outer
 //!   header has DF set (RFC 7348 section 4.3) and identification 0 (RFC 6864
 //!   section 4.1: an atomic datagram). An IPv4 outer header with a bad checksum is
@@ -39,6 +48,8 @@
 //!
 //! Deviations:
 //!
+//! - End.DT2M has no ESI filtering (Arg.FE2 of section 4.12): there are no Ethernet
+//!   segments shared with other routers.
 //! - The outer packet is never fragmented, and outer fragments are dropped, not put
 //!   back together (RFC 3378 does not forbid fragmenting): a frame longer than the
 //!   underlying interface's MTU less the outer headers is dropped and counted
@@ -132,6 +143,19 @@ pub enum OverlayKind {
         segments: Vec<IpAddr>,
         reduced: bool,
     },
+    /// EVPN over SRv6 (RFC 8986 sections 4.11 and 4.12, RFC 9252 section 6) of the
+    /// routing daemon's VNI `vni`: packets to the router's End.DT2U SID `unicast` or
+    /// End.DT2M SID `multicast` bring frames in, for the member's bridge to forward
+    /// or flood. Frames leave wrapped (H.Encaps.L2 with the one SID, so no Segment
+    /// Routing Header) to the remote End.DT2U SID a destination is behind (the
+    /// bridge's entries' VTEP), or, flooded, to each of `remotes`: the remote
+    /// End.DT2M SIDs (ingress replication). `local` is the outer source.
+    Srv6Evpn {
+        vni: u32,
+        unicast: [u8; 16],
+        multicast: [u8; 16],
+        remotes: Vec<IpAddr>,
+    },
 }
 
 impl OverlayKind {
@@ -143,6 +167,7 @@ impl OverlayKind {
             (Self::Vxlan { vni: a, .. }, Self::Vxlan { vni: b, .. }) => a == b,
             (Self::EtherIp { .. }, Self::EtherIp { .. })
             | (Self::Srv6L2 { .. }, Self::Srv6L2 { .. }) => true,
+            (Self::Srv6Evpn { vni: a, .. }, Self::Srv6Evpn { vni: b, .. }) => a == b,
             _ => false,
         }
     }
@@ -157,6 +182,7 @@ impl Overlay {
             OverlayKind::Vxlan { remotes, .. } => remotes,
             // The first segment: every frame goes there.
             OverlayKind::Srv6L2 { segments, .. } => &segments[..segments.len().min(1)],
+            OverlayKind::Srv6Evpn { remotes, .. } => remotes,
         }
     }
 
@@ -165,6 +191,17 @@ impl Overlay {
     #[must_use]
     pub fn is_vxlan(&self) -> bool {
         matches!(self.kind, OverlayKind::Vxlan { .. })
+    }
+
+    /// Whether it has many remote ends, each a destination is behind (VXLAN, SRv6
+    /// EVPN): a flooded frame goes to each, but not to those of the member it came
+    /// from, and a frame to a known destination goes to the one it is behind.
+    #[must_use]
+    pub fn is_multipoint(&self) -> bool {
+        matches!(
+            self.kind,
+            OverlayKind::Vxlan { .. } | OverlayKind::Srv6Evpn { .. }
+        )
     }
 }
 
@@ -399,10 +436,15 @@ fn receive_srv6<S: PacketSlot>(
     let IpAddr::V6(destination) = outer.destination else {
         return Ok(None);
     };
-    let Some(overlay) = overlays
-        .iter()
-        .find(|o| matches!(o.kind, OverlayKind::Srv6L2 { sid, .. } if sid == destination.octets()))
-    else {
+    let Some(overlay) = overlays.iter().find(|o| match o.kind {
+        OverlayKind::Srv6L2 { sid, .. } => sid == destination.octets(),
+        // End.DT2U and End.DT2M: the bridge looks up and floods (RFC 8986
+        // section 4.11 S04 to S09, 4.12 S04).
+        OverlayKind::Srv6Evpn {
+            unicast, multicast, ..
+        } => [unicast, multicast].contains(&destination.octets()),
+        _ => false,
+    }) else {
         return Ok(None);
     };
     let ingress = packet.ingress();
@@ -498,7 +540,9 @@ pub(crate) fn header<T: TraceSink>(
     if inner.len() < ETHERNET {
         return Err(DropReason::EthernetHeaderTruncated);
     }
-    if !overlay.remotes().contains(&remote) {
+    // An SRv6 EVPN destination's End.DT2U SID is not one of the flooding ones.
+    if !overlay.remotes().contains(&remote) && !matches!(overlay.kind, OverlayKind::Srv6Evpn { .. })
+    {
         return Err(DropReason::OverlayUnknownPeer);
     }
     let vni = match overlay.kind {
@@ -510,7 +554,7 @@ pub(crate) fn header<T: TraceSink>(
             Some((vni, port))
         }
         OverlayKind::EtherIp { .. } => None,
-        OverlayKind::Srv6L2 { .. } => None,
+        OverlayKind::Srv6L2 { .. } | OverlayKind::Srv6Evpn { .. } => None,
     };
     // Routed in the overlay's VRF.
     let (egress, mac) = route(underlay, remote, trace)?;
@@ -537,6 +581,15 @@ pub(crate) fn header<T: TraceSink>(
         };
         srv6_header(b, local, segments, *reduced, inner, interface.mtu)?;
         out.len = ETHERNET + IPV6_HEADER + srh_len(segments.len(), *reduced);
+        return Ok(out);
+    }
+    if let OverlayKind::Srv6Evpn { .. } = &overlay.kind {
+        let (IpAddr::V6(local), IpAddr::V6(_)) = (overlay.local, remote) else {
+            return Err(DropReason::OverlayInvalid);
+        };
+        let segments = std::slice::from_ref(&remote);
+        srv6_header(b, local, segments, true, inner, interface.mtu)?;
+        out.len = ETHERNET + IPV6_HEADER + srh_len(1, true);
         return Ok(out);
     }
     let encapsulation = if vni.is_some() {
@@ -761,6 +814,10 @@ pub(crate) fn transmit_member<S: PacketSlot, T: TraceSink>(
                 // A VXLAN destination known with no VTEP: nowhere to send it.
                 (OverlayKind::Vxlan { .. }, None) => return Err(DropReason::OverlayNoRoute),
                 (OverlayKind::Srv6L2 { segments, .. }, _) => segments[0],
+                (OverlayKind::Srv6Evpn { .. }, Some(sid)) => sid,
+                // Not known behind one SID: it is flooded instead (the members
+                // learn nothing, so this is not reached).
+                (OverlayKind::Srv6Evpn { .. }, None) => return Err(DropReason::OverlayNoRoute),
             };
             let underlay = snapshot
                 .vrf_snapshot(overlay.vrf)

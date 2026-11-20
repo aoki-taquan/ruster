@@ -425,7 +425,14 @@ type-3のVTEP、相手の近隣、L2のMACの送り直しを運ばないので�
   Target Link-Layer AddressはホストのMAC）。答えるNSは、拡張ヘッダが無く、hop limitが255で、送り元が
   ユニキャストで、オプションがSource Link-Layer Addressだけのもの。DADのNS（送り元が::）と、ほかのオプションの
   あるものはフラッディングする（ホストが自分で答える）。数はARPと合わせて`bridge_proxied`。
-- SRv6で運ぶとき（End.DT2U、End.DT2M）。
+- SRv6で運ぶとき（RFC 8986のEnd.DT2UとEnd.DT2M、RFC 9252の6.）: FEの表`ruster-if-srv6-evpn`（キーはインター
+  フェース、値は外側の送り元、VNI、自分のEnd.DT2UのSIDとEnd.DT2MのSID）のインターフェースは、ブリッジのメンバー
+  になる。送り先は設定に書かず、EVPNの表から取る。`flood`のVTEPに遠くのEnd.DT2MのSIDを、`mac`のVTEPに遠くの
+  End.DT2UのSIDを入れる（同じVNIのVXLANと同じ表）。フラッディングは`flood`のSIDへ一つずつ、知っている宛先は
+  そのEnd.DT2UのSIDへ、H.Encaps.L2（SIDが一つなのでSRH無し）で送る。自分のEnd.DT2UかEnd.DT2MのSID宛てで、
+  上の層がEthernet（143）のパケットは、End.DX2と同じく外して、そのブリッジが転送かフラッディングをする。
+  このメンバーで受けたフレームからは学ばない（どこにホストがいるかは送り手が決める。RFC 8986の4.11の注）。
+  End.DT2MのESIでのフィルタ（Arg.FE2）は無い。ARPとNDの代理応答は同じ表`neighbor`で、VXLANと同じに働く。
 
 `ruster evpn add|del --source NAME`で、ルーティングデーモンの代わりにこの3つの表を書ける。netns `evpn`は、
 VTEPを書かないVXLANとLinuxのvxlanの間で、これで`flood`、`mac`、`neighbor`を書き、届くこと、ARPとNDの代理応答を

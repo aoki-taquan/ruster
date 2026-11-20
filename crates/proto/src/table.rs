@@ -145,6 +145,11 @@ pub enum Key {
     Srv6L2 {
         interface: String,
     },
+    /// An interface that carries EVPN over SRv6 (`ruster-if-srv6-evpn`): a bridge
+    /// member whose remote ends come from the EVPN tables.
+    Srv6Evpn {
+        interface: String,
+    },
     /// The counters of the router's SRv6 SID `prefix/len` (RFC 8986 section 6).
     /// State the FE keeps, not configuration: no writer writes it.
     Srv6SidCounters {
@@ -306,6 +311,16 @@ pub enum Value {
     EvpnNeighbor {
         mac: [u8; 6],
         router: bool,
+    },
+    /// EVPN over SRv6 in the routing daemon's VNI `vni`: packets to the router's
+    /// End.DT2U SID `unicast` and End.DT2M SID `multicast` bring frames in; frames
+    /// leave from `source` to the remote SIDs of the EVPN tables. Routed in the
+    /// default VRF.
+    Srv6Evpn {
+        source: std::net::Ipv6Addr,
+        vni: u32,
+        unicast: std::net::Ipv6Addr,
+        multicast: std::net::Ipv6Addr,
     },
     /// Frames leave wrapped from `source` toward `segments` (the first first;
     /// H.Encaps.L2, or H.Encaps.L2.Red with `reduced`), and packets to the
@@ -824,6 +839,7 @@ impl Key {
             Self::EtherIp { .. } => sid::ETHERIP,
             Self::Vxlan { .. } => sid::VXLAN,
             Self::Srv6L2 { .. } => sid::SRV6_L2,
+            Self::Srv6Evpn { .. } => sid::SRV6_EVPN,
             Self::Srv6SidCounters { .. } => sid::SRV6_SID_COUNTERS,
             Self::EvpnMac { .. } => sid::EVPN_MAC,
             Self::EvpnFlood { .. } => sid::EVPN_FLOOD,
@@ -909,7 +925,8 @@ impl Change {
             Key::BridgePort { interface }
             | Key::EtherIp { interface }
             | Key::Vxlan { interface }
-            | Key::Srv6L2 { interface } => name(interface)?,
+            | Key::Srv6L2 { interface }
+            | Key::Srv6Evpn { interface } => name(interface)?,
             Key::Srv6SidCounters { prefix, len } => {
                 if *len > 128 || network(IpAddr::V6(*prefix), *len) != IpAddr::V6(*prefix) {
                     return Err(ModelError::Invalid("SID prefix"));
@@ -974,6 +991,7 @@ impl Change {
                         | (Key::EtherIp { .. }, Value::EtherIp { .. })
                         | (Key::Vxlan { .. }, Value::Vxlan { .. })
                         | (Key::Srv6L2 { .. }, Value::Srv6L2 { .. })
+                        | (Key::Srv6Evpn { .. }, Value::Srv6Evpn { .. })
                         | (Key::Srv6SidCounters { .. }, Value::Srv6SidCounters { .. })
                         | (Key::EvpnMac { .. }, Value::EvpnMac { .. })
                         | (Key::EvpnFlood { .. }, Value::EvpnFlood)
@@ -1176,6 +1194,24 @@ impl Change {
                             || local == remote
                         {
                             return Err(ModelError::Invalid("EtherIP local and remote"));
+                        }
+                    }
+                    Value::Srv6Evpn {
+                        source,
+                        vni,
+                        unicast,
+                        multicast,
+                    } => {
+                        let unicast_address = |a: &std::net::Ipv6Addr| {
+                            !(a.is_unspecified() || a.is_loopback() || a.is_multicast())
+                        };
+                        if !(1..=VXLAN_VNI_MAX).contains(vni)
+                            || ![source, unicast, multicast]
+                                .into_iter()
+                                .all(unicast_address)
+                            || unicast == multicast
+                        {
+                            return Err(ModelError::Invalid("SRv6 EVPN VNI and addresses"));
                         }
                     }
                     Value::Srv6L2 {
@@ -1437,6 +1473,9 @@ pub fn encode_key(key: &Key, e: &mut Encoder<'_>) {
         Key::Srv6L2 { interface } => {
             e.array(2).u64(sid::SRV6_L2).text(interface);
         }
+        Key::Srv6Evpn { interface } => {
+            e.array(2).u64(sid::SRV6_EVPN).text(interface);
+        }
         Key::Srv6SidCounters { prefix, len } => {
             e.array(2)
                 .u64(sid::SRV6_SID_COUNTERS)
@@ -1503,6 +1542,7 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
         | sid::ETHERIP
         | sid::VXLAN
         | sid::SRV6_L2
+        | sid::SRV6_EVPN
         | sid::SRV6_SID_COUNTERS => 2,
         sid::ADDRESS
         | sid::ROUTE
@@ -1538,6 +1578,7 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
         sid::ETHERIP => Key::EtherIp { interface: first },
         sid::VXLAN => Key::Vxlan { interface: first },
         sid::SRV6_L2 => Key::Srv6L2 { interface: first },
+        sid::SRV6_EVPN => Key::Srv6Evpn { interface: first },
         sid::SRV6_SID_COUNTERS => {
             let (prefix, len) = first
                 .split_once('/')
@@ -1921,6 +1962,23 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
                 e.u64(sid::VXLAN_VRF - sid::VXLAN).text(underlay_vrf);
             }
         }
+        Value::Srv6Evpn {
+            source,
+            vni,
+            unicast,
+            multicast,
+        } => {
+            let d = |member: u64| member - sid::SRV6_EVPN;
+            e.map(4)
+                .u64(d(sid::SRV6_EVPN_SOURCE))
+                .text(&source.to_string())
+                .u64(d(sid::SRV6_EVPN_VNI))
+                .u64(u64::from(*vni))
+                .u64(d(sid::SRV6_EVPN_UNICAST))
+                .text(&unicast.to_string())
+                .u64(d(sid::SRV6_EVPN_MULTICAST))
+                .text(&multicast.to_string());
+        }
         Value::Srv6L2 {
             source,
             sid: address,
@@ -2026,6 +2084,7 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
             | sid::ETHERIP
             | sid::VXLAN
             | sid::SRV6_L2
+            | sid::SRV6_EVPN
             | sid::SRV6_SID_COUNTERS
             | sid::BRIDGE_LEARNED
             | sid::EVPN_MAC
@@ -2681,6 +2740,17 @@ pub fn entry_line(key: &Key, value: &Value) -> Option<String> {
             )
         }
         (
+            Key::Srv6Evpn { interface },
+            Value::Srv6Evpn {
+                source,
+                vni,
+                unicast,
+                multicast,
+            },
+        ) => {
+            format!("srv6-evpn {interface} vni {vni} dt2u {unicast} dt2m {multicast} from {source}")
+        }
+        (
             Key::Srv6L2 { interface },
             Value::Srv6L2 {
                 source,
@@ -2883,6 +2953,24 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
         Value::Srv6SidCounters {
             packets: count(sid::SRV6_SID_PACKETS, "packets")?,
             bytes: count(sid::SRV6_SID_BYTES, "bytes")?,
+        }
+    } else if table == sid::SRV6_EVPN {
+        let mut address = |member: u64, what: &'static str| {
+            parse_ipv6(&text(member, what)?.ok_or(ModelError::Missing(what))?)
+        };
+        let source = address(sid::SRV6_EVPN_SOURCE, "source-address")?;
+        let unicast = address(sid::SRV6_EVPN_UNICAST, "unicast-sid")?;
+        let multicast = address(sid::SRV6_EVPN_MULTICAST, "multicast-sid")?;
+        let vni = match got.remove(&sid::SRV6_EVPN_VNI) {
+            Some(Member::Uint(n)) => u32::try_from(n).map_err(|_| ModelError::Invalid("VNI"))?,
+            Some(_) => return Err(ModelError::Invalid("VNI")),
+            None => return Err(ModelError::Missing("vni")),
+        };
+        Value::Srv6Evpn {
+            source,
+            vni,
+            unicast,
+            multicast,
         }
     } else if table == sid::SRV6_L2 {
         let mut address = |member: u64, what: &'static str| {

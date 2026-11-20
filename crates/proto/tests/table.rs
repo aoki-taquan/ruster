@@ -1954,3 +1954,34 @@ fn evpn_neighbors_round_trip_and_are_checked() {
         assert!(bad.validate().is_err(), "{bad:?}");
     }
 }
+
+#[test]
+fn srv6_evpn_interfaces_round_trip_and_are_checked() {
+    let entry = |vni: u32, unicast: &str, multicast: &str| {
+        Change::set(
+            Key::Srv6Evpn {
+                interface: "se0".into(),
+            },
+            Value::Srv6Evpn {
+                source: "2001:db8::2".parse().unwrap(),
+                vni,
+                unicast: unicast.parse().unwrap(),
+                multicast: multicast.parse().unwrap(),
+            },
+        )
+    };
+    let good = entry(100, "fc00:1::e", "fc00:1::f");
+    assert!(good.validate().is_ok());
+    assert_eq!(round_trip(&good), good);
+    assert_eq!(
+        entry_line(&good.key, good.value.as_ref().unwrap()).unwrap(),
+        "srv6-evpn se0 vni 100 dt2u fc00:1::e dt2m fc00:1::f from 2001:db8::2"
+    );
+    for bad in [
+        entry(0, "fc00:1::e", "fc00:1::f"),
+        entry(100, "fc00:1::e", "fc00:1::e"),
+        entry(100, "ff02::1", "fc00:1::f"),
+    ] {
+        assert!(bad.validate().is_err(), "{bad:?}");
+    }
+}

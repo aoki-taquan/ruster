@@ -590,6 +590,21 @@ impl MacTable {
         irb: Option<[u8; 6]>,
         now_ms: u64,
     ) -> BridgeDecision {
+        self.receive_learning(bridge, member, vtep, frame, irb, now_ms, true)
+    }
+
+    /// [`MacTable::receive`], learning the source only when `learn`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn receive_learning(
+        &mut self,
+        bridge: u16,
+        member: IfId,
+        vtep: Option<IpAddr>,
+        frame: &[u8],
+        irb: Option<[u8; 6]>,
+        now_ms: u64,
+        learn: bool,
+    ) -> BridgeDecision {
         let (Some(destination), Some(source)) = (frame.get(0..6), frame.get(6..12)) else {
             return BridgeDecision::Drop;
         };
@@ -602,7 +617,9 @@ impl MacTable {
             self.bridges[usize::from(bridge)].counters.dropped += 1;
             return BridgeDecision::Drop;
         }
-        self.learn(bridge, source, member, vtep, now_ms);
+        if learn {
+            self.learn(bridge, source, member, vtep, now_ms);
+        }
         if Some(destination) == irb {
             return BridgeDecision::Irb;
         }
@@ -701,6 +718,10 @@ pub struct BridgeConfig {
     pub members: Vec<IfId>,
     /// What the bridge answers ARP and ND with for remote hosts, when it does.
     pub proxy: Option<Proxy>,
+    /// The members whose frames are not learned from: where the hosts behind them
+    /// are comes from the control side only (an SRv6 EVPN interface: the remote
+    /// End.DT2U SID a host is behind is not in its frames; RFC 8986 section 4.11).
+    pub control_learned: Vec<IfId>,
 }
 
 /// The remote hosts a bridge answers ARP requests and Neighbor Solicitations for,
@@ -1007,13 +1028,17 @@ impl Bridges {
         if let Some(out) = self.proxy(bridge, member, packet.bytes_mut(), now_ms) {
             return out;
         }
-        let decision = self.table.receive(
+        let learn = !self.bridges[usize::from(bridge)]
+            .control_learned
+            .contains(&member);
+        let decision = self.table.receive_learning(
             bridge,
             member,
             vtep,
             packet.bytes_mut(),
             irb.map(|(_, mac)| mac),
             now_ms,
+            learn,
         );
         match decision {
             BridgeDecision::Irb => {
@@ -1429,6 +1454,7 @@ mod tests {
                 )]
                 .into(),
             }),
+            control_learned: Vec::new(),
         };
         bridges.publish(vec![config], &[None], &[], |_, _| true);
         let request = |sender: [u8; 4], target: [u8; 4]| {
@@ -1499,6 +1525,7 @@ mod tests {
                 )]
                 .into(),
             }),
+            control_learned: Vec::new(),
         };
         bridges.publish(vec![config], &[None], &[], |_, _| true);
         let solicitation = |source: Ipv6Addr, hop: u8, extra: usize| {
@@ -1618,6 +1645,7 @@ mod tests {
             irb: Some((IfId(9), IRB)),
             members: vec![P1, P2],
             proxy: None,
+            control_learned: Vec::new(),
         };
         bridges.publish(vec![config], &[None], &[], |_, _| true);
         assert_eq!(bridges.member_of(P2), Some(0));

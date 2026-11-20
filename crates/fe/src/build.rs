@@ -277,6 +277,7 @@ impl Routes {
                 | Key::EtherIp { .. }
                 | Key::Vxlan { .. }
                 | Key::Srv6L2 { .. }
+                | Key::Srv6Evpn { .. }
                 | Key::Bridge { .. }
                 // It changes the VTEPs of a VXLAN interface.
                 | Key::EvpnFlood { .. } => return None,
@@ -317,6 +318,15 @@ impl Routes {
                 stays(self.policies.get(vrf).and_then(|p| p.get(encap)), *by)
             });
         kept.then_some(afters)
+    }
+}
+
+/// The EVPN VNI an overlay is in: a VXLAN or SRv6 EVPN interface's.
+fn evpn_vni(kind: &ruster_core::OverlayKind) -> Option<u32> {
+    match kind {
+        ruster_core::OverlayKind::Vxlan { vni, .. }
+        | ruster_core::OverlayKind::Srv6Evpn { vni, .. } => Some(*vni),
+        _ => None,
     }
 }
 
@@ -361,8 +371,10 @@ fn evpn_floods(
     for overlay in overlays.iter_mut() {
         let at = bridge_of(overlay.interface);
         let local = overlay.local;
-        let ruster_core::OverlayKind::Vxlan { vni, remotes, .. } = &mut overlay.kind else {
-            continue;
+        let (vni, remotes) = match &mut overlay.kind {
+            ruster_core::OverlayKind::Vxlan { vni, remotes, .. }
+            | ruster_core::OverlayKind::Srv6Evpn { vni, remotes, .. } => (vni, remotes),
+            _ => continue,
         };
         let taken = taken.entry(at).or_default();
         for &vtep in floods.get(vni).into_iter().flatten() {
@@ -398,9 +410,15 @@ fn evpn_macs(
             continue;
         };
         for overlay in overlays {
-            let same =
-                matches!(overlay.kind, ruster_core::OverlayKind::Vxlan { vni: v, .. } if v == *vni);
-            if !same || !overlay.remotes().contains(vtep) {
+            // Over SRv6 the remote End.DT2U SID, which is not a flooding one.
+            let fits = match overlay.kind {
+                ruster_core::OverlayKind::Vxlan { vni: v, .. } => {
+                    v == *vni && overlay.remotes().contains(vtep)
+                }
+                ruster_core::OverlayKind::Srv6Evpn { vni: v, .. } => v == *vni && vtep.is_ipv6(),
+                _ => false,
+            };
+            if !fits {
                 continue;
             }
             let Some(at) = bridges
@@ -455,10 +473,9 @@ fn evpn_neighbors(
             if own {
                 continue;
             }
-            let in_vni = overlays.iter().any(|o| {
-                bridge.members.contains(&o.interface)
-                    && matches!(o.kind, ruster_core::OverlayKind::Vxlan { vni: v, .. } if v == *vni)
-            });
+            let in_vni = overlays
+                .iter()
+                .any(|o| bridge.members.contains(&o.interface) && evpn_vni(&o.kind) == Some(*vni));
             if !in_vni {
                 continue;
             }
@@ -1021,7 +1038,8 @@ pub(crate) fn build(
     let members = store
         .table(sid::ETHERIP)
         .chain(store.table(sid::VXLAN))
-        .chain(store.table(sid::SRV6_L2));
+        .chain(store.table(sid::SRV6_L2))
+        .chain(store.table(sid::SRV6_EVPN));
     // The VRF each overlay's outer packets are in, by name: the ids come with the
     // VRFs' order, below.
     let mut overlay_vrfs: Vec<&str> = Vec::new();
@@ -1069,6 +1087,25 @@ pub(crate) fn build(
                     sid: sid.octets(),
                     segments: segments.iter().map(|s| IpAddr::V6(*s)).collect(),
                     reduced: *reduced,
+                },
+            ),
+            // Its remote ends come from the EVPN tables (`evpn_floods`).
+            (
+                Key::Srv6Evpn { interface },
+                Value::Srv6Evpn {
+                    source,
+                    vni,
+                    unicast,
+                    multicast,
+                },
+            ) => (
+                interface,
+                IpAddr::V6(*source),
+                ruster_core::OverlayKind::Srv6Evpn {
+                    vni: *vni,
+                    unicast: unicast.octets(),
+                    multicast: multicast.octets(),
+                    remotes: Vec::new(),
                 },
             ),
             _ => continue,
@@ -1190,6 +1227,7 @@ pub(crate) fn build(
                     irb,
                     members: Vec::new(),
                     proxy: None,
+                    control_learned: Vec::new(),
                 },
             ));
         }
@@ -1215,6 +1253,13 @@ pub(crate) fn build(
     }
     for (at, member) in members {
         bridges[at].1.members.push(member);
+        // Where the hosts behind an SRv6 EVPN member are comes from the EVPN tables.
+        let evpn = overlays.iter().any(|o| {
+            o.interface == member && matches!(o.kind, ruster_core::OverlayKind::Srv6Evpn { .. })
+        });
+        if evpn {
+            bridges[at].1.control_learned.push(member);
+        }
     }
     // A bridge's VXLAN members share no remote VTEP: frames flooded from one go to
     // the others, so a VTEP behind two would get them back (a loop between two
