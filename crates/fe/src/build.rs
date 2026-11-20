@@ -425,7 +425,7 @@ fn evpn_macs(
 }
 
 /// Gives each bridge with a VXLAN member of an EVPN VNI the remote hosts' addresses
-/// of that VNI, to answer ARP with on its other members (RFC 9161). Not an address
+/// of that VNI, to answer ARP and ND with on its other members (RFC 9161). Not an address
 /// of the bridge's own interface (IRB): a remote router's gateway entry with the
 /// same address must not take the place of the local IRB. When the same address
 /// is in two VNIs of one bridge, the first in the table's order is answered with.
