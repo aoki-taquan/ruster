@@ -427,7 +427,9 @@ type-3のVTEP、相手の近隣、L2のMACの送り直しを運ばないので�
   あるものはフラッディングする（ホストが自分で答える）。数はARPと合わせて`bridge_proxied`。
 - SRv6で運ぶとき（End.DT2U、End.DT2M）。
 
-表の形と細かい決まりは、それぞれを作るときにこの節へ書く。
+`ruster evpn add|del --source NAME`で、ルーティングデーモンの代わりにこの3つの表を書ける。netns `evpn`は、
+VTEPを書かないVXLANとLinuxのvxlanの間で、これで`flood`、`mac`、`neighbor`を書き、届くこと、ARPとNDの代理応答を
+Linuxのホストが受けること、VTEPを消すと届かなくなることを確かめる。
 
 ## 8. 作る順番
 

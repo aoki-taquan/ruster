@@ -128,6 +128,7 @@ ruster rollback 3                            # 版3の設定を、新しい版�
 ruster show                                  # FEの表と、SIDごとの数、学んだMACを表示する
 ruster route add --source routed 203.0.113.0/24 dev wan via 198.51.100.1
 ruster route del --source routed 203.0.113.0/24
+ruster evpn add --source evpn flood 100 10.0.0.2   # EVPNの値を、ルーティングデーモンの代わりに書く
 ```
 
 `apply`は、confdが変わった分をFE、ribd、neighdへ送り、全部が受け取ってから答えます。どれかが断るとconfdは前の設定に戻します。全部が受け取った設定は、confdが番号付きの版として`--state-dir`に残します（最新の50個）。
