@@ -624,3 +624,67 @@ fn a_vxlan_interface_with_no_vtep_gets_them_from_evpn() {
     assert_eq!(out.len(), 1);
     assert_eq!(vtep_of(&out[0].1, &broadcast), VTEP4);
 }
+
+#[test]
+fn an_evpn_address_seen_on_a_local_port_has_moved_there() {
+    const VTEP4: [u8; 4] = [203, 0, 113, 4];
+    let mut bench = Bench::new();
+    let evpn = |bench: &mut Bench, changes: &[Change]| {
+        let token = bench.routes.patch(changes).unwrap();
+        assert_eq!(
+            settle(&mut bench.fe, &mut bench.routes, token),
+            Code::CHANGED
+        );
+    };
+    let h2_behind = |vtep: [u8; 4]| {
+        Change::set(
+            Key::EvpnMac { vni: 100, mac: H2 },
+            Value::EvpnMac {
+                vtep: IpAddr::from(vtep),
+            },
+        )
+    };
+    evpn(
+        &mut bench,
+        &[
+            Change::set(
+                Key::EvpnFlood {
+                    vni: 100,
+                    vtep: IpAddr::from(VTEP4),
+                },
+                Value::EvpnFlood,
+            ),
+            h2_behind(VTEP4),
+        ],
+    );
+    // H2 speaks on p1: it is there now, for frames from a VTEP too.
+    bench.send(P1, frame(H1, H2, 60));
+    let to_h2 = frame(H2, H1, 60);
+    assert_eq!(
+        bench.send(WAN, outer(VTEP2, 100, &to_h2)),
+        vec![(P1, to_h2.clone())]
+    );
+    // Another EVPN entry rebuilds the tables, with H2's as it was: H2 stays here.
+    evpn(
+        &mut bench,
+        &[Change::set(
+            Key::EvpnMac {
+                vni: 100,
+                mac: [2, 0, 0, 0, 0, 0x77],
+            },
+            Value::EvpnMac {
+                vtep: IpAddr::from(VTEP4),
+            },
+        )],
+    );
+    assert_eq!(
+        bench.send(WAN, outer(VTEP2, 100, &to_h2)),
+        vec![(P1, to_h2.clone())]
+    );
+    // The daemon says H2 is behind VTEP2 now (it moved away again): it goes there.
+    evpn(&mut bench, &[h2_behind(VTEP2)]);
+    let from_h1 = frame(H2, H1, 100);
+    let out = bench.send(P1, from_h1.clone());
+    assert_eq!(out.len(), 1);
+    assert_eq!(vtep_of(&out[0].1, &from_h1), VTEP2);
+}

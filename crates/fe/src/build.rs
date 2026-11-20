@@ -79,7 +79,7 @@ pub(crate) struct Built {
     /// The bridges by name, in name order, and the static entries of their MAC
     /// address tables (bridge index, address, member, the remote VTEP on a VXLAN member).
     pub(crate) bridges: Vec<(String, ruster_core::BridgeConfig)>,
-    pub(crate) bridge_statics: Vec<(u16, [u8; 6], IfId, Option<IpAddr>)>,
+    pub(crate) bridge_statics: Vec<ruster_core::StaticMac>,
     /// The router's SRv6 SIDs and SR policies.
     pub(crate) srv6: ruster_core::Srv6Table,
 }
@@ -389,9 +389,9 @@ fn evpn_macs(
     store: &Store,
     bridges: &[(String, ruster_core::BridgeConfig)],
     overlays: &[ruster_core::Overlay],
-    statics: &mut Vec<(u16, [u8; 6], IfId, Option<IpAddr>)>,
+    statics: &mut Vec<ruster_core::StaticMac>,
 ) {
-    let mut have: BTreeSet<(u16, [u8; 6])> = statics.iter().map(|s| (s.0, s.1)).collect();
+    let mut have: BTreeSet<(u16, [u8; 6])> = statics.iter().map(|s| (s.bridge, s.mac)).collect();
     for (key, value) in store.table(sid::EVPN_MAC) {
         let (Key::EvpnMac { vni, mac }, Value::EvpnMac { vtep }) = (key, value) else {
             continue;
@@ -410,7 +410,14 @@ fn evpn_macs(
                 continue;
             };
             if have.insert((at, *mac)) {
-                statics.push((at, *mac, overlay.interface, Some(*vtep)));
+                // A host may move here before the daemon hears of it.
+                statics.push(ruster_core::StaticMac {
+                    bridge: at,
+                    mac: *mac,
+                    member: overlay.interface,
+                    vtep: Some(*vtep),
+                    movable: true,
+                });
             }
         }
     }
@@ -1199,12 +1206,13 @@ pub(crate) fn build(
                     ));
                 }
                 if bridges[at].1.members.contains(&member) {
-                    bridge_statics.push((
-                        u16::try_from(at).unwrap_or(u16::MAX),
-                        *mac,
+                    bridge_statics.push(ruster_core::StaticMac {
+                        bridge: u16::try_from(at).unwrap_or(u16::MAX),
+                        mac: *mac,
                         member,
-                        *vtep,
-                    ));
+                        vtep: *vtep,
+                        movable: false,
+                    });
                 }
             }
         }

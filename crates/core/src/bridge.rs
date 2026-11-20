@@ -24,12 +24,20 @@
 //!   01-80-C2-00-00-0F are not relayed.
 //! - RFC 7348 section 4.1: an address learned on a VXLAN member is learned with the
 //!   remote VTEP it came from, and frames to it go to that VTEP.
+//! - RFC 7432 section 15 (MAC mobility): an address a routing daemon says is behind
+//!   a remote VTEP is a movable static entry. Seen on another member, it has moved
+//!   there and is learned there; the daemon hears of it from the learned entries
+//!   and advertises it. While the daemon still gives the same remote entry, the
+//!   learned one stays; given otherwise (another VTEP, or withdrawn and given
+//!   again), the remote one replaces it.
 //!
-//! Deviations: no spanning tree (the operator keeps the topology free of loops); a
+//! Deviations: a movable static entry is changed by learning (802.1Q 8.7 keeps
+//! static entries); no spanning tree (the operator keeps the topology free of loops); a
 //! bridge does not tell VLANs apart (VLAN-unaware: make one bridge per VLAN with VLAN
 //! sub-interfaces as members); a frame with a group or all-zero source address is
 //! dropped, not relayed.
 
+use std::collections::BTreeSet;
 use std::net::IpAddr;
 
 use crate::fixed_directory::DirectoryHashDomain;
@@ -100,6 +108,11 @@ pub enum Learned {
 struct Slot {
     used: bool,
     fixed: bool,
+    /// A static entry learning may take over on another member ([`StaticMac::movable`]).
+    movable: bool,
+    /// A learned entry that took over a movable static one: the member and VTEP that
+    /// one had. While the same static entry is given again, the learned one stays.
+    moved_from: Option<(IfId, Option<IpAddr>)>,
     bridge: u16,
     mac: [u8; 6],
     member: IfId,
@@ -111,6 +124,8 @@ struct Slot {
 const EMPTY: Slot = Slot {
     used: false,
     fixed: false,
+    movable: false,
+    moved_from: None,
     bridge: 0,
     mac: [0; 6],
     member: IfId(0),
@@ -137,6 +152,20 @@ pub struct MacEntry {
     pub fixed: bool,
     /// When a learned entry was last seen.
     pub seen_ms: u64,
+}
+
+/// A static entry of a bridge's MAC address table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StaticMac {
+    pub bridge: u16,
+    pub mac: [u8; 6],
+    pub member: IfId,
+    /// The remote VTEP behind a VXLAN member.
+    pub vtep: Option<IpAddr>,
+    /// Learning takes it over when the address is seen on another member: for an
+    /// address a routing daemon says is behind a remote VTEP (EVPN), which may move
+    /// here before the daemon hears of it. A configured entry is not movable.
+    pub movable: bool,
 }
 
 /// The MAC address table of every bridge: open addressing with linear probing, at
@@ -276,7 +305,7 @@ impl MacTable {
         bridges: &[BridgeLimits],
         old_of_new: &[Option<u16>],
         keep: impl Fn(u16, IfId, Option<IpAddr>) -> bool,
-        statics: &[(u16, [u8; 6], IfId, Option<IpAddr>)],
+        statics: &[StaticMac],
     ) -> usize {
         // An empty table is all `EMPTY` already (`remove` leaves `EMPTY` behind):
         // with nothing learned, nothing is gone through slot by slot.
@@ -304,9 +333,42 @@ impl MacTable {
                     .map_or_else(BridgeCounters::default, |b| b.counters),
             })
             .collect();
+        // The new id of each old bridge (the first that names it).
+        let mut new_of_old: Vec<Option<u16>> = vec![None; old_bridges.len()];
+        for (new, old) in old_of_new.iter().enumerate().take(self.bridges.len()) {
+            if let Some(slot) = old.and_then(|o| new_of_old.get_mut(usize::from(o))) {
+                if slot.is_none() {
+                    *slot = u16::try_from(new).ok();
+                }
+            }
+        }
+        // The learned entries that took over a static one given again as it was:
+        // the static one stays out (the host moved here; the routing daemon has
+        // not heard yet). One given otherwise, or not given, ends that.
+        let took_over: BTreeSet<(u16, [u8; 6], IfId, Option<IpAddr>)> = old
+            .iter()
+            .filter(|s| !s.fixed)
+            .filter_map(|s| {
+                let new = new_of_old.get(usize::from(s.bridge)).copied().flatten()?;
+                let (member, vtep) = s.moved_from?;
+                Some((new, s.mac, member, vtep))
+            })
+            .collect();
+        let mut kept_over: BTreeSet<(u16, [u8; 6])> = BTreeSet::new();
         let mut left_out = 0;
-        for &(bridge, mac, member, vtep) in statics {
+        for &StaticMac {
+            bridge,
+            mac,
+            member,
+            vtep,
+            movable,
+        } in statics
+        {
             if usize::from(bridge) >= self.bridges.len() || self.find(bridge, &mac).is_some() {
+                continue;
+            }
+            if movable && took_over.contains(&(bridge, mac, member, vtep)) {
+                kept_over.insert((bridge, mac));
                 continue;
             }
             if self.len >= self.capacity {
@@ -316,21 +378,14 @@ impl MacTable {
             self.insert(Slot {
                 used: true,
                 fixed: true,
+                movable,
+                moved_from: None,
                 bridge,
                 mac,
                 member,
                 vtep,
                 seen_ms: 0,
             });
-        }
-        // The new id of each old bridge (the first that names it).
-        let mut new_of_old: Vec<Option<u16>> = vec![None; old_bridges.len()];
-        for (new, old) in old_of_new.iter().enumerate().take(self.bridges.len()) {
-            if let Some(slot) = old.and_then(|o| new_of_old.get_mut(usize::from(o))) {
-                if slot.is_none() {
-                    *slot = u16::try_from(new).ok();
-                }
-            }
         }
         for slot in old.into_iter().filter(|s| !s.fixed) {
             let Some(new) = new_of_old.get(usize::from(slot.bridge)).copied().flatten() else {
@@ -345,11 +400,39 @@ impl MacTable {
             {
                 continue;
             }
+            let moved_from = slot
+                .moved_from
+                .filter(|_| kept_over.contains(&(new, slot.mac)));
             self.insert(Slot {
                 bridge: new,
+                moved_from,
                 ..slot
             });
             self.bridges[usize::from(new)].learned += 1;
+        }
+        // A static entry kept out for a learned one that did not come back in.
+        for kept in statics
+            .iter()
+            .filter(|s| kept_over.contains(&(s.bridge, s.mac)))
+        {
+            if self.find(kept.bridge, &kept.mac).is_some() {
+                continue;
+            }
+            if self.len >= self.capacity {
+                left_out += 1;
+                continue;
+            }
+            self.insert(Slot {
+                used: true,
+                fixed: true,
+                movable: true,
+                moved_from: None,
+                bridge: kept.bridge,
+                mac: kept.mac,
+                member: kept.member,
+                vtep: kept.vtep,
+                seen_ms: 0,
+            });
         }
         left_out
     }
@@ -372,9 +455,33 @@ impl MacTable {
             let aged = self.aged(&self.slots[at], now_ms);
             let slot = &mut self.slots[at];
             if slot.fixed {
-                return Learned::Static;
+                // A movable entry seen on another member, not behind a remote VTEP,
+                // has moved there (EVPN, RFC 7432 section 15: where remote hosts
+                // are comes from the routing daemon): it is learned there, as far
+                // as there is room.
+                if !slot.movable || slot.member == member || vtep.is_some() || full {
+                    return Learned::Static;
+                }
+                *slot = Slot {
+                    fixed: false,
+                    movable: false,
+                    moved_from: Some((slot.member, slot.vtep)),
+                    member,
+                    vtep,
+                    seen_ms: now_ms,
+                    ..*slot
+                };
+                let state = &mut self.bridges[usize::from(bridge)];
+                state.learned += 1;
+                state.counters.moved += 1;
+                return Learned::Moved;
             }
             slot.seen_ms = now_ms;
+            // Behind a remote VTEP again: the routing daemon's entry is what holds
+            // from the next table change on.
+            if vtep.is_some() {
+                slot.moved_from = None;
+            }
             if slot.member == member && slot.vtep == vtep {
                 return Learned::Refreshed;
             }
@@ -397,6 +504,8 @@ impl MacTable {
         self.insert(Slot {
             used: true,
             fixed: false,
+            movable: false,
+            moved_from: None,
             bridge,
             mac,
             member,
@@ -650,7 +759,7 @@ impl Bridges {
         &mut self,
         bridges: Vec<BridgeConfig>,
         old_of_new: &[Option<u16>],
-        statics: &[(u16, [u8; 6], IfId, Option<IpAddr>)],
+        statics: &[StaticMac],
         vtep_kept: impl Fn(IfId, IpAddr) -> bool,
     ) -> usize {
         let size = |ids: &mut dyn Iterator<Item = IfId>| ids.map(|id| usize::from(id.0) + 1).max();
@@ -1037,7 +1146,13 @@ mod tests {
             }],
             &[Some(0)],
             |_, member, _| member != P1,
-            &[(0, s, P3, None)],
+            &[StaticMac {
+                bridge: 0,
+                mac: s,
+                member: P3,
+                vtep: None,
+                movable: false,
+            }],
         );
         assert_eq!(left, 0);
         // The learned entries on P1 went; the counters stayed.
@@ -1045,6 +1160,63 @@ mod tests {
         assert_eq!(t.counters().next().unwrap().learned, 2);
         assert_eq!(t.learn(0, s, P1, None, 5), Learned::Static);
         assert_eq!(t.send(0, &s, 1_000_000), Some((P3, None)));
+    }
+
+    #[test]
+    fn a_movable_static_entry_is_taken_over_until_it_is_given_otherwise() {
+        let limits = [BridgeLimits {
+            aging_ms: 300_000,
+            max_macs: 4,
+        }];
+        let vtep: IpAddr = [198, 51, 100, 2].into();
+        let remote = StaticMac {
+            bridge: 0,
+            mac: A,
+            member: P3,
+            vtep: Some(vtep),
+            movable: true,
+        };
+        let mut t = table(16, 4);
+        let publish = |t: &mut MacTable, statics: &[StaticMac]| {
+            t.republish(&limits, &[Some(0)], |_, _, _| true, statics)
+        };
+        publish(&mut t, &[remote]);
+        assert_eq!(t.send(0, &A, 0), Some((P3, Some(vtep))));
+        // Seen on the member it is on: stays static.
+        assert_eq!(t.learn(0, A, P3, Some(vtep), 1), Learned::Static);
+        // Seen on another: moved there, learned.
+        assert_eq!(t.learn(0, A, P1, None, 2), Learned::Moved);
+        assert_eq!(t.send(0, &A, 3), Some((P1, None)));
+        assert!(t.entries().any(|e| e.mac == A && !e.fixed));
+        // The same static entry again (the daemon has not heard): the learned one
+        // stays.
+        publish(&mut t, &[remote]);
+        assert_eq!(t.send(0, &A, 4), Some((P1, None)));
+        // Withdrawn, then given again (the host went back): the static one wins.
+        publish(&mut t, &[]);
+        assert_eq!(t.send(0, &A, 5), Some((P1, None)));
+        publish(&mut t, &[remote]);
+        assert_eq!(t.send(0, &A, 6), Some((P3, Some(vtep))));
+        // Given behind another VTEP: the static one wins too.
+        assert_eq!(t.learn(0, A, P1, None, 7), Learned::Moved);
+        let other = StaticMac {
+            vtep: Some([198, 51, 100, 3].into()),
+            ..remote
+        };
+        publish(&mut t, &[other]);
+        assert_eq!(t.send(0, &A, 8), Some((P3, other.vtep)));
+        // Not taken over from behind a VTEP, on another member either.
+        assert_eq!(t.learn(0, A, P2, Some(vtep), 9), Learned::Static);
+        // Taken over, then seen behind a VTEP again: the static one is back with
+        // the next change.
+        assert_eq!(t.learn(0, A, P1, None, 10), Learned::Moved);
+        assert_eq!(t.learn(0, A, P3, other.vtep, 11), Learned::Moved);
+        publish(&mut t, &[other]);
+        assert!(t.entries().any(|e| e.mac == A && e.fixed));
+        // Taken over, and the member leaves the bridge: the static one is back.
+        assert_eq!(t.learn(0, A, P1, None, 12), Learned::Moved);
+        t.republish(&limits, &[Some(0)], |_, member, _| member != P1, &[other]);
+        assert_eq!(t.send(0, &A, 13), Some((P3, other.vtep)));
     }
 
     #[test]

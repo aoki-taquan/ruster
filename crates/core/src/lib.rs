@@ -41,7 +41,7 @@ mod vlan;
 
 pub use bridge::{
     BridgeConfig, BridgeCounters, BridgeDecision, BridgeLimits, Bridges, FloodFrame, Learned,
-    MacEntry, MacTable, FLOOD_FRAME_MAX,
+    MacEntry, MacTable, StaticMac, FLOOD_FRAME_MAX,
 };
 pub use checksum::{internet_checksum, ipv4_header_checksum, rfc1624_update};
 #[cfg(feature = "validation-test-hooks")]
