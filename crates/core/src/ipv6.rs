@@ -864,7 +864,7 @@ pub(crate) enum Completed {
 }
 
 /// The ICMPv6 checksum of `icmp` between `source` and `destination` (RFC 4443 2.3).
-fn icmpv6_checksum(source: [u8; 16], destination: [u8; 16], icmp: &[u8]) -> u16 {
+pub(crate) fn icmpv6_checksum(source: [u8; 16], destination: [u8; 16], icmp: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     let mut add = |bytes: &[u8]| {
         for pair in bytes.chunks(2) {

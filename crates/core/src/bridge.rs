@@ -36,6 +36,16 @@
 //!   source and sender; it is not flooded. Not answered: gratuitous requests, those
 //!   for unknown addresses (flooded), and those for a host learned on the asking
 //!   member.
+//! - RFC 9161 section 3.3 (proxy ND) and RFC 4861 section 7.2.4: a Neighbor
+//!   Solicitation to the target's solicited-node address, likewise, is answered with
+//!   a Neighbor Advertisement from the host's addresses, R as the routing daemon
+//!   gave, S and O set, and its MAC address as the Target Link-Layer Address.
+//!
+//! Deviations from RFC 9161: DAD solicitations (from the unspecified address) are
+//! not answered but flooded (the host itself answers); a solicitation with an
+//! extension header or with other options than the Source Link-Layer Address is
+//! flooded ("forward" of section 3.3 (f)); there is no per-host O flag (always set,
+//! no anycast).
 //!
 //! Deviations: a movable static entry is changed by learning (802.1Q 8.7 keeps
 //! static entries); no spanning tree (the operator keeps the topology free of loops); a
@@ -44,7 +54,7 @@
 //! dropped, not relayed.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::fixed_directory::DirectoryHashDomain;
 use crate::{IfId, ResolutionHashKey};
@@ -78,7 +88,8 @@ pub struct BridgeCounters {
     pub flood_dropped: u64,
     /// Frames dropped because their destination is on the member they came in on.
     pub filtered: u64,
-    /// ARP requests the bridge answered for a remote host (RFC 9161).
+    /// ARP requests and Neighbor Solicitations the bridge answered for a remote host
+    /// (RFC 9161).
     pub proxied: u64,
     /// Frames dropped because their destination is reserved (IEEE 802.1Q table 8-1)
     /// or their source is not a unicast address.
@@ -692,7 +703,8 @@ pub struct BridgeConfig {
     pub proxy: Option<Proxy>,
 }
 
-/// The remote hosts a bridge answers ARP requests for, on its local members (RFC 9161: a routing daemon learned them from EVPN).
+/// The remote hosts a bridge answers ARP requests and Neighbor Solicitations for,
+/// on its local members (RFC 9161: a routing daemon learned them from EVPN).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Proxy {
     /// The members requests are answered on: ports and VLAN sub-interfaces, not
@@ -718,6 +730,66 @@ fn arp_request_target(frame: &[u8]) -> Option<Ipv4Addr> {
     }
     let (sender, target) = (&arp[16..20], &arp[26..30]);
     (sender != target).then(|| Ipv4Addr::new(target[0], target[1], target[2], target[3]))
+}
+
+/// The address a Neighbor Solicitation in `frame` (Ethernet, IPv6 with no extension
+/// header) asks for, when it is one the bridge answers: to the target's
+/// solicited-node address, hop limit 255, from a unicast address (not a DAD
+/// solicitation, RFC 4862 section 5.4.2), with exactly the Source Link-Layer
+/// Address option (RFC 4861 sections 4.3 and 7.1.1). Others go on as they are
+/// (RFC 9161 section 3.3 (f), "forward").
+fn solicitation_target(frame: &[u8]) -> Option<Ipv6Addr> {
+    let packet = frame.get(12..86)?;
+    let ip = &packet[2..42];
+    let icmp = &packet[42..74];
+    let address = |bytes: &[u8]| <[u8; 16]>::try_from(bytes).ok().map(Ipv6Addr::from);
+    let source: Ipv6Addr = address(&ip[8..24])?;
+    let destination: Ipv6Addr = address(&ip[24..40])?;
+    let target: Ipv6Addr = address(&icmp[8..24])?;
+    let solicited = {
+        let t = target.octets();
+        let mut d = [0; 16];
+        d[0..2].copy_from_slice(&[0xff, 0x02]);
+        d[11..13].copy_from_slice(&[1, 0xff]);
+        d[13..16].copy_from_slice(&t[13..16]);
+        Ipv6Addr::from(d)
+    };
+    let fits = packet[0..2] == [0x86, 0xdd]
+        && ip[0] >> 4 == 6
+        && ip[4..8] == [0, 32, 58, 255]
+        && !source.is_unspecified()
+        && !source.is_multicast()
+        && destination == solicited
+        && icmp[0..2] == [135, 0]
+        && !target.is_multicast()
+        && icmp[24..26] == [1, 1];
+    fits.then_some(target)
+}
+
+/// Makes the Neighbor Solicitation in `frame` (see [`solicitation_target`]) the
+/// Neighbor Advertisement of `host` (RFC 9161 section 3.3: its MAC address the
+/// source of the frame and the Target Link-Layer Address, the target the source;
+/// R as the host is, S set, O set; RFC 4861 section 7.2.4).
+fn make_advertisement(frame: &mut [u8], host: ProxyHost) {
+    let mut asker = [0; 6];
+    asker.copy_from_slice(&frame[6..12]);
+    let mut asker_ip = [0; 16];
+    asker_ip.copy_from_slice(&frame[22..38]);
+    let mut target = [0; 16];
+    target.copy_from_slice(&frame[62..78]);
+    frame[0..6].copy_from_slice(&asker);
+    frame[6..12].copy_from_slice(&host.mac);
+    frame[14..18].copy_from_slice(&[0x60, 0, 0, 0]);
+    frame[22..38].copy_from_slice(&target);
+    frame[38..54].copy_from_slice(&asker_ip);
+    let icmp = &mut frame[54..86];
+    icmp[0..4].copy_from_slice(&[136, 0, 0, 0]);
+    icmp[4] = (u8::from(host.router) << 7) | 0x40 | 0x20;
+    icmp[5..8].fill(0);
+    icmp[24..26].copy_from_slice(&[2, 1]);
+    icmp[26..32].copy_from_slice(&host.mac);
+    let sum = crate::ipv6::icmpv6_checksum(target, asker_ip, &frame[54..86]);
+    frame[56..58].copy_from_slice(&sum.to_be_bytes());
 }
 
 /// Makes the ARP request in `frame` (see [`arp_request_target`]) the reply of the
@@ -978,10 +1050,18 @@ impl Bridges {
         now_ms: u64,
     ) -> Option<Received> {
         let proxy = self.bridges.get(usize::from(bridge))?.proxy.as_ref()?;
-        if !proxy.members.contains(&member) || frame.get(0..6)? != [0xff; 6] {
+        if !proxy.members.contains(&member) {
             return None;
         }
-        let host = *proxy.hosts.get(&IpAddr::V4(arp_request_target(frame)?))?;
+        let destination = frame.get(0..6)?;
+        let target = if destination == [0xff; 6] {
+            IpAddr::V4(arp_request_target(frame)?)
+        } else if destination[0..3] == [0x33, 0x33, 0xff] {
+            IpAddr::V6(solicitation_target(frame)?)
+        } else {
+            return None;
+        };
+        let host = *proxy.hosts.get(&target)?;
         let source: [u8; 6] = frame.get(6..12)?.try_into().ok()?;
         if source[0] & 1 != 0 || source == [0; 6] {
             return None;
@@ -994,7 +1074,11 @@ impl Bridges {
             return None;
         }
         self.table.learn(bridge, source, member, None, now_ms);
-        make_arp_reply(frame, host.mac);
+        if target.is_ipv4() {
+            make_arp_reply(frame, host.mac);
+        } else {
+            make_advertisement(frame, host);
+        }
         self.table.count_proxied(bridge);
         Some(Received::Forward(member, None))
     }
@@ -1382,6 +1466,87 @@ mod tests {
         bridges.table.learn(0, remote, P2, None, 3);
         let mut frame = request([192, 0, 2, 10], [192, 0, 2, 20]);
         assert_eq!(bridges.proxy(0, P2, &mut frame, 4), None);
+    }
+
+    #[test]
+    fn a_neighbor_solicitation_for_a_remote_host_is_answered_on_a_local_member() {
+        let key = ResolutionHashKey::new(3, 4).unwrap();
+        let mut bridges = Bridges::new(16, 1, key);
+        let remote = [2, 0, 0, 0, 0, 0x22];
+        let asker = [2, 0, 0, 0, 0, 0x11];
+        let target: Ipv6Addr = "2001:db8::20".parse().unwrap();
+        let asker_ip: Ipv6Addr = "2001:db8::10".parse().unwrap();
+        let config = BridgeConfig {
+            limits: BridgeLimits {
+                aging_ms: 1_000,
+                max_macs: 8,
+            },
+            irb: None,
+            members: vec![P1, P3],
+            proxy: Some(Proxy {
+                members: vec![P1],
+                hosts: [(
+                    IpAddr::V6(target),
+                    ProxyHost {
+                        mac: remote,
+                        router: true,
+                    },
+                )]
+                .into(),
+            }),
+        };
+        bridges.publish(vec![config], &[None], &[], |_, _| true);
+        let solicitation = |source: Ipv6Addr, hop: u8, extra: usize| {
+            let t = target.octets();
+            let mut f = vec![0x33, 0x33, 0xff, t[13], t[14], t[15]];
+            f.extend_from_slice(&asker);
+            f.extend_from_slice(&[0x86, 0xdd, 0x60, 0, 0, 0]);
+            let len = u16::try_from(32 + extra).unwrap();
+            f.extend_from_slice(&len.to_be_bytes());
+            f.extend_from_slice(&[58, hop]);
+            f.extend_from_slice(&source.octets());
+            let mut d = [0; 16];
+            d[0..2].copy_from_slice(&[0xff, 0x02]);
+            d[11..13].copy_from_slice(&[1, 0xff]);
+            d[13..16].copy_from_slice(&t[13..16]);
+            f.extend_from_slice(&d);
+            f.extend_from_slice(&[135, 0, 0, 0, 0, 0, 0, 0]);
+            f.extend_from_slice(&t);
+            f.extend_from_slice(&[1, 1]);
+            f.extend_from_slice(&asker);
+            f.resize(f.len() + extra, 0);
+            f
+        };
+        let mut frame = solicitation(asker_ip, 255, 0);
+        assert_eq!(
+            bridges.proxy(0, P1, &mut frame, 0),
+            Some(Received::Forward(P1, None))
+        );
+        assert_eq!(&frame[0..6], &asker);
+        assert_eq!(&frame[6..12], &remote);
+        assert_eq!(&frame[18..22], &[0, 32, 58, 255]);
+        assert_eq!(&frame[22..38], &target.octets());
+        assert_eq!(&frame[38..54], &asker_ip.octets());
+        assert_eq!(&frame[54..56], &[136, 0]);
+        // R (a router), S and O.
+        assert_eq!(&frame[58..62], &[0xe0, 0, 0, 0]);
+        assert_eq!(&frame[62..78], &target.octets());
+        assert_eq!(&frame[78..80], &[2, 1]);
+        assert_eq!(&frame[80..86], &remote);
+        assert_eq!(
+            crate::ipv6::icmpv6_checksum(target.octets(), asker_ip.octets(), &frame[54..86]),
+            0
+        );
+        assert_eq!(bridges.table.counters().next().unwrap().proxied, 1);
+        // Not for: DAD, a hop limit other than 255, more options, an overlay member.
+        for (member, mut frame) in [
+            (P1, solicitation(Ipv6Addr::UNSPECIFIED, 255, 0)),
+            (P1, solicitation(asker_ip, 64, 0)),
+            (P1, solicitation(asker_ip, 255, 8)),
+            (P3, solicitation(asker_ip, 255, 0)),
+        ] {
+            assert_eq!(bridges.proxy(0, member, &mut frame, 1), None);
+        }
     }
 
     #[test]
