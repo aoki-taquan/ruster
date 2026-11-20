@@ -1848,3 +1848,75 @@ fn learned_bridge_addresses_round_trip() {
         "bridge-learned br0 02:00:00:00:00:11 vx0 vtep 198.51.100.2"
     );
 }
+
+#[test]
+fn evpn_entries_round_trip_and_are_checked() {
+    let mac = Change::set(
+        Key::EvpnMac {
+            vni: 100,
+            mac: [2, 0, 0, 0, 0, 0x11],
+        },
+        Value::EvpnMac {
+            vtep: "198.51.100.2".parse().unwrap(),
+        },
+    );
+    let flood = Change::set(
+        Key::EvpnFlood {
+            vni: 100,
+            vtep: "2001:db8::2".parse().unwrap(),
+        },
+        Value::EvpnFlood,
+    );
+    for change in [&mac, &flood] {
+        assert!(change.validate().is_ok());
+        assert_eq!(&round_trip(change), change);
+    }
+    assert_eq!(
+        entry_line(&mac.key, mac.value.as_ref().unwrap()).unwrap(),
+        "evpn-mac vni 100 02:00:00:00:00:11 vtep 198.51.100.2"
+    );
+    assert_eq!(
+        entry_line(&flood.key, flood.value.as_ref().unwrap()).unwrap(),
+        "evpn-flood vni 100 vtep 2001:db8::2"
+    );
+    // A group address, VNI 0 and a VTEP that is no unicast address are refused.
+    let bad = [
+        Change::set(
+            Key::EvpnMac {
+                vni: 100,
+                mac: [1, 0, 0x5e, 0, 0, 1],
+            },
+            Value::EvpnMac {
+                vtep: "198.51.100.2".parse().unwrap(),
+            },
+        ),
+        Change::set(
+            Key::EvpnMac {
+                vni: 0,
+                mac: [2, 0, 0, 0, 0, 1],
+            },
+            Value::EvpnMac {
+                vtep: "198.51.100.2".parse().unwrap(),
+            },
+        ),
+        Change::set(
+            Key::EvpnMac {
+                vni: 100,
+                mac: [2, 0, 0, 0, 0, 1],
+            },
+            Value::EvpnMac {
+                vtep: "224.0.0.1".parse().unwrap(),
+            },
+        ),
+        Change::set(
+            Key::EvpnFlood {
+                vni: 100,
+                vtep: "0.0.0.0".parse().unwrap(),
+            },
+            Value::EvpnFlood,
+        ),
+    ];
+    for change in &bad {
+        assert!(change.validate().is_err(), "{change:?}");
+    }
+}

@@ -18,6 +18,10 @@
 //! A selected route whose next hops are only gateway addresses is resolved through
 //! the other selected routes of its VRF before it goes to the FE ([`resolve`]).
 //!
+//! The remote addresses and flooding VTEPs of EVPN VNIs, which routing daemons
+//! learn from EVPN routes, go the same way: for each VNI and address (or VTEP) the
+//! entry of the source with the lowest preference.
+//!
 //! Skeleton limits: no route leaking between VRFs, no metric or ECMP across sources.
 //!
 //! # Standards
@@ -26,6 +30,9 @@
 //!   (lower is preferred) between sources.
 //! - RFC 4271 sections 5.1.3 and 9.1.2.1: gateways are resolved recursively (see
 //!   [`resolve`]).
+//! - RFC 7432 sections 9.2.2 and 11, RFC 8365: what the MAC/IP and Inclusive
+//!   Multicast Ethernet Tag routes say, as a routing daemon gives it (the daemon
+//!   chooses among the routes; ribd only between daemons).
 //!
 //! Deviations: a preference is set per source, not per route. ribd does not know
 //! the interfaces, so a route out of a disabled interface may be chosen over a
@@ -99,6 +106,18 @@ struct Source {
     gateway_addresses: BTreeMap<(String, IpAddr), usize>,
     /// Since when it has had no connection, while it has routes.
     gone_since: Option<u64>,
+}
+
+/// The tables a source writes and ribd selects from: routes, and the remote
+/// addresses and flooding VTEPs of EVPN VNIs.
+const SOURCE_TABLES: &[u64] = &[sid::ROUTE, sid::EVPN_MAC, sid::EVPN_FLOOD];
+
+/// Whether ribd selects `key` for the FE.
+fn selects(key: &Key) -> bool {
+    matches!(
+        key,
+        Key::Route { .. } | Key::EvpnMac { .. } | Key::EvpnFlood { .. }
+    )
 }
 
 fn is_gateways(value: Option<&Value>) -> bool {
@@ -307,7 +326,7 @@ impl Ribd {
             .iter_mut()
             .find(|s| s.spec.name == name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown route source"))?;
-        source.server.attach(stream, &[sid::ROUTE])
+        source.server.attach(stream, SOURCE_TABLES)
     }
 
     /// True once the FE connection closed (the FE stopped or restarted).
@@ -352,7 +371,7 @@ impl Ribd {
         let mut selected = BTreeMap::new();
         for source in order {
             for (key, value) in source.server.store().iter() {
-                if matches!(key, Key::Route { .. }) {
+                if selects(key) {
                     selected.entry(key.clone()).or_insert_with(|| value.clone());
                 }
             }
@@ -477,7 +496,7 @@ impl Ribd {
     fn changes_of(&self, touched: &BTreeSet<Key>) -> Option<Vec<Change>> {
         let mut changes = Vec::new();
         for key in touched {
-            if !matches!(key, Key::Route { .. }) {
+            if !selects(key) {
                 continue;
             }
             let selected = match self.selected_of(key) {
@@ -552,7 +571,7 @@ impl Task for Ribd {
                     let at = since.saturating_add(after);
                     if now_ms >= at {
                         source.gone_since = None;
-                        if source.server.drop_tables(&[sid::ROUTE], &mut changed) {
+                        if source.server.drop_tables(SOURCE_TABLES, &mut changed) {
                             self.counters.sources_dropped += 1;
                             eprintln!(
                                 "ruster-ribd: source {} has been away {after} ms; its routes go",
@@ -1171,5 +1190,79 @@ mod tests {
         assert_eq!(settle(&mut ribd, 3_400), 2);
         assert_eq!(settle(&mut ribd, 9_000), 2);
         assert_eq!(ribd.counters().sources_dropped, 1);
+    }
+
+    #[test]
+    fn evpn_entries_are_selected_by_preference_and_go_with_their_source() {
+        let mut fe = Server::new();
+        let (a, b) = UnixStream::pair().unwrap();
+        fe.attach(a, &[sid::ROUTE, sid::EVPN_MAC, sid::EVPN_FLOOD])
+            .unwrap();
+        let specs = [("near", 20, None), ("far", 50, Some(1_000))].map(
+            |(name, preference, drop_after_ms)| SourceSpec {
+                name: name.into(),
+                preference,
+                hold_ms: 0,
+                drop_after_ms,
+            },
+        );
+        let mut ribd = Ribd::new(b, specs.to_vec()).unwrap();
+        let mac = |last: u8| Key::EvpnMac {
+            vni: 100,
+            mac: [2, 0, 0, 0, 0, last],
+        };
+        let vtep = |last: u8| IpAddr::from([198, 51, 100, last]);
+        let flood = Key::EvpnFlood {
+            vni: 100,
+            vtep: vtep(9),
+        };
+        let connect = |ribd: &mut Ribd, name: &str, changes: &[Change]| {
+            let (a, b) = UnixStream::pair().unwrap();
+            ribd.attach_source(name, a).unwrap();
+            let mut client = Client::new(b).unwrap();
+            client.patch(changes).unwrap();
+            client.sync_done();
+            client.poll();
+            client
+        };
+        // Both give MAC 1, behind other VTEPs; only the far one gives MAC 2 and the
+        // flooding VTEP.
+        let near = connect(
+            &mut ribd,
+            "near",
+            &[Change::set(mac(1), Value::EvpnMac { vtep: vtep(1) })],
+        );
+        let far = connect(
+            &mut ribd,
+            "far",
+            &[
+                Change::set(mac(1), Value::EvpnMac { vtep: vtep(2) }),
+                Change::set(mac(2), Value::EvpnMac { vtep: vtep(2) }),
+                Change::set(flood.clone(), Value::EvpnFlood),
+            ],
+        );
+        let mut settle = |ribd: &mut Ribd, now: u64| {
+            for _ in 0..1_000 {
+                let busy = fe.step(&mut Fe).busy | ribd.step(now).busy;
+                if !busy {
+                    break;
+                }
+            }
+            fe.store()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let held = settle(&mut ribd, 0);
+        assert_eq!(held.get(&mac(1)), Some(&Value::EvpnMac { vtep: vtep(1) }));
+        assert_eq!(held.get(&mac(2)), Some(&Value::EvpnMac { vtep: vtep(2) }));
+        assert_eq!(held.get(&flood), Some(&Value::EvpnFlood));
+        // The far source goes for longer than it may: its entries go.
+        drop(far);
+        settle(&mut ribd, 10);
+        let held = settle(&mut ribd, 1_010);
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(held.get(&mac(1)), Some(&Value::EvpnMac { vtep: vtep(1) }));
+        drop(near);
     }
 }

@@ -715,6 +715,24 @@
       },
       {
         "namespace": "data",
+        "identifier": "/ruster-evpn:evpn/mac",
+        "sid": 60320,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-evpn:evpn/mac/vtep",
+        "sid": 60321,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-evpn:evpn/flood",
+        "sid": 60325,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
         "identifier": "/ruster-fib:fib/vrf/route/srv6-local/behavior",
         "sid": 60290,
         "status": "unstable"
