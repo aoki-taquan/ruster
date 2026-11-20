@@ -733,6 +733,24 @@
       },
       {
         "namespace": "data",
+        "identifier": "/ruster-evpn:evpn/neighbor",
+        "sid": 60330,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-evpn:evpn/neighbor/mac",
+        "sid": 60331,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-evpn:evpn/neighbor/router",
+        "sid": 60332,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
         "identifier": "/ruster-fib:fib/vrf/route/srv6-local/behavior",
         "sid": 60290,
         "status": "unstable"

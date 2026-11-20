@@ -1923,3 +1923,33 @@ fn evpn_entries_round_trip_and_are_checked() {
         assert!(change.validate().is_err(), "{change:?}");
     }
 }
+
+#[test]
+fn evpn_neighbors_round_trip_and_are_checked() {
+    let neighbor = |address: &str, mac: [u8; 6], router: bool| {
+        Change::set(
+            Key::EvpnNeighbor {
+                vni: 100,
+                address: address.parse().unwrap(),
+            },
+            Value::EvpnNeighbor { mac, router },
+        )
+    };
+    let v4 = neighbor("192.0.2.20", [2, 0, 0, 0, 0, 0x22], false);
+    let v6 = neighbor("2001:db8::20", [2, 0, 0, 0, 0, 0x22], true);
+    for change in [&v4, &v6] {
+        assert!(change.validate().is_ok());
+        assert_eq!(&round_trip(change), change);
+    }
+    assert_eq!(
+        entry_line(&v6.key, v6.value.as_ref().unwrap()).unwrap(),
+        "evpn-neighbor vni 100 2001:db8::20 02:00:00:00:00:22 router"
+    );
+    for bad in [
+        neighbor("224.0.0.1", [2, 0, 0, 0, 0, 0x22], false),
+        neighbor("192.0.2.20", [1, 0, 0x5e, 0, 0, 1], false),
+        neighbor("192.0.2.20", [0; 6], false),
+    ] {
+        assert!(bad.validate().is_err(), "{bad:?}");
+    }
+}

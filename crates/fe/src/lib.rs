@@ -98,7 +98,12 @@ pub mod writers {
         sid::VXLAN,
         sid::SRV6_L2,
     ];
-    pub const ROUTE: &[u64] = &[sid::ROUTE, sid::EVPN_MAC, sid::EVPN_FLOOD];
+    pub const ROUTE: &[u64] = &[
+        sid::ROUTE,
+        sid::EVPN_MAC,
+        sid::EVPN_FLOOD,
+        sid::EVPN_NEIGHBOR,
+    ];
     pub const NEIGHBOR: &[u64] = &[sid::NEIGHBOR];
     pub const READ_ONLY: &[u64] = &[];
 }
@@ -223,6 +228,7 @@ pub struct FeCounters {
     pub bridge_forwarded: u64,
     pub bridge_flooded: u64,
     pub bridge_flood_dropped: u64,
+    pub bridge_proxied: u64,
     pub bridge_dropped: u64,
     /// Frames bridged to an overlay (EtherIP) that were dropped because they do not
     /// fit the underlying interface's MTU once wrapped, and those dropped for any
@@ -1213,6 +1219,7 @@ where
             counters.bridge_forwarded += b.forwarded;
             counters.bridge_flooded += b.flooded;
             counters.bridge_flood_dropped += b.flood_dropped;
+            counters.bridge_proxied += b.proxied;
             counters.bridge_dropped += b.dropped + b.filtered;
         }
         counters

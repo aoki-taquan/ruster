@@ -264,6 +264,7 @@ impl Routes {
                 | Key::BridgePort { .. }
                 | Key::BridgeMac { .. }
                 | Key::EvpnMac { .. }
+                | Key::EvpnNeighbor { .. }
                 // State the FE keeps itself: no table change.
                 | Key::Srv6SidCounters { .. }
                 | Key::BridgeLearned { .. } => {
@@ -419,6 +420,45 @@ fn evpn_macs(
                     movable: true,
                 });
             }
+        }
+    }
+}
+
+/// Gives each bridge with a VXLAN member of an EVPN VNI the remote hosts' addresses
+/// of that VNI, to answer ARP and ND with on its other members (RFC 9161).
+fn evpn_neighbors(
+    store: &Store,
+    bridges: &mut [(String, ruster_core::BridgeConfig)],
+    overlays: &[ruster_core::Overlay],
+) {
+    for (key, value) in store.table(sid::EVPN_NEIGHBOR) {
+        let (Key::EvpnNeighbor { vni, address }, Value::EvpnNeighbor { mac, router }) =
+            (key, value)
+        else {
+            continue;
+        };
+        let host = ruster_core::ProxyHost {
+            mac: *mac,
+            router: *router,
+        };
+        for (_, bridge) in bridges.iter_mut() {
+            let in_vni = overlays.iter().any(|o| {
+                bridge.members.contains(&o.interface)
+                    && matches!(o.kind, ruster_core::OverlayKind::Vxlan { vni: v, .. } if v == *vni)
+            });
+            if !in_vni {
+                continue;
+            }
+            let members = &bridge.members;
+            let proxy = bridge.proxy.get_or_insert_with(|| ruster_core::Proxy {
+                members: members
+                    .iter()
+                    .copied()
+                    .filter(|m| !overlays.iter().any(|o| o.interface == *m))
+                    .collect(),
+                hosts: BTreeMap::new(),
+            });
+            proxy.hosts.entry(*address).or_insert(host);
         }
     }
 }
@@ -1136,6 +1176,7 @@ pub(crate) fn build(
                     limits,
                     irb,
                     members: Vec::new(),
+                    proxy: None,
                 },
             ));
         }
@@ -1218,6 +1259,7 @@ pub(crate) fn build(
         }
     }
     evpn_macs(store, &bridges, &overlays, &mut bridge_statics);
+    evpn_neighbors(store, &mut bridges, &overlays);
     let mut names: BTreeSet<&str> = active.values().map(|&(_, vrf)| vrf).collect();
     if let Some(sid_vrfs) = &kept_sid_vrfs {
         // The VRFs the routes are in, as before: the change kept them.
