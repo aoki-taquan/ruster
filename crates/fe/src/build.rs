@@ -319,12 +319,17 @@ impl Routes {
     }
 }
 
+/// The most VTEPs a VXLAN interface has with those of EVPN: as many as a
+/// configured list may have.
+const EVPN_REMOTES_MAX: usize = 64;
+
 /// Adds the VTEPs that take the flooded frames of an EVPN VNI (routes of the
 /// writer [`crate::writers::ROUTE`]) to the VXLAN interfaces of that VNI: of the
 /// local address's family, not the local address, and not a VTEP of another VXLAN
 /// member of the same bridge (the frames would come back, as for configured ones).
 /// What a routing daemon gives never makes the build fail: a VTEP that does not
-/// fit is left out.
+/// fit, or that would take the interface past [`EVPN_REMOTES_MAX`] VTEPs, is left
+/// out.
 fn evpn_floods(
     store: &Store,
     bridges: &[(String, ruster_core::BridgeConfig)],
@@ -362,7 +367,11 @@ fn evpn_floods(
         for &vtep in floods.get(vni).into_iter().flatten() {
             let fits = vtep.is_ipv4() == local.is_ipv4() && vtep != local;
             // Outside a bridge two interfaces may share a VTEP.
-            if fits && (at.is_none() || !taken.contains(&vtep)) && !remotes.contains(&vtep) {
+            // No more than a configured list may have: each received packet and
+            // each flooded frame goes through the list.
+            let room = remotes.len() < EVPN_REMOTES_MAX;
+            if fits && room && (at.is_none() || !taken.contains(&vtep)) && !remotes.contains(&vtep)
+            {
                 remotes.push(vtep);
                 taken.insert(vtep);
             }
