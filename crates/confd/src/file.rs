@@ -284,7 +284,28 @@ pub fn config(lock: Lock) -> Result<Config, String> {
                 segments,
                 reduced,
             } => {
-                srv6_l2.push((entry.name.clone(), sid.clone(), segments.clone(), *reduced));
+                srv6_l2.push((
+                    entry.name.clone(),
+                    crate::srv6::L2Kind::Dx2 {
+                        sid: sid.clone(),
+                        segments: segments.clone(),
+                        reduced: *reduced,
+                    },
+                ));
+            }
+            Kind::Srv6Evpn {
+                vni,
+                unicast_sid,
+                multicast_sid,
+            } => {
+                srv6_l2.push((
+                    entry.name.clone(),
+                    crate::srv6::L2Kind::Evpn {
+                        vni: *vni,
+                        unicast: unicast_sid.clone(),
+                        multicast: multicast_sid.clone(),
+                    },
+                ));
             }
             Kind::Vlan { parent, id } => {
                 let id = *id;

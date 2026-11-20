@@ -433,6 +433,9 @@ type-3のVTEP、相手の近隣、L2のMACの送り直しを運ばないので�
   上の層がEthernet（143）のパケットは、End.DX2と同じく外して、そのブリッジが転送かフラッディングをする。
   このメンバーで受けたフレームからは学ばない（どこにホストがいるかは送り手が決める。RFC 8986の4.11の注）。
   End.DT2MのESIでのフィルタ（Arg.FE2）は無い。ARPとNDの代理応答は同じ表`neighbor`で、VXLANと同じに働く。
+  設定は`srv6-evpn = { vni, unicast-sid, multicast-sid }`（SIDは`[srv6]`のロケータの中、送り元は`[srv6]`の
+  source、MTUは1500から内側のEthernetとIPv6を引いたもの）。netns `srv6-evpn`は、ruster 2台の間で`ruster evpn`
+  で値を書き、End.DT2Mのフラッディング、End.DT2Uのユニキャスト、ARPの代理応答を確かめる。
 
 `ruster evpn add|del --source NAME`で、ルーティングデーモンの代わりにこの3つの表を書ける。netns `evpn`は、
 VTEPを書かないVXLANとLinuxのvxlanの間で、これで`flood`、`mac`、`neighbor`を書き、届くこと、ARPとNDの代理応答を

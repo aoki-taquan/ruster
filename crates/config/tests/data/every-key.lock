@@ -95,6 +95,18 @@ ipv6-from = []
 kind = { srv6-l2 = { sid = "fc00:1::d2", segments = ["fc00:2::d2"], reduced = false } }
 
 [[interface]]
+name = "se0"
+mac = "02:00:00:00:00:07"
+mtu = 1446
+enabled = true
+vrf = "default"
+ipv4 = []
+ipv4-from = []
+ipv6 = []
+ipv6-from = []
+kind = { srv6-evpn = { vni = 100, unicast-sid = "fc00:1::e", multicast-sid = "fc00:1::f" } }
+
+[[interface]]
 name = "br0"
 mac = "02:00:00:00:00:04"
 mtu = 1492
