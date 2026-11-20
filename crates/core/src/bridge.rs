@@ -759,10 +759,15 @@ fn solicitation_target(frame: &[u8]) -> Option<Ipv6Addr> {
         && ip[4..8] == [0, 32, 58, 255]
         && !source.is_unspecified()
         && !source.is_multicast()
+        && !source.is_loopback()
+        && source != target
         && destination == solicited
+        && frame[3..6] == solicited.octets()[13..16]
         && icmp[0..2] == [135, 0]
         && !target.is_multicast()
-        && icmp[24..26] == [1, 1];
+        && icmp[24..26] == [1, 1]
+        // RFC 4861 section 7.1.1: the checksum is good.
+        && crate::ipv6::icmpv6_checksum(source.octets(), destination.octets(), icmp) == 0;
     fits.then_some(target)
 }
 
@@ -1515,6 +1520,8 @@ mod tests {
             f.extend_from_slice(&[1, 1]);
             f.extend_from_slice(&asker);
             f.resize(f.len() + extra, 0);
+            let sum = crate::ipv6::icmpv6_checksum(source.octets(), d, &f[54..]);
+            f[56..58].copy_from_slice(&sum.to_be_bytes());
             f
         };
         let mut frame = solicitation(asker_ip, 255, 0);
@@ -1538,12 +1545,19 @@ mod tests {
             0
         );
         assert_eq!(bridges.table.counters().next().unwrap().proxied, 1);
-        // Not for: DAD, a hop limit other than 255, more options, an overlay member.
+        // Not for: DAD, a hop limit other than 255, more options, an overlay member,
+        // the target's own address as the source, a bad checksum.
         for (member, mut frame) in [
             (P1, solicitation(Ipv6Addr::UNSPECIFIED, 255, 0)),
             (P1, solicitation(asker_ip, 64, 0)),
             (P1, solicitation(asker_ip, 255, 8)),
             (P3, solicitation(asker_ip, 255, 0)),
+            (P1, solicitation(target, 255, 0)),
+            (P1, {
+                let mut f = solicitation(asker_ip, 255, 0);
+                f[57] ^= 1;
+                f
+            }),
         ] {
             assert_eq!(bridges.proxy(0, member, &mut frame, 1), None);
         }
