@@ -12,7 +12,7 @@
 //! 3. The routes confd offers ribd (static and connected), likewise. Which routes the
 //!    FE ends up with is ribd's choice among all its sources.
 //! 4. A section for each process that takes a part ([`crate::part`]): what it says
-//!    taking its part would change (`ruster-unbound`, `ruster-kea` and `ruster-frr`
+//!    taking its part would change (`ruster-unbound`, `ruster-kea`, `ruster-frr` and `ruster-bird`
 //!    diff the files they write; `ruster-pppoed`, `ruster-dhcpc` and neighd's RA
 //!    diff the settings and name what would start, start again or stop), "no
 //!    change", the reason it would refuse it, "not connected", or "did not answer in

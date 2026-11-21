@@ -724,14 +724,21 @@ pub enum RoutingDaemon {
     BirdRs,
 }
 
+impl RoutingDaemon {
+    fn is_frr(&self) -> bool {
+        *self == Self::Frr
+    }
+}
+
 /// The configuration with every parameter given.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Lock {
     pub version: u32,
     /// The routing daemon that runs BGP, IS-IS and OSPF. A lock written before it
-    /// was added has none: FRR.
-    #[serde(default)]
+    /// was added has none: FRR. Not written for FRR, so that a ruster from before
+    /// still reads the lock.
+    #[serde(default, skip_serializing_if = "RoutingDaemon::is_frr")]
     pub routing_daemon: RoutingDaemon,
     pub firewall_filtering: String,
     pub firewall_outside: FirewallOutside,
