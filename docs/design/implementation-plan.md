@@ -185,9 +185,8 @@ backlogと同じく、使う場面が出たものから片付ける。
 
 `ruster-bird`を作る。全体の設定の`[bgp]`、EVPN、`[isis]`、`[ospf]`、`[ospf6]`の部分からbird-rsの設定を作って反映し、
 bird-rsをribdの送り手とFEの状態の読み手につなぐ（bird-rsの`protocol ruster`）。FRRの橋渡し役と同じ形にし、
-IS-ISとOSPFはFRRと同じTAPで動かす。設計は`router-box.md`の「bird-rs（`ruster-bird`）」。次の順に作る。
-
-1. IS-IS、OSPFv2、OSPFv3（TAPの上）。
+IS-ISとOSPFはFRRと同じTAPで動かす。設計は`router-box.md`の「bird-rs（`ruster-bird`）」。BGP、EVPN、IS-IS、OSPFの
+全部ができた。残りは`backlog`のissue（#902など）と同じく扱う。
 
 #### 経路や通信の数が増えたとき
 

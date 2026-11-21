@@ -12,9 +12,11 @@
 //!    does not say which FE interface it is on), and is given the link-local address
 //!    of the FE interface it is on as the next hop's (bird-rs would give the kernel's
 //!    TUN device's, which no FE port answers for).
-//! 3. With `bgp`: `protocol ruster`, which gives ribd the BGP routes as the source
-//!    [`SOURCE`] under the run directory.
-//! 4. The operator's include file, as it is (bird-rs's syntax). `ruster-bird` does
+//! 3. With `isis`, `ospf` or `ospf6`: their protocols on the TAP devices
+//!    ([`crate::igp`]).
+//! 4. With any of them: `protocol ruster`, which gives ribd the BGP, IS-IS and OSPF
+//!    routes as the source [`SOURCE`] under the run directory.
+//! 5. The operator's include file, as it is (bird-rs's syntax). `ruster-bird` does
 //!    not read it.
 //!
 //! The routes are not given to the kernel (`protocol kernel`): the FE forwards by
@@ -71,35 +73,41 @@ pub const INCLUDE_MAX: u64 = 1 << 20;
 /// `run_dir` and the include file's text. Each value is read as an address, prefix
 /// or number again, so nothing else reaches the file but the include.
 pub fn config(routing: &Frr, include: &str, run_dir: &str) -> Result<String, String> {
-    // Refused rather than left out: the operator would believe they run.
-    if routing.isis.is_some() || routing.ospf.is_some() || routing.ospf6.is_some() {
-        return Err("isis, ospf and ospf6 are not run through ruster-bird yet".into());
-    }
     let mut out = format!("{HEADER}\n");
-    if let Some(bgp) = &routing.bgp {
-        let id: std::net::Ipv4Addr = bgp
-            .router_id
+    // BGP's router ID, else OSPF's: IS-IS alone needs none.
+    let id = routing
+        .bgp
+        .as_ref()
+        .map(|b| &b.router_id)
+        .or(routing.ospf.as_ref().map(|o| &o.router_id))
+        .or(routing.ospf6.as_ref().map(|o| &o.router_id));
+    if let Some(id) = id {
+        let id: std::net::Ipv4Addr = id
             .parse()
-            .map_err(|_| format!("router-id {:?} is not an IPv4 address", bgp.router_id))?;
+            .map_err(|_| format!("router-id {id:?} is not an IPv4 address"))?;
         let _ = writeln!(out, "router id {id};");
     }
     out.push_str("protocol device {}\n");
+    let mut evpn = None;
     if let Some(bgp) = &routing.bgp {
-        let evpn = evpn_of(bgp, &routing.evpn)?;
+        evpn = evpn_of(bgp, &routing.evpn)?;
         if let Some(vni) = evpn {
             write_evpn(&mut out, bgp, vni)?;
         }
         write_bgp(&mut out, bgp, &routing.connected, evpn)?;
+    }
+    crate::igp::write(&mut out, routing)?;
+    if routing.bgp.is_some() || crate::igp::runs(routing) {
         if run_dir.is_empty() || run_dir.contains(['"', '\\', '\n']) {
             return Err(format!("run directory {run_dir:?}"));
         }
         let _ = write!(
             out,
             "protocol ruster {{\n  run dir \"{run_dir}\";\n  source \"{SOURCE}\";\n  \
-             ipv4 {{ export where source = RTS_BGP; }};\n  \
-             ipv6 {{ export where source = RTS_BGP; }};\n"
+             ipv4 {{ export where source ~ [{ROUTED}]; }};\n  \
+             ipv6 {{ export where source ~ [{ROUTED}]; }};\n"
         );
-        if let Some(vni) = evpn {
+        if let (Some(vni), Some(bgp)) = (evpn, &routing.bgp) {
             let n = vni.vni;
             // Over SRv6 the label is a SID's function, not the VNI.
             let by_label = if vni.encapsulation == "srv6" {
@@ -122,6 +130,10 @@ pub fn config(routing: &Frr, include: &str, run_dir: &str) -> Result<String, Str
     }
     Ok(out)
 }
+
+/// The sources of the routes given to ribd: BGP, IS-IS and OSPF (not the routes of
+/// the router's own interfaces, which confd gives).
+const ROUTED: &str = "RTS_BGP, RTS_ISIS, RTS_OSPF, RTS_OSPF_IA, RTS_OSPF_EXT1, RTS_OSPF_EXT2";
 
 /// The link-local address of the interface whose prefix holds `neighbor`.
 fn link_local_for(neighbor: IpAddr, connected: &[Connected]) -> Option<Ipv6Addr> {

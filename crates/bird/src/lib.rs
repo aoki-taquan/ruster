@@ -7,6 +7,7 @@
 //!
 //! # Standards
 //!
-//! The standards it follows are in [`conf`].
+//! The standards it follows are in [`conf`] and [`igp`].
 
 pub mod conf;
+pub mod igp;
