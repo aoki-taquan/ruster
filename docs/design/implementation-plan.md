@@ -181,6 +181,18 @@ backlogと同じく、使う場面が出たものから片付ける。
 （`docs/design/overlay.md`の7.）。ルーティングデーモンとつなぐには、そちらが表`ruster-evpn`へ書き、FEの状態の
 `learned-entry`をobserveする。EVPNのbacklogの残りは、ほかのbacklogと同じく扱う。
 
+#### bird-rsの橋渡し役
+
+`ruster-bird`を作る。全体の設定の`[bgp]`、EVPN、`[isis]`、`[ospf]`、`[ospf6]`の部分からbird-rsの設定を作って反映し、
+bird-rsをribdの送り手とFEの状態の読み手につなぐ（bird-rsの`protocol ruster`）。FRRの橋渡し役と同じ形にし、
+IS-ISとOSPFはFRRと同じTAPで動かす。次の順に作る。
+
+1. 設計: 全体の設定の形（FRRと同じ`[bgp]`を使うか、どちらのデーモンを使うかの選び方）、bird.confの作り方、
+   反映（`birdc configure`）、送り手の名前とribdの起動の引数、netnsの試験。設計図に書く。
+2. BGPのIPv4とIPv6のunicast。
+3. EVPN（VXLANとSRv6）。
+4. IS-IS、OSPFv2、OSPFv3（TAPの上）。
+
 #### 経路や通信の数が増えたとき
 
 FRRの橋渡し役は100万経路まで受ける。2026-11-10に測ると、FEは表が大きいと更新に時間がかかり、その間は
