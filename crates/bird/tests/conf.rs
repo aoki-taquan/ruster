@@ -372,7 +372,7 @@ protocol ruster {{
 }
 
 #[test]
-fn is_is_carries_ipv6_when_all_its_interfaces_have_it_and_alone_takes_its_id_from_the_net() {
+fn is_is_carries_ipv6_on_the_interfaces_with_it_and_alone_takes_its_id_from_the_net() {
     let isis = |names: &[&str]| ruster_config::Isis {
         net: "49.0001.1921.6800.1001.00".into(),
         level: "level-1-2".into(),
@@ -385,27 +385,24 @@ fn is_is_carries_ipv6_when_all_its_interfaces_have_it_and_alone_takes_its_id_fro
             })
             .collect(),
     };
-    // wan has an IPv6 prefix (routing()'s connected): IPv6 on.
+    // wan has an IPv6 prefix (routing()'s connected), lan none: IPv6 off on lan.
     let mut part = routing(None);
-    part.isis = Some(isis(&["wan"]));
+    part.isis = Some(isis(&["wan", "lan"]));
     let text = config(&part, "", "/run/ruster").unwrap();
     assert!(
         text.contains("  ipv6 { import all; export none; };\n  interface"),
         "{text}"
     );
+    assert!(
+        text.contains("  interface \"rp-wan\" { metric 10; };"),
+        "{text}"
+    );
+    assert!(
+        text.contains("  interface \"rp-lan\" { metric 10; ipv6 off; };"),
+        "{text}"
+    );
     // The router ID from the system ID 1921.6800.1001: 0x68.0x00.0x10.0x01.
     assert!(text.contains("router id 104.0.16.1;"), "{text}");
-    // lan has none: a mix is refused.
-    part.isis = Some(isis(&["wan", "lan"]));
-    let error = config(&part, "", "/run/ruster").unwrap_err();
-    assert!(
-        error.contains("all of its interfaces or to none"),
-        "{error}"
-    );
-    // None has one: IPv4 only.
-    part.isis = Some(isis(&["lan"]));
-    let text = config(&part, "", "/run/ruster").unwrap();
-    assert!(!text.contains("ipv6 { import all"), "{text}");
     // An OSPF with no interface is not written.
     part.ospf = Some(ruster_config::Ospf {
         router_id: "198.51.100.1".into(),

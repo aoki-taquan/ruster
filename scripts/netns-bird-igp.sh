@@ -4,6 +4,7 @@
 # device of r-wan (rp-r-wan) with a neighbouring bird-rs, and gives ribd the routes
 # itself (protocol ruster, source bird). The neighbour announces one prefix by
 # IS-IS and another by OSPF; ribd puts them in the FE, and a LAN host reaches both.
+# IS-IS carries IPv6 on r-wan, which has an IPv6 prefix, and not on r-lan.
 # The router announces the LAN's prefix from its passive r-lan.
 #
 #   lan (192.0.2.10) -- [r-lan | router | r-wan 10.0.1.1] -- peer (10.0.1.2, bird-rs:
@@ -65,6 +66,7 @@ for d in d1:203.0.113.1 d2:198.18.0.1; do
   nsx "$peer" ip link set "${d%%:*}" up
   nsx "$peer" ip addr add "${d#*:}/24" dev "${d%%:*}"
 done
+nsx "$peer" ip addr add 2001:db8:203::1/64 dev d1 nodad
 nsx "$router" ip link set lo up
 nsx "$router" ip link add vrf-ports type vrf table 999
 nsx "$router" ip link set vrf-ports up
@@ -77,10 +79,12 @@ cat >"$work/peer.conf" <<'CONF'
 router id 10.0.1.2;
 protocol device { scan time 1; }
 protocol kernel { ipv4 { import none; export where source ~ [RTS_ISIS, RTS_OSPF]; }; }
+protocol kernel { ipv6 { import none; export where source ~ [RTS_ISIS]; }; }
 protocol isis {
   net 49.0001.0000.0000.0002.00;
   level 2;
   ipv4 { import all; export none; };
+  ipv6 { import all; export none; };
   interface "h0" { hello 1; };
   interface "d1" { passive; };
 }
@@ -107,6 +111,7 @@ ipv4 = "192.0.2.1/24"
 name = "r-wan"
 mac = "02:00:00:00:00:02"
 ipv4 = "10.0.1.1/24"
+ipv6 = ["2001:db8:100::1/64"]
 
 [isis]
 net = "49.0001.0000.0000.0001.00"
@@ -160,7 +165,10 @@ wait_route "203.0.113.0/24 via 10.0.1.2 dev r-wan" ||
   fail "the FE has no IS-IS route to 203.0.113.0/24: $(routes); $(routerc show protocols 2>&1)"
 wait_route "198.18.0.0/24 via 10.0.1.2 dev r-wan" ||
   fail "the FE has no OSPF route to 198.18.0.0/24: $(routes); $(routerc show protocols 2>&1)"
-grep -q 'interface "rp-r-wan"' "$work/bird.conf" || fail "ruster-bird's file: $(cat "$work/bird.conf")"
+grep -q 'interface "rp-r-wan" { metric 10; };' "$work/bird.conf" || fail "ruster-bird's file: $(cat "$work/bird.conf")"
+grep -q 'interface "rp-r-lan" { metric 10; passive; ipv6 off; };' "$work/bird.conf" ||
+  fail "r-lan has no IPv6 but IS-IS carries it there: $(cat "$work/bird.conf")"
+wait_route "2001:db8:203::/64 via fe80::" || fail "the FE has no IS-IS IPv6 route: $(routes)"
 echo "ok: the router's bird-rs learns the peer's prefixes by IS-IS and OSPF on rp-r-wan, and ribd puts them in the FE"
 echo "    $(routes | grep -E '203.0.113.0/24|198.18.0.0/24' | tr '\n' ' ')"
 
