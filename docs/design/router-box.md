@@ -207,6 +207,15 @@ FRRの代わりに経路デーモンのbird-rsを使うときの橋渡し役。�
   ディレクトリを`BIRD_RS`で渡し、無ければ飛ばす（終了コード77、netns-allは`skip`と出す）。EVPN、IS-IS、
   OSPFも同じ形で足す。netns `bird-evpn`は、ruster 2台にそれぞれbird-rsを付けてIBGP EVPNでつなぎ、VTEPを書かない
   VXLANで、type-3のVTEPとtype-2のMACがribdに入って届くこと、片方のbird-rsを止めると消えることを確かめる。
+  netns `bird-igp`は、IS-ISとOSPFv2をTAP（`rp-r-wan`）の上で相手のbird-rsと動かし、両方の経路がFEに入って
+  LANのホストから届くこと、passiveのインターフェースの経路を相手が学ぶことを確かめる。OSPFv3はbird-rsの
+  testenvでFRRを相手に確かめてあり、ここでは書き方の試験だけ。
+- IS-ISとOSPFは、FRRと同じ`[isis]`、`[ospf]`、`[ospf6]`をbird-rsの`protocol isis`、`protocol ospf v2`、`v3`に
+  変える。インターフェースはTAPの名前（`rp-<名前>`）、passiveはIS-ISの`passive`とOSPFの`stub`、OSPFの
+  point-to-pointは`type ptp`。経路は`protocol ruster`がBGPと同じくribdへ渡す（kernelには入れない）。
+  bird-rsのIS-ISはIPv6をプロトコル全体で運ぶので、IS-ISのインターフェースが全部IPv6のプレフィックスを持つときだけ
+  IPv6を有効にし、持つものと持たないものが混ざると断る（FRRはインターフェースごとに有効にする）。インターフェースの
+  無いOSPFは書かない。router IDはBGP、OSPF、OSPFv3の順に取り、IS-ISだけならNETのsystem IDの後ろ4オクテットにする。
 
 ### Kea（`ruster-kea`）
 

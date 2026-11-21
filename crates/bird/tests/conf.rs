@@ -80,8 +80,8 @@ protocol bgp ruster_neighbor_2001_db8_100__10 {{
 protocol ruster {{
   run dir \"/run/ruster\";
   source \"bird\";
-  ipv4 {{ export where source = RTS_BGP; }};
-  ipv6 {{ export where source = RTS_BGP; }};
+  ipv4 {{ export where source ~ [RTS_BGP, RTS_ISIS, RTS_OSPF, RTS_OSPF_IA, RTS_OSPF_EXT1, RTS_OSPF_EXT2]; }};
+  ipv6 {{ export where source ~ [RTS_BGP, RTS_ISIS, RTS_OSPF, RTS_OSPF_IA, RTS_OSPF_EXT1, RTS_OSPF_EXT2]; }};
 }}
 # extra
 "
@@ -116,15 +116,6 @@ fn values_that_would_break_the_file_are_refused() {
         assert!(config(&routing(Some(bad)), "", "/run/ruster").is_err());
     }
     assert!(config(&routing(Some(bgp())), "", "/run/\"x").is_err());
-    // IS-IS and OSPF are refused until ruster-bird runs them.
-    let mut isis = routing(None);
-    isis.isis = Some(ruster_config::Isis {
-        net: "49.0001.1921.6800.1001.00".into(),
-        level: "level-1-2".into(),
-        interface: Vec::new(),
-    });
-    let error = config(&isis, "", "/run/ruster").unwrap_err();
-    assert!(error.contains("not run through ruster-bird"), "{error}");
 }
 
 fn dir(name: &str) -> PathBuf {
@@ -290,4 +281,136 @@ fn an_evpn_neighbor_gets_the_vni_s_protocol_evpn_and_protocol_ruster_its_bridge(
     big.vni = 70_000;
     part.evpn = vec![big];
     assert!(config(&part, "", "/run/ruster").is_err());
+}
+
+#[test]
+fn is_is_and_ospf_run_on_the_tap_devices_and_give_ribd_their_routes() {
+    let mut part = routing(None);
+    // Both IS-IS interfaces have IPv6.
+    part.connected.push(Connected {
+        interface: "lan".into(),
+        prefix: "2001:db8:1::/64".into(),
+        link_local: "fe80::ff:fe00:1".into(),
+    });
+    part.isis = Some(ruster_config::Isis {
+        net: "49.0001.1921.6800.1001.00".into(),
+        level: "level-2".into(),
+        interface: vec![
+            ruster_config::IsisInterface {
+                name: "wan".into(),
+                metric: 20,
+                passive: false,
+            },
+            ruster_config::IsisInterface {
+                name: "lan".into(),
+                metric: 10,
+                passive: true,
+            },
+        ],
+    });
+    let ospf = |passive: bool| ruster_config::Ospf {
+        router_id: "198.51.100.1".into(),
+        interface: vec![ruster_config::OspfInterface {
+            name: "wan".into(),
+            area: "0.0.0.1".into(),
+            cost: 30,
+            network: "point-to-point".into(),
+            passive,
+        }],
+    };
+    part.ospf = Some(ospf(false));
+    part.ospf6 = Some(ospf(true));
+    let text = config(&part, "", "/run/ruster").unwrap();
+    let expected = format!(
+        "{HEADER}
+router id 198.51.100.1;
+protocol device {{}}
+protocol isis ruster_isis {{
+  net \"49.0001.1921.6800.1001.00\";
+  level 2;
+  ipv4 {{ import all; export none; }};
+  ipv6 {{ import all; export none; }};
+  interface \"rp-wan\" {{ metric 20; }};
+  interface \"rp-lan\" {{ metric 10; passive; }};
+}}
+protocol ospf v2 ruster_ospf {{
+  router id 198.51.100.1;
+  ipv4 {{ import all; export none; }};
+  area 0.0.0.1 {{
+    interface \"rp-wan\" {{ cost 30; type ptp; }};
+  }};
+}}
+protocol ospf v3 ruster_ospf6 {{
+  router id 198.51.100.1;
+  ipv6 {{ import all; export none; }};
+  area 0.0.0.1 {{
+    interface \"rp-wan\" {{ cost 30; type ptp; stub; }};
+  }};
+}}
+protocol ruster {{
+  run dir \"/run/ruster\";
+  source \"bird\";
+  ipv4 {{ export where source ~ [RTS_BGP, RTS_ISIS, RTS_OSPF, RTS_OSPF_IA, RTS_OSPF_EXT1, RTS_OSPF_EXT2]; }};
+  ipv6 {{ export where source ~ [RTS_BGP, RTS_ISIS, RTS_OSPF, RTS_OSPF_IA, RTS_OSPF_EXT1, RTS_OSPF_EXT2]; }};
+}}
+"
+    );
+    assert_eq!(text, expected);
+    // A name that would break the file, a level or network of no kind: refused.
+    let mut bad = part.clone();
+    bad.isis.as_mut().unwrap().interface[0].name = "w\"an".into();
+    assert!(config(&bad, "", "/run/ruster").is_err());
+    let mut bad = part.clone();
+    bad.isis.as_mut().unwrap().level = "level-3".into();
+    assert!(config(&bad, "", "/run/ruster").is_err());
+    let mut bad = part.clone();
+    bad.ospf.as_mut().unwrap().interface[0].network = "nbma".into();
+    assert!(config(&bad, "", "/run/ruster").is_err());
+    let mut bad = part.clone();
+    bad.isis.as_mut().unwrap().interface[0].name = "r*".into();
+    assert!(config(&bad, "", "/run/ruster").is_err());
+}
+
+#[test]
+fn is_is_carries_ipv6_when_all_its_interfaces_have_it_and_alone_takes_its_id_from_the_net() {
+    let isis = |names: &[&str]| ruster_config::Isis {
+        net: "49.0001.1921.6800.1001.00".into(),
+        level: "level-1-2".into(),
+        interface: names
+            .iter()
+            .map(|n| ruster_config::IsisInterface {
+                name: (*n).into(),
+                metric: 10,
+                passive: false,
+            })
+            .collect(),
+    };
+    // wan has an IPv6 prefix (routing()'s connected): IPv6 on.
+    let mut part = routing(None);
+    part.isis = Some(isis(&["wan"]));
+    let text = config(&part, "", "/run/ruster").unwrap();
+    assert!(
+        text.contains("  ipv6 { import all; export none; };\n  interface"),
+        "{text}"
+    );
+    // The router ID from the system ID 1921.6800.1001: 0x68.0x00.0x10.0x01.
+    assert!(text.contains("router id 104.0.16.1;"), "{text}");
+    // lan has none: a mix is refused.
+    part.isis = Some(isis(&["wan", "lan"]));
+    let error = config(&part, "", "/run/ruster").unwrap_err();
+    assert!(
+        error.contains("all of its interfaces or to none"),
+        "{error}"
+    );
+    // None has one: IPv4 only.
+    part.isis = Some(isis(&["lan"]));
+    let text = config(&part, "", "/run/ruster").unwrap();
+    assert!(!text.contains("ipv6 { import all"), "{text}");
+    // An OSPF with no interface is not written.
+    part.ospf = Some(ruster_config::Ospf {
+        router_id: "198.51.100.1".into(),
+        interface: Vec::new(),
+    });
+    let text = config(&part, "", "/run/ruster").unwrap();
+    assert!(!text.contains("protocol ospf"), "{text}");
 }
