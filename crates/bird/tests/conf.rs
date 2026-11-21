@@ -253,8 +253,10 @@ fn an_evpn_neighbor_gets_the_vni_s_protocol_evpn_and_protocol_ruster_its_bridge(
         "  encapsulation vxlan { router address 10.0.0.1; };",
         "  rd 198.51.100.1:100;",
         "  route target (rt, 65001, 100);",
-        "    export where proto = \"ruster_evpn_100\";",
-        "  eth { table ruster_eth; export all; ruster bridge \"br0\"; };",
+        "    export where proto ~ \"ruster_evpn_*\";",
+        "  eth { table ruster_eth; export where net.vlan_id = 1; };",
+        "  vid 1;",
+        "  eth { table ruster_eth; export all; ruster bridge \"br0\" vid 1; };",
         "  evpn { table ruster_evpn; export where (rt, 65001, 100) ~ bgp_ext_community; };",
     ] {
         assert!(text.lines().any(|l| l == line), "{line}\n{text}");
@@ -410,4 +412,38 @@ fn is_is_carries_ipv6_on_the_interfaces_with_it_and_alone_takes_its_id_from_the_
     });
     let text = config(&part, "", "/run/ruster").unwrap();
     assert!(!text.contains("protocol ospf"), "{text}");
+}
+
+#[test]
+fn two_vnis_get_a_protocol_evpn_and_a_vlan_id_each() {
+    let mut with_evpn = bgp();
+    with_evpn.neighbor[0].evpn = true;
+    let mut part = routing(Some(with_evpn));
+    let mut second = evpn_vni("vxlan");
+    second.vni = 200;
+    second.bridge = "br1".into();
+    // Given in another order: VLAN IDs go by VNI.
+    part.evpn = vec![second.clone(), evpn_vni("vxlan")];
+    let text = config(&part, "", "/run/ruster").unwrap();
+    for line in [
+        "protocol evpn ruster_evpn_100 {",
+        "protocol evpn ruster_evpn_200 {",
+        "  eth { table ruster_eth; export where net.vlan_id = 2; };",
+        "  route target (rt, 65001, 200);",
+        "  eth { table ruster_eth; export all; ruster bridge \"br0\" vid 1; ruster bridge \"br1\" vid 2; };",
+        "  evpn { table ruster_evpn; export where (rt, 65001, 100) ~ bgp_ext_community || (rt, 65001, 200) ~ bgp_ext_community; };",
+    ] {
+        assert!(text.lines().any(|l| l == line), "{line}\n{text}");
+    }
+    assert_eq!(text.matches("ipv4 table ruster_tun4;").count(), 1, "{text}");
+    // A bridge twice, or two VNIs over SRv6: refused.
+    let mut same_bridge = second.clone();
+    same_bridge.bridge = "br0".into();
+    part.evpn = vec![evpn_vni("vxlan"), same_bridge];
+    assert!(config(&part, "", "/run/ruster").is_err());
+    let mut srv6 = evpn_vni("srv6");
+    srv6.vni = 200;
+    srv6.bridge = "br1".into();
+    part.evpn = vec![evpn_vni("vxlan"), srv6];
+    assert!(config(&part, "", "/run/ruster").is_err());
 }

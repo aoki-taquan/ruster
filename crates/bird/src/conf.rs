@@ -48,8 +48,9 @@
 //!
 //! Deviations: none of BGP itself is here; bird-rs implements it. A remote VTEP
 //! resolves only on a connected prefix of the default VRF (the EVPN next hops are
-//! looked up in the TUN device's tables alone). One EVPN instance (VNI) per router; a VNI above 65535 does not fit the RD's number and is
-//! refused, as is a route target of a four-octet AS with such a VNI.
+//! looked up in the TUN device's tables alone). Each VNI has a bridge of its own,
+//! and over SRv6 there is one VNI (`protocol ruster` takes one VNI in place of the
+//! label). A VNI above 65535 does not fit the RD's number and is refused.
 
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
@@ -94,13 +95,11 @@ pub fn config(routing: &Frr, include: &str, run_dir: &str) -> Result<String, Str
         let _ = writeln!(out, "router id {id};");
     }
     out.push_str("protocol device {}\n");
-    let mut evpn = None;
+    let mut evpn = Vec::new();
     if let Some(bgp) = &routing.bgp {
         evpn = evpn_of(bgp, &routing.evpn)?;
-        if let Some(vni) = evpn {
-            write_evpn(&mut out, bgp, vni)?;
-        }
-        write_bgp(&mut out, bgp, &routing.connected, evpn)?;
+        write_evpn(&mut out, bgp, &evpn)?;
+        write_bgp(&mut out, bgp, &routing.connected, !evpn.is_empty())?;
     }
     crate::igp::write(&mut out, routing)?;
     if routing.bgp.is_some() || crate::igp::runs(routing) {
@@ -113,19 +112,27 @@ pub fn config(routing: &Frr, include: &str, run_dir: &str) -> Result<String, Str
              ipv4 {{ export where source ~ [{ROUTED}]; }};\n  \
              ipv6 {{ export where source ~ [{ROUTED}]; }};\n"
         );
-        if let (Some(vni), Some(bgp)) = (evpn, &routing.bgp) {
-            let n = vni.vni;
-            // Over SRv6 the label is a SID's function, not the VNI.
-            let by_label = if vni.encapsulation == "srv6" {
-                format!(" ruster vni {n};")
-            } else {
-                String::new()
+        if let (false, Some(bgp)) = (evpn.is_empty(), &routing.bgp) {
+            // Each bridge's learned addresses under its VLAN ID (bird-rs 374d143).
+            let bridges: String = evpn
+                .iter()
+                .map(|(vid, vni)| format!(" ruster bridge \"{}\" vid {vid};", vni.bridge))
+                .collect();
+            let targets: Vec<String> = evpn
+                .iter()
+                .map(|(_, vni)| format!("(rt, {}, {}) ~ bgp_ext_community", bgp.asn, vni.vni))
+                .collect();
+            // Over SRv6 the label is a SID's function, not the VNI (one VNI then,
+            // which confd checks).
+            let by_label = match &evpn[..] {
+                [(_, vni)] if vni.encapsulation == "srv6" => format!(" ruster vni {};", vni.vni),
+                _ => String::new(),
             };
             let _ = write!(
                 out,
-                "  eth {{ table ruster_eth; export all; ruster bridge \"{}\"; }};\n  \
-                 evpn {{ table ruster_evpn; export where (rt, {}, {n}) ~ bgp_ext_community;{by_label} }};\n",
-                vni.bridge, bgp.asn
+                "  eth {{ table ruster_eth; export all;{bridges} }};\n  \
+                 evpn {{ table ruster_evpn; export where {};{by_label} }};\n",
+                targets.join(" || ")
             );
         }
         out.push_str("}\n");
@@ -155,63 +162,101 @@ fn link_local_for(neighbor: IpAddr, connected: &[Connected]) -> Option<Ipv6Addr>
     })
 }
 
-/// The VNI of the EVPN sessions of `bgp`, when it has any: there is one (confd
-/// checks it), of a name and addresses that fit the file.
-fn evpn_of<'a>(bgp: &Bgp, vnis: &'a [EvpnVni]) -> Result<Option<&'a EvpnVni>, String> {
+/// The VNIs of the EVPN sessions of `bgp`, when it has any, each with the VLAN ID
+/// that stands for its bridge in bird-rs's Ethernet table (1, 2, ... in the order
+/// of the VNIs): at least one (confd checks it), of names and addresses that fit
+/// the file, each VNI and bridge once, and over SRv6 only one VNI.
+fn evpn_of<'a>(bgp: &Bgp, vnis: &'a [EvpnVni]) -> Result<Vec<(u16, &'a EvpnVni)>, String> {
     if !bgp.neighbor.iter().any(|n| n.evpn) {
-        return Ok(None);
+        return Ok(Vec::new());
     }
-    let [vni] = vnis else {
-        return Err(format!("evpn takes one VNI, not {}", vnis.len()));
-    };
-    let name_fits = !vni.bridge.is_empty()
-        && vni
-            .bridge
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
-    // The RD `<router-id>:<VNI>` takes a two-octet number.
-    if !name_fits || !(1..=0xffff).contains(&vni.vni) {
-        return Err(format!("evpn: bridge {:?}, VNI {}", vni.bridge, vni.vni));
+    if vnis.is_empty() || vnis.len() > 4094 {
+        return Err(format!("evpn takes 1 to 4094 VNIs, not {}", vnis.len()));
     }
-    vni.router_address
-        .parse::<IpAddr>()
-        .map_err(|_| format!("evpn: router address {:?}", vni.router_address))?;
-    for sid in vni.unicast_sid.iter().chain(&vni.multicast_sid) {
-        sid.parse::<Ipv6Addr>()
-            .map_err(|_| format!("evpn: SID {sid:?}"))?;
+    let mut sorted: Vec<&EvpnVni> = vnis.iter().collect();
+    sorted.sort_by_key(|v| v.vni);
+    for (at, vni) in sorted.iter().enumerate() {
+        let name_fits = !vni.bridge.is_empty()
+            && vni
+                .bridge
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+        // The RD `<router-id>:<VNI>` takes a two-octet number.
+        if !name_fits || !(1..=0xffff).contains(&vni.vni) {
+            return Err(format!("evpn: bridge {:?}, VNI {}", vni.bridge, vni.vni));
+        }
+        let twice = sorted[..at]
+            .iter()
+            .any(|other| other.vni == vni.vni || other.bridge == vni.bridge);
+        if twice {
+            return Err(format!(
+                "evpn: VNI {} or bridge {:?} twice",
+                vni.vni, vni.bridge
+            ));
+        }
+        vni.router_address
+            .parse::<IpAddr>()
+            .map_err(|_| format!("evpn: router address {:?}", vni.router_address))?;
+        for sid in vni.unicast_sid.iter().chain(&vni.multicast_sid) {
+            sid.parse::<Ipv6Addr>()
+                .map_err(|_| format!("evpn: SID {sid:?}"))?;
+        }
     }
-    Ok(Some(vni))
+    if sorted.len() > 1 && sorted.iter().any(|v| v.encapsulation == "srv6") {
+        return Err("evpn: over SRv6, one VNI".into());
+    }
+    Ok(sorted
+        .into_iter()
+        .enumerate()
+        .map(|(at, vni)| (u16::try_from(at + 1).unwrap_or(u16::MAX), vni))
+        .collect())
 }
 
 /// The EVPN tables, the router's addresses on the default VRF's TUN device in
 /// tables of their own (so that a remote VTEP's address resolves through them,
 /// and they do not take the place of the networks announced, or of learned routes,
-/// in the main tables), and the `protocol evpn` of the VNI: RD
-/// `<router-id>:<VNI>` (RFC 7432 section 7.9, type 1), route target `<AS>:<VNI>`
-/// (RFC 8365 section 5.1.2.1), VXLAN from its local address or SRv6 with its SIDs.
-fn write_evpn(out: &mut String, bgp: &Bgp, vni: &EvpnVni) -> Result<(), String> {
-    let n = vni.vni;
-    let encapsulation = match (vni.encapsulation.as_str(), &vni.unicast_sid[..], &vni.multicast_sid[..]) {
-        ("vxlan", [], []) => format!("encapsulation vxlan {{ router address {}; }}", vni.router_address),
-        ("srv6", [unicast], [multicast]) => format!(
-            "encapsulation srv6 {{ unicast sid {unicast}; multicast sid {multicast}; router address {}; }}",
-            vni.router_address
-        ),
-        (other, ..) => return Err(format!("evpn: encapsulation {other:?}")),
-    };
-    let _ = writeln!(
-        out,
+/// in the main tables), and a `protocol evpn` per VNI: RD `<router-id>:<VNI>` (RFC
+/// 7432 section 7.9, type 1), route target `<AS>:<VNI>` (RFC 8365 section 5.1.2.1),
+/// VXLAN from its local address or SRv6 with its SIDs, and its VLAN ID: it takes
+/// only the Ethernet routes of that VLAN (bird-rs would take the others as its
+/// own).
+fn write_evpn(out: &mut String, bgp: &Bgp, evpn: &[(u16, &EvpnVni)]) -> Result<(), String> {
+    if evpn.is_empty() {
+        return Ok(());
+    }
+    out.push_str(
         "ipv4 table ruster_tun4;\n\
          ipv6 table ruster_tun6;\n\
-         protocol direct ruster_tun {{ ipv4 {{ table ruster_tun4; }}; ipv6 {{ table ruster_tun6; }}; \
-         interface \"rt-default\"; }}\n\
+         protocol direct ruster_tun { ipv4 { table ruster_tun4; }; ipv6 { table ruster_tun6; }; \
+         interface \"rt-default\"; }\n\
          evpn table ruster_evpn;\n\
-         eth table ruster_eth;\n\
-         protocol evpn ruster_evpn_{n} {{\n  eth {{ table ruster_eth; }};\n  \
-         evpn {{ table ruster_evpn; }};\n  {encapsulation};\n  rd {}:{n};\n  \
-         route target (rt, {}, {n});\n  vni {n};\n}}",
-        bgp.router_id, bgp.asn
+         eth table ruster_eth;\n",
     );
+    for (vid, vni) in evpn {
+        let n = vni.vni;
+        let encapsulation = match (
+            vni.encapsulation.as_str(),
+            &vni.unicast_sid[..],
+            &vni.multicast_sid[..],
+        ) {
+            ("vxlan", [], []) => format!(
+                "encapsulation vxlan {{ router address {}; }}",
+                vni.router_address
+            ),
+            ("srv6", [unicast], [multicast]) => format!(
+                "encapsulation srv6 {{ unicast sid {unicast}; multicast sid {multicast}; router address {}; }}",
+                vni.router_address
+            ),
+            (other, ..) => return Err(format!("evpn: encapsulation {other:?}")),
+        };
+        let _ = writeln!(
+            out,
+            "protocol evpn ruster_evpn_{n} {{\n  eth {{ table ruster_eth; export where net.vlan_id = {vid}; }};\n  \
+             evpn {{ table ruster_evpn; }};\n  {encapsulation};\n  rd {}:{n};\n  \
+             route target (rt, {}, {n});\n  vni {n};\n  vid {vid};\n}}",
+            bgp.router_id, bgp.asn
+        );
+    }
     Ok(())
 }
 
@@ -219,7 +264,7 @@ fn write_bgp(
     out: &mut String,
     bgp: &Bgp,
     connected: &[Connected],
-    evpn: Option<&EvpnVni>,
+    evpn: bool,
 ) -> Result<(), String> {
     let mut networks: [Vec<String>; 2] = Default::default();
     for text in &bgp.networks {
@@ -288,13 +333,11 @@ fn write_bgp(
         }
         out.push_str("  };\n");
         // EVPN: everything taken, only this router's own routes sent.
-        if let Some(vni) = evpn.filter(|_| neighbor.evpn) {
-            let _ = writeln!(
-                out,
-                "  evpn {{\n    table ruster_evpn;\n    import all;\n    \
-                 export where proto = \"ruster_evpn_{}\";\n    \
-                 igp table ruster_tun4;\n    igp table ruster_tun6;\n  }};",
-                vni.vni
+        if evpn && neighbor.evpn {
+            out.push_str(
+                "  evpn {\n    table ruster_evpn;\n    import all;\n    \
+                 export where proto ~ \"ruster_evpn_*\";\n    \
+                 igp table ruster_tun4;\n    igp table ruster_tun6;\n  };\n",
             );
         }
         out.push_str("}\n");
