@@ -9,7 +9,7 @@ After=ruster-netns.service ruster-confd.service ruster-ribd.service bird-rs.serv
 Type=notify
 NetworkNamespacePath=/run/netns/ruster
 # bird-rs (Type=simple) makes its control socket a little after it starts.
-ExecStartPre=/bin/sh -c 'for i in $(seq 1 50); do [ -S /run/bird-rs.ctl ] && exit 0; sleep 0.2; done; exit 1'
+ExecStartPre=/bin/sh -c 'i=0; while [ $$i -lt 50 ]; do [ -S /run/bird-rs.ctl ] && exit 0; i=$$((i + 1)); sleep 0.2; done; exit 1'
 ExecStart=/usr/local/bin/ruster-bird --birdc "/usr/local/bin/birdc-rs -s /run/bird-rs.ctl" /etc/bird-rs/bird.conf
 Restart=on-failure
 RestartSec=1

@@ -172,9 +172,10 @@ fn write_bgp(out: &mut String, bgp: &Bgp, connected: &[Connected]) -> Result<(),
 }
 
 /// How long a `birdc` command may take; it is stopped after this and counts as
-/// failed. The check and the configure fit together before confd stops waiting for
-/// an answer (30 s).
-pub const COMMAND_LIMIT: Duration = Duration::from_secs(12);
+/// failed. A take runs at most three (the check, the configure, and the configure
+/// of the file put back), which fit together before confd stops waiting for an
+/// answer (30 s).
+pub const COMMAND_LIMIT: Duration = Duration::from_secs(9);
 
 /// Writes bird-rs's configuration file and has bird-rs apply it.
 #[derive(Debug)]
