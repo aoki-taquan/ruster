@@ -171,8 +171,10 @@ FRRの代わりに経路デーモンのbird-rsを使うときの橋渡し役。�
   チャネルを足す（bird-rsだけ。FRRのFPMはEVPNを運ばないので、confdは`routing-daemon = "frr"`では断る）。
 - EVPNのVNIは、ブリッジのメンバーのVXLANとSRv6 EVPNのインターフェースから作る（confdが部分`bird`の`evpn`に
   入れる）。VNIは一台にいくつでもよいが、ブリッジごとに一つ（bird-rsの`protocol ruster`のethチャネルは、ブリッジ
-  ごとに`ruster bridge "<名前>" vid N`でVLAN IDを付けて一つの表に入れる。bird-rs 374d143以降）。VLAN IDはVNIの
-  小さい順に1、2、...で、VNIごとの`protocol evpn`はそのVLAN IDのEthernetの経路だけを取る。SRv6では一つだけ
+  ごとに`ruster bridge "<名前>" vid N`でVLAN IDを付けて一つの表に入れる。bird-rs 374d143以降）。VLAN IDは
+  4094までのVNIならVNIそのもの、それより大きいVNIには空いている番号を小さい順に割り当てる。ほかのVNIを足し引き
+  してもずれないようにするため。VNIごとの`protocol evpn`は、そのVLAN IDのEthernetの経路だけを取る。VNIを足し引き
+  するとbird-rsは`protocol ruster`を作り直すので、そのあいだribdからbird-rsの経路が一度消えて戻る。SRv6では一つだけ
   （`protocol ruster`の`ruster vni`が一つのため）。RDの`<router-id>:<VNI>`の番号は2オクテットなので、65535を
   超えるVNIは断る。遠くのVTEP（SRv6では相手のアドレス）は、default VRFの直結のプレフィックスの
   中にあるものだけ解決する（EVPNの次の転送先はTUNの直結の経路の表だけで引くため）。BGPで学んだループバックの

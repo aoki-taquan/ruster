@@ -253,10 +253,10 @@ fn an_evpn_neighbor_gets_the_vni_s_protocol_evpn_and_protocol_ruster_its_bridge(
         "  encapsulation vxlan { router address 10.0.0.1; };",
         "  rd 198.51.100.1:100;",
         "  route target (rt, 65001, 100);",
-        "    export where proto ~ \"ruster_evpn_*\";",
-        "  eth { table ruster_eth; export where net.vlan_id = 1; };",
-        "  vid 1;",
-        "  eth { table ruster_eth; export all; ruster bridge \"br0\" vid 1; };",
+        "    export where proto = \"ruster_evpn_100\";",
+        "  eth { table ruster_eth; export where net.vlan_id = 100; };",
+        "  vid 100;",
+        "  eth { table ruster_eth; export all; ruster bridge \"br0\" vid 100; };",
         "  evpn { table ruster_evpn; export where (rt, 65001, 100) ~ bgp_ext_community; };",
     ] {
         assert!(text.lines().any(|l| l == line), "{line}\n{text}");
@@ -422,16 +422,21 @@ fn two_vnis_get_a_protocol_evpn_and_a_vlan_id_each() {
     let mut second = evpn_vni("vxlan");
     second.vni = 200;
     second.bridge = "br1".into();
-    // Given in another order: VLAN IDs go by VNI.
-    part.evpn = vec![second.clone(), evpn_vni("vxlan")];
+    // VNIs up to 4094 are their own VLAN IDs; a larger one takes a free one.
+    let mut third = evpn_vni("vxlan");
+    third.vni = 5000;
+    third.bridge = "br2".into();
+    part.evpn = vec![second.clone(), third, evpn_vni("vxlan")];
     let text = config(&part, "", "/run/ruster").unwrap();
     for line in [
         "protocol evpn ruster_evpn_100 {",
         "protocol evpn ruster_evpn_200 {",
-        "  eth { table ruster_eth; export where net.vlan_id = 2; };",
+        "  eth { table ruster_eth; export where net.vlan_id = 200; };",
+        "  eth { table ruster_eth; export where net.vlan_id = 1; };",
         "  route target (rt, 65001, 200);",
-        "  eth { table ruster_eth; export all; ruster bridge \"br0\" vid 1; ruster bridge \"br1\" vid 2; };",
-        "  evpn { table ruster_evpn; export where (rt, 65001, 100) ~ bgp_ext_community || (rt, 65001, 200) ~ bgp_ext_community; };",
+        "  eth { table ruster_eth; export all; ruster bridge \"br0\" vid 100; ruster bridge \"br1\" vid 200; ruster bridge \"br2\" vid 1; };",
+        "  evpn { table ruster_evpn; export where (rt, 65001, 100) ~ bgp_ext_community || (rt, 65001, 200) ~ bgp_ext_community || (rt, 65001, 5000) ~ bgp_ext_community; };",
+        "    export where proto = \"ruster_evpn_100\" || proto = \"ruster_evpn_200\" || proto = \"ruster_evpn_5000\";",
     ] {
         assert!(text.lines().any(|l| l == line), "{line}\n{text}");
     }
