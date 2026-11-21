@@ -178,7 +178,8 @@ FRRの代わりに経路デーモンのbird-rsを使うときの橋渡し役。�
   （`protocol ruster`の`ruster vni`が一つのため）。RDの`<router-id>:<VNI>`の番号は2オクテットなので、65535を
   超えるVNIは断る。
 - BGPの次の転送先（IBGP、multihop、EVPNの遠くのVTEP）は、bird-rsの別の表（`ruster_tun4`、`ruster_tun6`）で
-  引く。その表には、default VRFのTUNの直結の経路と、IS-ISとOSPFの経路（`protocol pipe`で写す）を置く。主の表に
+  引く。その表には、default VRFのTUNの直結の経路と、IS-IS、OSPF、includeの`protocol static`の経路（`protocol pipe`で
+  写す）を置く。includeでは、`ruster_`で始まる名前のprotocolや表を使わない（ruster-birdのもの）。主の表に
   直結の経路を入れると、`networks`の広告や学んだ経路の代わりに選ばれてしまうため。BGPで学んだ経路の先にある
   次の転送先と、VXLANの`underlay-vrf`がdefaultでないものは、今は解決しない。bird-rsの`protocol evpn`を一つ置き、RDは`<router-id>:<VNI>`（RFC 7432の7.9のtype 1）、route targetは`<AS>:<VNI>`
   （RFC 8365の5.1.2.1の自動の形）、VXLANは`router address`にインターフェースのlocalを、SRv6はその

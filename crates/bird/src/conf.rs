@@ -49,7 +49,9 @@
 //!
 //! Deviations: none of BGP itself is here; bird-rs implements it. A next hop (a
 //! remote VTEP too) resolves only on a connected prefix of the default VRF or
-//! through an IS-IS or OSPF route, not through a BGP route ([`NEXT_HOP_TABLES`]). Each VNI has a bridge of its own,
+//! through an IS-IS, OSPF or include-file static route, not through a BGP route
+//! ([`NEXT_HOP_TABLES`]). The include file names none of its protocols or tables
+//! `ruster_*`: those are ruster-bird's. Each VNI has a bridge of its own,
 //! and over SRv6 there is one VNI (`protocol ruster` takes one VNI in place of the
 //! label). A VNI above 65535 does not fit the RD's number and is refused.
 
@@ -147,15 +149,17 @@ pub fn config(routing: &Frr, include: &str, run_dir: &str) -> Result<String, Str
 }
 
 /// The tables BGP's next hops resolve through: the router's addresses on the
-/// default VRF's TUN device (confd puts them there) and the IS-IS and OSPF routes.
+/// default VRF's TUN device (confd puts them there), the IS-IS and OSPF routes, and
+/// the static routes of the operator's include file (a route to an IBGP peer's
+/// loopback, say).
 /// They are kept out of the main tables, where the connected routes would take the
 /// place of the networks announced (and of learned routes): the main tables hold
 /// what goes to ribd.
 pub const NEXT_HOP_TABLES: &str = "ipv4 table ruster_tun4;
 ipv6 table ruster_tun6;
 protocol direct ruster_tun { ipv4 { table ruster_tun4; }; ipv6 { table ruster_tun6; }; interface \"rt-default\"; }
-protocol pipe ruster_igp4 { table master4; peer table ruster_tun4; import none; export where source ~ [RTS_ISIS, RTS_OSPF, RTS_OSPF_IA, RTS_OSPF_EXT1, RTS_OSPF_EXT2]; }
-protocol pipe ruster_igp6 { table master6; peer table ruster_tun6; import none; export where source ~ [RTS_ISIS, RTS_OSPF, RTS_OSPF_IA, RTS_OSPF_EXT1, RTS_OSPF_EXT2]; }
+protocol pipe ruster_igp4 { table master4; peer table ruster_tun4; import none; export where source ~ [RTS_ISIS, RTS_OSPF, RTS_OSPF_IA, RTS_OSPF_EXT1, RTS_OSPF_EXT2] || (source = RTS_STATIC && proto !~ \"ruster_*\"); }
+protocol pipe ruster_igp6 { table master6; peer table ruster_tun6; import none; export where source ~ [RTS_ISIS, RTS_OSPF, RTS_OSPF_IA, RTS_OSPF_EXT1, RTS_OSPF_EXT2] || (source = RTS_STATIC && proto !~ \"ruster_*\"); }
 ";
 
 /// The sources of the routes given to ribd: BGP, IS-IS and OSPF (not the routes of
