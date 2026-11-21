@@ -260,15 +260,17 @@
 //!                              # IPv6 one via the address DHCPv6 replies come from
 //! punt-rate = 20               # optional, as in [[dhcp]]; these when left out
 //! punt-burst = 20
-//! [bgp]                        # optional: BGP in the default VRF (FRR's bgpd,
-//!                              # through ruster-frr)
+//! [bgp]                        # optional: BGP in the default VRF, run by the
+//!                              # routing-daemon (FRR's bgpd or bird-rs)
 //! as = 65001                   # the router's AS number
 //! router-id = "198.51.100.1"   # optional: the first ipv4 address of the default
 //!                              # VRF's enabled interfaces when left out
 //! networks = ["203.0.113.0/24", "2001:db8:5::/48"]  # optional: the prefixes it
-//!                              # announces, always (FRR sees no route of the FE)
-//! include = "/etc/ruster/frr-extra.conf"  # optional: FRR settings that ruster-frr
-//!                              # adds to FRR's configuration as they are
+//!                              # announces, always (the daemon sees no route of
+//!                              # the FE)
+//! include = "/etc/ruster/frr-extra.conf"  # optional: settings of the daemon's
+//!                              # own form that ruster-frr or ruster-bird adds as
+//!                              # they are
 //!
 //! [[bgp.neighbor]]
 //! address = "198.51.100.10"    # not link-local; off the links (multihop)
@@ -277,11 +279,12 @@
 //! remote-as = 65002
 //! description = "upstream"     # optional
 //! evpn = true                  # optional: the session also carries EVPN (bird-rs
-//!                              # only; one VNI, from the bridge's VXLAN or
-//!                              # srv6-evpn member)
+//!                              # only) for each bridge with a VXLAN or srv6-evpn
+//!                              # member: one VNI a bridge, VNIs up to 65535, and
+//!                              # with srv6-evpn only that one VNI
 //!
-//! [isis]                       # optional: IS-IS in the default VRF (FRR's isisd,
-//!                              # through ruster-frr, on the TAP rp-<interface>)
+//! [isis]                       # optional: IS-IS in the default VRF, run by the
+//!                              # routing-daemon on the TAP rp-<interface>
 //! net = "49.0001.1921.6800.1001.00"  # the area, the system ID and NSEL 00
 //! level = "level-1-2"          # optional, the default; or "level-1", "level-2"
 //!
@@ -290,8 +293,8 @@
 //! metric = 10                  # optional, 10 when left out (wide metrics)
 //! passive = false              # optional: announce it, but form no adjacency
 //!
-//! [ospf]                       # optional: OSPFv2 in the default VRF (FRR's ospfd);
-//!                              # [ospf6] takes the same keys for OSPFv3 (ospf6d)
+//! [ospf]                       # optional: OSPFv2 in the default VRF, run by the
+//!                              # routing-daemon; [ospf6] takes the same keys for OSPFv3
 //! router-id = "198.51.100.1"   # optional: as for [bgp]
 //! area = "0.0.0.0"             # optional: the area of the interfaces that name
 //!                              # none; the backbone when left out
