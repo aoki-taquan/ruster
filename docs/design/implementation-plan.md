@@ -185,13 +185,12 @@ backlogと同じく、使う場面が出たものから片付ける。
 
 `ruster-bird`を作る。全体の設定の`[bgp]`、EVPN、`[isis]`、`[ospf]`、`[ospf6]`の部分からbird-rsの設定を作って反映し、
 bird-rsをribdの送り手とFEの状態の読み手につなぐ（bird-rsの`protocol ruster`）。FRRの橋渡し役と同じ形にし、
-IS-ISとOSPFはFRRと同じTAPで動かす。次の順に作る。
+IS-ISとOSPFはFRRと同じTAPで動かす。設計は`router-box.md`の「bird-rs（`ruster-bird`）」。次の順に作る。
 
-1. 設計: 全体の設定の形（FRRと同じ`[bgp]`を使うか、どちらのデーモンを使うかの選び方）、bird.confの作り方、
-   反映（`birdc configure`）、送り手の名前とribdの起動の引数、netnsの試験。設計図に書く。
-2. BGPのIPv4とIPv6のunicast。
-3. EVPN（VXLANとSRv6）。
-4. IS-IS、OSPFv2、OSPFv3（TAPの上）。
+1. 全体の設定の`routing-daemon`と、`ruster-bird`の骨組み（部分の受け取り、bird.confの生成、`birdc`での反映）、
+   BGPのIPv4とIPv6のunicast。
+2. EVPN（VXLANとSRv6）。
+3. IS-IS、OSPFv2、OSPFv3（TAPの上）。
 
 #### 経路や通信の数が増えたとき
 
