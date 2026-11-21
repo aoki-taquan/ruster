@@ -105,6 +105,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruster-bird"
+version = "0.2.0"
+dependencies = [
+ "ruster-confd",
+ "ruster-config",
+ "ruster-proto",
+]
+
+[[package]]
 name = "ruster-cli"
 version = "0.2.0"
 dependencies = [

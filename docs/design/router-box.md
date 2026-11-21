@@ -178,9 +178,9 @@ FRRの代わりに経路デーモンのbird-rsを使うときの橋渡し役。�
   付けて起動する。次の転送先がTAP（`rp-<名前>`）のものは、bird-rsがFEのインターフェースの名前に戻して渡す。
   EVPNの表`ruster-evpn`も同じ接続で書き、FEの状態の`learned-entry`は`fe/state.sock`をobserveして読む
   （[`overlay.md`](overlay.md)の7.）。
-- IS-ISとOSPFの経路は、bird-rsの`protocol kernel`でkernelのdefault VRFの表にも入れる。TAPから出てくる
-  ルータ自身の通信（iBGP、OSPFv2の近隣へのユニキャスト）は、kernelがその経路で出すため（FRRのzebraと同じ）。
-  BGPの経路はkernelに入れない。
+- 経路はkernelに入れない（bird-rsの`protocol kernel`は使わない）。ルータ自身の通信は、confdが入れるTUN向けの
+  default経路でFEへ渡り、FEがribdの選んだ経路で転送する。kernelにTAP向けの経路があると、ルータ自身の
+  パケットがribdの選択を飛び越えるため（bird-rsの`docs/RUSTER.md`）。
 - 送り出しは`networks`だけにする（FRRと同じ、RFC 8212）。取り込みは全部受ける。
 - 反映: `ruster-bird`は`confd/part/bird/part.sock`でモジュール`bird`を受け取り、bird.confを全部作る。まず
   `birdc configure check "<新しいファイル>"`で確かめ、`8002`ならファイルを替えずに断る。通れば置き換えて
@@ -190,9 +190,10 @@ FRRの代わりに経路デーモンのbird-rsを使うときの橋渡し役。�
 - bird-rsはsystemdが起動する（`-f`、`Type=simple`、kernelのnetnsで）。設定が読めないと起動しないので、
   `ruster-bird`の初回の反映より前は、unitの`ExecStartPre`で最小のbird.confを置く。制御のsocketは`-g`で
   `ruster-bird`のグループに渡す。bird-rsはribdとFEのsocketが無いあいだ自分で繋ぎ直すので、起動の順番は問わない。
-- BGPのTCPはkernelで終端する（TUN経由）。IPv6の近隣へ広告する次の転送先のlink-localと、受けた経路の
-  次の転送先の扱いは、FRRと同じ問題（TUNのlink-localにFEが答えない）があり、BGPのunicastを作るときに
-  bird-rsのどの設定で行うかを決めて、ここに書く。
+- BGPのTCPはkernelで終端する（TUN経由）。IPv6の近隣へ広告する次の転送先のlink-localは、近隣のいる
+  インターフェースのもの（MACから作る）を`next hop link local`で渡す（bird-rsは近隣の見つかったデバイス、
+  つまりTUNのlink-localを付けるが、FEはそれに答えない）。受けた経路はグローバルの次の転送先を使う
+  （`next hop prefer global`）。
 - 試験: netns `bgp`、`isis`、`ospf`、`evpn`と同じ構成で、FRRの代わりにbird-rsを動かす。bird-rsのビルド物は
   環境変数で渡す。
 
