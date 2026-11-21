@@ -169,7 +169,9 @@ pub struct Config {
     /// and once each: a value found at run time ([`delegated`]), which confd hands
     /// `ruster-unbound` beside the `dns` part.
     pub dns_found: Vec<IpAddr>,
-    /// BGP, checked; confd hands it to `ruster-frr` ([`bgp`]).
+    /// The routing daemon that runs BGP, IS-IS and OSPF: its bridge takes them.
+    pub routing_daemon: ruster_config::RoutingDaemon,
+    /// BGP, checked; confd hands it to `ruster-frr` or `ruster-bird` ([`bgp`]).
     pub bgp: Option<ruster_config::Bgp>,
     /// The bridges, checked; their own interfaces are in `interfaces` ([`bridge`]).
     pub bridges: Vec<bridge::Bridge>,
@@ -1233,6 +1235,7 @@ mod tests {
             dhcp_client: Vec::new(),
             map_e_from: None,
             dns_found: Vec::new(),
+            routing_daemon: Default::default(),
             bgp: None,
             isis: None,
             ospf: None,
@@ -1304,6 +1307,7 @@ mod tests {
             dhcp_client: Vec::new(),
             map_e_from: None,
             dns_found: Vec::new(),
+            routing_daemon: Default::default(),
             bgp: None,
             isis: None,
             ospf: None,
