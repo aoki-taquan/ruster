@@ -25,13 +25,28 @@
 //! configuration before when it cannot read a file, so a refused part changes
 //! nothing.
 //!
+//! With a neighbor of `evpn = true`, also the EVPN parts: the router's addresses on
+//! the TUN device in tables of their own (`protocol direct ruster_tun`, which the
+//! EVPN channels resolve next hops through), the EVPN and Ethernet tables, the
+//! `protocol evpn` of the VNI, an `evpn` channel on those neighbors, and in
+//! `protocol ruster` the bridge's learned addresses (`eth`) and the EVPN routes of
+//! the VNI's route target (`evpn`). Turning EVPN on or off restarts `protocol
+//! ruster` and those sessions (bird-rs restarts a protocol whose channels change):
+//! ribd gets the routes again.
+//!
 //! # Standards
 //!
 //! - RFC 8212: eBGP routes are taken and sent only through an explicit policy (the
 //!   channels' import and export filters).
-//! - RFC 4760: an IPv4 neighbor carries IPv4 unicast, an IPv6 neighbor IPv6 unicast.
+//! - RFC 4760: an IPv4 neighbor carries IPv4 unicast, an IPv6 neighbor IPv6 unicast;
+//!   an EVPN neighbor also l2vpn evpn (RFC 7432).
+//! - RFC 7432 section 7.9: the RD is of type 1, `<router-id>:<VNI>`. RFC 8365 section
+//!   5.1.2.1: the route target is `<AS>:<VNI>`. RFC 9252 section 6: over SRv6 the
+//!   router's End.DT2U and End.DT2M SIDs.
 //!
-//! Deviations: none of BGP itself is here; bird-rs implements it.
+//! Deviations: none of BGP itself is here; bird-rs implements it. One EVPN
+//! instance (VNI) per router; a VNI above 65535 does not fit the RD's number and is
+//! refused, as is a route target of a four-octet AS with such a VNI.
 
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
@@ -134,7 +149,8 @@ fn evpn_of<'a>(bgp: &Bgp, vnis: &'a [EvpnVni]) -> Result<Option<&'a EvpnVni>, St
             .bridge
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
-    if !name_fits || !(1..=0x00ff_ffff).contains(&vni.vni) {
+    // The RD `<router-id>:<VNI>` takes a two-octet number.
+    if !name_fits || !(1..=0xffff).contains(&vni.vni) {
         return Err(format!("evpn: bridge {:?}, VNI {}", vni.bridge, vni.vni));
     }
     vni.router_address
@@ -147,8 +163,10 @@ fn evpn_of<'a>(bgp: &Bgp, vnis: &'a [EvpnVni]) -> Result<Option<&'a EvpnVni>, St
     Ok(Some(vni))
 }
 
-/// The EVPN tables, the router's addresses on the TUN device (so that a remote
-/// VTEP's address resolves), and the `protocol evpn` of the VNI: RD
+/// The EVPN tables, the router's addresses on the default VRF's TUN device in
+/// tables of their own (so that a remote VTEP's address resolves through them,
+/// and they do not take the place of the networks announced, or of learned routes,
+/// in the main tables), and the `protocol evpn` of the VNI: RD
 /// `<router-id>:<VNI>` (RFC 7432 section 7.9, type 1), route target `<AS>:<VNI>`
 /// (RFC 8365 section 5.1.2.1), VXLAN from its local address or SRv6 with its SIDs.
 fn write_evpn(out: &mut String, bgp: &Bgp, vni: &EvpnVni) -> Result<(), String> {
@@ -163,7 +181,10 @@ fn write_evpn(out: &mut String, bgp: &Bgp, vni: &EvpnVni) -> Result<(), String> 
     };
     let _ = writeln!(
         out,
-        "protocol direct ruster_tun {{ ipv4; ipv6; interface \"rt-*\"; }}\n\
+        "ipv4 table ruster_tun4;\n\
+         ipv6 table ruster_tun6;\n\
+         protocol direct ruster_tun {{ ipv4 {{ table ruster_tun4; }}; ipv6 {{ table ruster_tun6; }}; \
+         interface \"rt-default\"; }}\n\
          evpn table ruster_evpn;\n\
          eth table ruster_eth;\n\
          protocol evpn ruster_evpn_{n} {{\n  eth {{ table ruster_eth; }};\n  \
@@ -251,7 +272,8 @@ fn write_bgp(
             let _ = writeln!(
                 out,
                 "  evpn {{\n    table ruster_evpn;\n    import all;\n    \
-                 export where proto = \"ruster_evpn_{}\";\n  }};",
+                 export where proto = \"ruster_evpn_{}\";\n    \
+                 igp table ruster_tun4;\n    igp table ruster_tun6;\n  }};",
                 vni.vni
             );
         }

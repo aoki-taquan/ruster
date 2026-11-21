@@ -271,16 +271,17 @@ pub fn evpn_vnis(
 }
 
 /// Checks the EVPN sessions of `bgp`: bird-rs only, one VNI (bird-rs's `protocol
-/// ruster` reads one bridge's learned addresses), and route targets `<AS>:<VNI>`
-/// that fit a two-octet AS or a two-octet VNI (RFC 4360 section 3.1, RFC 5668).
+/// ruster` reads one bridge's learned addresses), and a VNI of at most 65535: the
+/// RD `<router-id>:<VNI>` takes a two-octet number (RFC 4364 section 4.2, type 1),
+/// and so the route target `<AS>:<VNI>` fits a four-octet AS too (RFC 5668).
 pub(crate) fn check_evpn(
     bgp: Option<&ruster_config::Bgp>,
     daemon: ruster_config::RoutingDaemon,
     vnis: &[ruster_config::EvpnVni],
 ) -> Result<(), String> {
-    let Some(bgp) = bgp.filter(|b| b.neighbor.iter().any(|n| n.evpn)) else {
+    if !bgp.is_some_and(|b| b.neighbor.iter().any(|n| n.evpn)) {
         return Ok(());
-    };
+    }
     if daemon != ruster_config::RoutingDaemon::BirdRs {
         return Err("bgp: a neighbor with evpn needs routing-daemon = \"bird-rs\"".into());
     }
@@ -290,10 +291,11 @@ pub(crate) fn check_evpn(
             vnis.len()
         ));
     };
-    if bgp.asn > 0xffff && vni.vni > 0xffff {
+    // The RD `<router-id>:<VNI>` (type 1) takes a two-octet number.
+    if vni.vni > 0xffff {
         return Err(format!(
-            "bgp: the route target {}:{} fits neither a two-octet AS nor a two-octet VNI",
-            bgp.asn, vni.vni
+            "bgp: evpn takes a VNI of at most 65535 (the RD's number), not {}",
+            vni.vni
         ));
     }
     Ok(())

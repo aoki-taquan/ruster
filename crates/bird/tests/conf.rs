@@ -255,7 +255,9 @@ fn an_evpn_neighbor_gets_the_vni_s_protocol_evpn_and_protocol_ruster_its_bridge(
     part.evpn = vec![evpn_vni("vxlan")];
     let text = config(&part, "", "/run/ruster").unwrap();
     for line in [
-        "protocol direct ruster_tun { ipv4; ipv6; interface \"rt-*\"; }",
+        "ipv4 table ruster_tun4;",
+        "protocol direct ruster_tun { ipv4 { table ruster_tun4; }; ipv6 { table ruster_tun6; }; interface \"rt-default\"; }",
+        "    igp table ruster_tun4;",
         "protocol evpn ruster_evpn_100 {",
         "  encapsulation vxlan { router address 10.0.0.1; };",
         "  rd 198.51.100.1:100;",
@@ -282,5 +284,10 @@ fn an_evpn_neighbor_gets_the_vni_s_protocol_evpn_and_protocol_ruster_its_bridge(
     let mut bad = evpn_vni("vxlan");
     bad.bridge = "br\"0".into();
     part.evpn = vec![bad];
+    assert!(config(&part, "", "/run/ruster").is_err());
+    // A VNI the RD's two-octet number does not take.
+    let mut big = evpn_vni("vxlan");
+    big.vni = 70_000;
+    part.evpn = vec![big];
     assert!(config(&part, "", "/run/ruster").is_err());
 }

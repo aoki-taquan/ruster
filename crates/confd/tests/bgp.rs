@@ -228,4 +228,7 @@ fn an_evpn_neighbor_needs_bird_rs_and_one_vni_and_the_bird_part_has_it() {
     let vx1 = "\n[[interface]]\nname = \"vx1\"\nvxlan = { vni = 200, local = \"198.51.100.1\" }\n";
     let error = file::parse(&evpn("bird-rs", vx1, "\"p1\", \"vx0\", \"vx1\"")).unwrap_err();
     assert!(error.contains("one VXLAN or srv6-evpn"), "{error}");
+    let big = one.replace("vni = 100,", "vni = 70000,");
+    let error = file::parse(&big).unwrap_err();
+    assert!(error.contains("at most 65535"), "{error}");
 }

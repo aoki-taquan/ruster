@@ -66,7 +66,7 @@ for h in "$a:a0:192.0.2.10" "$b:b0:192.0.2.20"; do
   nsx "$ns" ip link set "$dev" up
 done
 
-config() { # router dir, p1's MAC, wan's MAC, wan address, far wan
+config() { # router dir, p1's MAC, wan's MAC, wan address, far wan, networks
   mkdir -p "$work/$1/run"
   chmod 0700 "$work/$1/run"
   cat > "$work/$1/router.toml" <<TOML
@@ -91,6 +91,7 @@ bridge = { members = ["p1", "vx0"] }
 
 [bgp]
 as = 65000
+networks = [$6]
 include = "$work/$1/include.conf"
 
 [[bgp.neighbor]]
@@ -132,8 +133,8 @@ wait_show() { # router dir, namespace, pattern, present (1) or gone (0)
 }
 pings() { nsx "$1" ping -c 1 -W 1 "$2" >/dev/null 2>&1; }
 
-config r1 02:00:00:00:01:01 02:00:00:00:01:02 10.0.0.1 10.0.0.2
-config r2 02:00:00:00:02:01 02:00:00:00:02:02 10.0.0.2 10.0.0.1
+config r1 02:00:00:00:01:01 02:00:00:00:01:02 10.0.0.1 10.0.0.2 '"10.0.0.0/24"'
+config r2 02:00:00:00:02:01 02:00:00:00:02:02 10.0.0.2 10.0.0.1 ""
 start r1 "$r1"
 start r2 "$r2"
 
@@ -158,6 +159,11 @@ wait_show r2 "$r2" "^evpn-mac vni 100 $a_mac vtep 10.0.0.1" 1 ||
   fail "r2's ribd has no MAC of a: $(show r2 "$r2" | grep evpn)"
 wait_show r1 "$r1" "^evpn-mac vni 100 $b_mac vtep 10.0.0.2" 1 || fail "r1's ribd has no MAC of b"
 echo "ok: the MAC addresses each FE learned reach the other's ribd (type 2)"
+
+# r1 announces its own connected prefix as a network, EVPN or not.
+learned=$(nsx "$r2" "$bird/birdc-rs" -s "$work/r2/bird.ctl" show route for 10.0.0.0/24 all 2>&1)
+grep -q "BGP" <<<"$learned" || fail "r2 has no BGP route to r1's network 10.0.0.0/24: $learned"
+echo "ok: a network that is a connected prefix is still announced with EVPN on"
 
 kill "$bird_r2"
 wait_show r1 "$r1" "^evpn-flood vni 100 vtep 10.0.0.2" 0 ||
