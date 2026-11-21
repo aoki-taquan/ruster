@@ -9,8 +9,13 @@ for backend in af-xdp af-packet; do
   for test in "$here"/netns-*.sh; do
     name=$(basename "$test" .sh)
     [[ "$name" == netns-all ]] && continue
-    if FE_BACKEND=$backend bash "$test" "$bin" >/dev/null 2>&1; then
+    FE_BACKEND=$backend bash "$test" "$bin" >/dev/null 2>&1
+    status=$?
+    if (( status == 0 )); then
       echo "pass  $backend $name"
+    elif (( status == 77 )); then
+      # The software it needs is not there (BIRD_RS for bird-rs).
+      echo "skip  $backend $name"
     else
       echo "FAIL  $backend $name"
       failed+=("$backend $name")
