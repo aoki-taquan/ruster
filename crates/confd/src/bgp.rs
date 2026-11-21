@@ -270,10 +270,12 @@ pub fn evpn_vnis(
     out
 }
 
-/// Checks the EVPN sessions of `bgp`: bird-rs only, one VNI (bird-rs's `protocol
-/// ruster` reads one bridge's learned addresses), and a VNI of at most 65535: the
-/// RD `<router-id>:<VNI>` takes a two-octet number (RFC 4364 section 4.2, type 1),
-/// and so the route target `<AS>:<VNI>` fits a four-octet AS too (RFC 5668).
+/// Checks the EVPN sessions of `bgp`: bird-rs only; at least one VNI, each with a
+/// bridge of its own (bird-rs's `protocol ruster` gives each bridge a VLAN ID of
+/// its Ethernet table) and once; over SRv6 one VNI (`protocol ruster` takes one in
+/// place of the label); and VNIs of at most 65535: the RD `<router-id>:<VNI>` takes
+/// a two-octet number (RFC 4364 section 4.2, type 1), and so the route target
+/// `<AS>:<VNI>` fits a four-octet AS too (RFC 5668).
 pub(crate) fn check_evpn(
     bgp: Option<&ruster_config::Bgp>,
     daemon: ruster_config::RoutingDaemon,
@@ -285,18 +287,29 @@ pub(crate) fn check_evpn(
     if daemon != ruster_config::RoutingDaemon::BirdRs {
         return Err("bgp: a neighbor with evpn needs routing-daemon = \"bird-rs\"".into());
     }
-    let [vni] = vnis else {
-        return Err(format!(
-            "bgp: evpn takes one VXLAN or srv6-evpn bridge member, not {}",
-            vnis.len()
-        ));
-    };
-    // The RD `<router-id>:<VNI>` (type 1) takes a two-octet number.
-    if vni.vni > 0xffff {
-        return Err(format!(
-            "bgp: evpn takes a VNI of at most 65535 (the RD's number), not {}",
-            vni.vni
-        ));
+    if vnis.is_empty() {
+        return Err("bgp: evpn needs a VXLAN or srv6-evpn bridge member".into());
+    }
+    for (at, vni) in vnis.iter().enumerate() {
+        // The RD `<router-id>:<VNI>` (type 1) takes a two-octet number.
+        if vni.vni > 0xffff {
+            return Err(format!(
+                "bgp: evpn takes a VNI of at most 65535 (the RD's number), not {}",
+                vni.vni
+            ));
+        }
+        if let Some(other) = vnis[..at].iter().find(|o| o.bridge == vni.bridge) {
+            return Err(format!(
+                "bgp: evpn takes one VNI per bridge; {} has {} and {}",
+                vni.bridge, other.vni, vni.vni
+            ));
+        }
+        if vnis[..at].iter().any(|o| o.vni == vni.vni) {
+            return Err(format!("bgp: evpn VNI {} twice", vni.vni));
+        }
+    }
+    if vnis.len() > 1 && vnis.iter().any(|v| v.encapsulation == "srv6") {
+        return Err("bgp: over srv6-evpn, evpn takes one VNI".into());
     }
     Ok(())
 }

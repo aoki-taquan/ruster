@@ -7,6 +7,8 @@
 #
 #   a (192.0.2.10) -- p1 [r1 br0: p1, vx0] wan 10.0.0.1 ===== 10.0.0.2 wan [r2 br0: p1, vx0] p1 -- b (192.0.2.20)
 #
+# A second VNI (200) bridges p2 with vx1 the same way, for c and d.
+#
 # a and b reach each other at L2; each ribd has the other's flood VTEP and host MAC;
 # when r2's bird-rs stops, r1's entries go. Needs bird-rs and birdc-rs: BIRD_RS is
 # the directory that holds them (exit 77, skipped, without). Run as root after
@@ -23,13 +25,13 @@ if [[ -z "$bird" || ! -x "$bird/bird-rs" || ! -x "$bird/birdc-rs" ]]; then
 fi
 bird=$(realpath "$bird")
 tag=rbe$$
-a=$tag-a b=$tag-b r1=$tag-r1 r2=$tag-r2
+a=$tag-a b=$tag-b c=$tag-c d=$tag-d r1=$tag-r1 r2=$tag-r2
 work=$(mktemp -d)
 pids=()
 cleanup() {
   for pid in ${pids[@]+"${pids[@]}"}; do kill "$pid" 2>/dev/null || true; done
   wait 2>/dev/null || true
-  for ns in "$a" "$b" "$r1" "$r2"; do ip netns del "$ns" 2>/dev/null || true; done
+  for ns in "$a" "$b" "$c" "$d" "$r1" "$r2"; do ip netns del "$ns" 2>/dev/null || true; done
   if [[ "${keep_logs:-}" == 1 ]]; then echo "logs in $work"; else rm -rf "$work"; fi
 }
 trap cleanup EXIT
@@ -39,7 +41,7 @@ fail() {
   exit 1
 }
 nsx() { ip netns exec "$@"; }
-for ns in "$a" "$b" "$r1" "$r2"; do ip netns add "$ns"; done
+for ns in "$a" "$b" "$c" "$d" "$r1" "$r2"; do ip netns add "$ns"; done
 for r in "$r1" "$r2"; do
   nsx "$r" sysctl -qw net.ipv4.ip_forward=0
   nsx "$r" ip link add vrf-ports type vrf table 999
@@ -53,12 +55,16 @@ port() { # router, its port, the port's MAC
 }
 ip link add p1 netns "$r1" type veth peer name a0 netns "$a"
 ip link add p1 netns "$r2" type veth peer name b0 netns "$b"
+ip link add p2 netns "$r1" type veth peer name c0 netns "$c"
+ip link add p2 netns "$r2" type veth peer name d0 netns "$d"
 ip link add wan netns "$r1" type veth peer name wan netns "$r2"
 port "$r1" p1 02:00:00:00:01:01
 port "$r1" wan 02:00:00:00:01:02
 port "$r2" p1 02:00:00:00:02:01
 port "$r2" wan 02:00:00:00:02:02
-for h in "$a:a0:192.0.2.10" "$b:b0:192.0.2.20"; do
+port "$r1" p2 02:00:00:00:01:03
+port "$r2" p2 02:00:00:00:02:03
+for h in "$a:a0:192.0.2.10" "$b:b0:192.0.2.20" "$c:c0:198.51.100.10" "$d:d0:198.51.100.20"; do
   IFS=: read -r ns dev address <<<"$h"
   nsx "$ns" ethtool -K "$dev" tx off >/dev/null 2>&1 || true
   nsx "$ns" sysctl -qw "net.ipv6.conf.$dev.disable_ipv6=1"
@@ -89,6 +95,18 @@ vxlan = { vni = 100, local = "$4" }
 name = "br0"
 bridge = { members = ["p1", "vx0"] }
 
+[[interface]]
+name = "p2"
+mac = "${2%:*}:03"
+
+[[interface]]
+name = "vx1"
+vxlan = { vni = 200, local = "$4" }
+
+[[interface]]
+name = "br1"
+bridge = { members = ["p2", "vx1"] }
+
 [bgp]
 as = 65000
 networks = [$6]
@@ -108,7 +126,7 @@ start() { # router dir, namespace
   local dir=$work/$1
   for name in ruster-fe ruster-ribd ruster-neighd; do
     local args=()
-    [[ $name == ruster-fe ]] && args=(--backend "$backend" p1 wan)
+    [[ $name == ruster-fe ]] && args=(--backend "$backend" p1 p2 wan)
     [[ $name == ruster-ribd ]] && args=(confd:1 bird:20:65000)
     ip netns exec "$2" "$bin/$name" --run-dir "$dir/run" "${args[@]}" >>"$dir/$name.log" 2>&1 &
     pids+=("$!")
@@ -152,6 +170,19 @@ done
 out=$(nsx "$a" ping -c 3 -i 0.2 -W 1 192.0.2.20) || fail "a to b: $out"
 grep -q "ttl=64" <<<"$out" || fail "a to b was not bridged (TTL changed): $out"
 echo "ok: a and b reach each other at L2 over VXLAN, with the VTEPs from EVPN"
+
+# The second VNI, in its own bridge: c and d.
+wait_show r1 "$r1" "^evpn-flood vni 200 vtep 10.0.0.2" 1 || fail "r1's ribd has no flood of VNI 200"
+ok=0
+for _ in $(seq 1 20); do
+  if pings "$c" 198.51.100.20; then ok=1; break; fi
+done
+(( ok == 1 )) || fail "c does not reach d over VNI 200"
+c_mac=$(nsx "$c" cat /sys/class/net/c0/address)
+wait_show r2 "$r2" "^evpn-mac vni 200 $c_mac vtep 10.0.0.1" 1 ||
+  fail "r2's ribd has no MAC of c in VNI 200: $(show r2 "$r2" | grep evpn)"
+if show r2 "$r2" | grep -q "^evpn-mac vni 100 $c_mac"; then fail "c's MAC is in VNI 100 too"; fi
+echo "ok: a second VNI in its own bridge: c and d reach each other, and c's MAC is in VNI 200 only"
 
 a_mac=$(nsx "$a" cat /sys/class/net/a0/address)
 b_mac=$(nsx "$b" cat /sys/class/net/b0/address)

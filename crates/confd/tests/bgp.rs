@@ -224,10 +224,23 @@ fn an_evpn_neighbor_needs_bird_rs_and_one_vni_and_the_bird_part_has_it() {
     assert_eq!(part.evpn[0].router_address, "198.51.100.1");
     let error = file::parse(&evpn("frr", "", "\"p1\", \"vx0\"")).unwrap_err();
     assert!(error.contains("bird-rs"), "{error}");
-    // Two VNIs: more than one protocol ruster takes.
+    // Two VNIs in one bridge: refused; in two bridges: both in the part.
     let vx1 = "\n[[interface]]\nname = \"vx1\"\nvxlan = { vni = 200, local = \"198.51.100.1\" }\n";
     let error = file::parse(&evpn("bird-rs", vx1, "\"p1\", \"vx0\", \"vx1\"")).unwrap_err();
-    assert!(error.contains("one VXLAN or srv6-evpn"), "{error}");
+    assert!(error.contains("one VNI per bridge"), "{error}");
+    let br1 = format!(
+        "{vx1}\n[[interface]]\nname = \"p2\"\nmac = \"02:00:00:00:09:02\"\n\n\
+         [[interface]]\nname = \"br1\"\nbridge = {{ members = [\"p2\", \"vx1\"] }}\n"
+    );
+    let config = file::parse(&evpn("bird-rs", &br1, "\"p1\", \"vx0\"")).unwrap();
+    let part = ruster_config::parse_frr_part(&Module::Bird.part(&config)).unwrap();
+    let mut got: Vec<(u32, &str)> = part
+        .evpn
+        .iter()
+        .map(|v| (v.vni, v.bridge.as_str()))
+        .collect();
+    got.sort_unstable();
+    assert_eq!(got, [(100, "br0"), (200, "br1")]);
     let big = one.replace("vni = 100,", "vni = 70000,");
     let error = file::parse(&big).unwrap_err();
     assert!(error.contains("at most 65535"), "{error}");
