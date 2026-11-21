@@ -3,7 +3,7 @@
 //!
 //! It takes the `bird` part of the configuration from confd, writes bird-rs's
 //! configuration to FILE, and has bird-rs check and read it with COMMAND
-//! (`birdc -s /run/bird-rs.ctl` when not given; an empty one runs nothing), split at
+//! (`birdc-rs -s /run/bird-rs.ctl` when not given; an empty one runs nothing), split at
 //! spaces, followed by `configure check "FILE"` and `configure "FILE"`. bird-rs gives
 //! its routes to ribd itself, as the route source `bird`
 //! (`ribd/source/bird/source.sock`; start ribd with `bird:PREFERENCE:HOLD_MS`). Run it
@@ -23,7 +23,7 @@ const CONFD_WAIT: Duration = Duration::from_secs(10);
 
 fn run() -> Result<(), String> {
     let (run_dir, rest) = daemon::run_dir_and_rest(std::env::args().skip(1))?;
-    let mut birdc = "birdc -s /run/bird-rs.ctl".to_owned();
+    let mut birdc = "birdc-rs -s /run/bird-rs.ctl".to_owned();
     let mut file = None;
     let mut args = rest.into_iter();
     while let Some(arg) = args.next() {

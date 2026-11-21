@@ -194,8 +194,12 @@ FRRの代わりに経路デーモンのbird-rsを使うときの橋渡し役。�
   インターフェースのもの（MACから作る）を`next hop link local`で渡す（bird-rsは近隣の見つかったデバイス、
   つまりTUNのlink-localを付けるが、FEはそれに答えない）。受けた経路はグローバルの次の転送先を使う
   （`next hop prefer global`）。
-- 試験: netns `bgp`、`isis`、`ospf`、`evpn`と同じ構成で、FRRの代わりにbird-rsを動かす。bird-rsのビルド物は
-  環境変数で渡す。
+- systemdのunitは`contrib/systemd/ruster-bird.service`と`bird-rs.service`（bird.confは`/etc/bird-rs/`、制御の
+  socketは`/run/bird-rs.ctl`）。
+- 試験: netns `bird-bgp`は、BGPをbird-rsどうしで張り、経路がFEに入って届くこと、IPv6の近隣がFEのポートの
+  link-localを受けること、読めない設定を断ること、取り下げた経路が消えることを確かめる。bird-rsと`birdc-rs`の
+  ディレクトリを`BIRD_RS`で渡し、無ければ飛ばす（終了コード77、netns-allは`skip`と出す）。EVPN、IS-IS、
+  OSPFも同じ形で足す。
 
 ### Kea（`ruster-kea`）
 

@@ -1,0 +1,21 @@
+# bird-rs in the router's namespace, with routing-daemon = "bird-rs". ruster-bird
+# writes /etc/bird-rs/bird.conf and has it read; bird-rs gives its routes to ribd
+# itself (start ribd with bird among its sources, RUSTER_RIBD_SOURCES). bird-rs does
+# not start without a file it can read: a first one is put there until ruster-bird
+# writes it.
+[Unit]
+Description=bird-rs routing daemon for ruster
+PartOf=ruster.target
+BindsTo=ruster-netns.service
+After=ruster-netns.service
+
+[Service]
+Type=simple
+NetworkNamespacePath=/run/netns/ruster
+ExecStartPre=/bin/sh -c 'mkdir -p /etc/bird-rs && [ -e /etc/bird-rs/bird.conf ] || echo "protocol device {}" > /etc/bird-rs/bird.conf'
+ExecStart=/usr/local/bin/bird-rs -f -c /etc/bird-rs/bird.conf -s /run/bird-rs.ctl
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=ruster.target
