@@ -161,6 +161,41 @@ confd → 各プロセス: 確定
 - zebraはFPMに加えてkernelのnetnsにも経路を入れるが、行き先はTUNかTAPで、FEはどちらから出てきたパケットも
   kernelのパケットとして転送するので、転送には効かない。
 
+### bird-rs（`ruster-bird`）
+
+FRRの代わりに経路デーモンのbird-rsを使うときの橋渡し役。どちらを使うかは全体の設定の`routing-daemon`
+（`"frr"`が既定、または`"bird-rs"`）で選び、一つのルータでは片方だけを動かす。
+
+- 設定はFRRと同じ`[bgp]`（default VRFだけ）、`[isis]`、`[ospf]`、`[ospf6]`。`include`は選んだデーモンの書き方の
+  ファイルで、bird.confの最後にそのまま足す。EVPNは`[[bgp.neighbor]]`の`evpn = true`で、その近隣にl2vpn evpnの
+  チャネルを足す（bird-rsだけ。FRRのFPMはEVPNを運ばないので、confdは`routing-daemon = "frr"`では断る）。
+- EVPNのVNIは、ブリッジのメンバーのVXLANとSRv6 EVPNのインターフェースから作る。VNIごとにbird-rsの
+  `protocol evpn`を一つ置き、RDは`<router-id>:<VNI>`（RFC 7432の7.9のtype 1）、route targetは`<AS>:<VNI>`
+  （RFC 8365の5.1.2.1の自動の形）、VXLANは`router address`にインターフェースのlocalを、SRv6はその
+  unicast-sidとmulticast-sidを書く。`protocol ruster`のethチャネルで、そのブリッジの名前（`ruster bridge`）に
+  つなぐ。
+- 経路はbird-rsの`protocol ruster`が、ribdへ送り手`bird`として直接書く（FPMは使わない）。ribdは`bird:<優先度>`を
+  付けて起動する。次の転送先がTAP（`rp-<名前>`）のものは、bird-rsがFEのインターフェースの名前に戻して渡す。
+  EVPNの表`ruster-evpn`も同じ接続で書き、FEの状態の`learned-entry`は`fe/state.sock`をobserveして読む
+  （[`overlay.md`](overlay.md)の7.）。
+- IS-ISとOSPFの経路は、bird-rsの`protocol kernel`でkernelのdefault VRFの表にも入れる。TAPから出てくる
+  ルータ自身の通信（iBGP、OSPFv2の近隣へのユニキャスト）は、kernelがその経路で出すため（FRRのzebraと同じ）。
+  BGPの経路はkernelに入れない。
+- 送り出しは`networks`だけにする（FRRと同じ、RFC 8212）。取り込みは全部受ける。
+- 反映: `ruster-bird`は`confd/part/bird/part.sock`でモジュール`bird`を受け取り、bird.confを全部作る。まず
+  `birdc configure check "<新しいファイル>"`で確かめ、`8002`ならファイルを替えずに断る。通れば置き換えて
+  `birdc configure`で読ませる。`0003`、`0004`（止めるprotocolを待っている）、`0019`は受け入れる。読めない
+  設定は反映されず、bird-rsは前の設定のまま動く。`protocol ruster`の行き先を変えなければ、ribdへの接続は
+  そのまま残る。
+- bird-rsはsystemdが起動する（`-f`、`Type=simple`、kernelのnetnsで）。設定が読めないと起動しないので、
+  `ruster-bird`の初回の反映より前は、unitの`ExecStartPre`で最小のbird.confを置く。制御のsocketは`-g`で
+  `ruster-bird`のグループに渡す。bird-rsはribdとFEのsocketが無いあいだ自分で繋ぎ直すので、起動の順番は問わない。
+- BGPのTCPはkernelで終端する（TUN経由）。IPv6の近隣へ広告する次の転送先のlink-localと、受けた経路の
+  次の転送先の扱いは、FRRと同じ問題（TUNのlink-localにFEが答えない）があり、BGPのunicastを作るときに
+  bird-rsのどの設定で行うかを決めて、ここに書く。
+- 試験: netns `bgp`、`isis`、`ospf`、`evpn`と同じ構成で、FRRの代わりにbird-rsを動かす。bird-rsのビルド物は
+  環境変数で渡す。
+
 ### Kea（`ruster-kea`）
 
 - LANのポートはFEが持ち、kernelからは見えない。DHCPのフレームは、FEの受け渡しの表でLANのポートから
