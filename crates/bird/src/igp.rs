@@ -10,16 +10,15 @@
 //! # Standards
 //!
 //! - ISO 10589 and RFC 1195: one IS-IS instance, with the NET and the level given;
-//!   RFC 5305: wide metrics (bird-rs's default); RFC 5308: IPv6.
+//!   RFC 5305: wide metrics (bird-rs's default); RFC 5308: IPv6 on an interface
+//!   with a global IPv6 prefix (`ipv6 off` on the others, bird-rs 89bcc5c).
 //! - RFC 2328 (OSPFv2) and RFC 5340 (OSPFv3): the router ID, and per interface its
 //!   area, cost and network type (broadcast or point-to-point); a passive
 //!   interface's prefixes are announced but no adjacency is formed on it (bird-rs's
 //!   `stub`).
 //!
 //! Deviations: none of the protocols is here; bird-rs implements them. Only the
-//! default VRF. IS-IS carries IPv6 on all of its interfaces or on none (bird-rs has
-//! no switch per interface): a mix of interfaces with and without an IPv6 prefix is
-//! refused. An OSPF with no interface is not written.
+//! default VRF. An OSPF with no interface is not written.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -62,34 +61,24 @@ pub fn write(out: &mut String, routing: &Frr) -> Result<(), String> {
                 ))
             }
         };
-        // bird-rs carries IPv6 on every circuit or on none: FRR's bridge has it on
-        // those with an IPv6 prefix, so both agree only when all or none have one.
-        let with_ipv6 = isis
-            .interface
-            .iter()
-            .filter(|i| has_ipv6(&i.name, &routing.connected))
-            .count();
-        let ipv6 = match with_ipv6 {
-            0 => "",
-            n if n == isis.interface.len() => "  ipv6 { import all; export none; };\n",
-            _ => {
-                return Err(
-                    "isis: with bird-rs, give IPv6 to all of its interfaces or to none".into(),
-                )
-            }
-        };
         // Quoted: bird-rs reads only one form of NET bare.
         let _ = write!(
             out,
             "protocol isis ruster_isis {{\n  net \"{}\";\n  level {level};\n  \
-             ipv4 {{ import all; export none; }};\n{ipv6}",
+             ipv4 {{ import all; export none; }};\n  ipv6 {{ import all; export none; }};\n",
             isis.net
         );
         for i in &isis.interface {
             let passive = if i.passive { " passive;" } else { "" };
+            // IPv6 only on an interface with an IPv6 prefix, as FRR's bridge has it.
+            let ipv6 = if has_ipv6(&i.name, &routing.connected) {
+                ""
+            } else {
+                " ipv6 off;"
+            };
             let _ = writeln!(
                 out,
-                "  interface {} {{ metric {};{passive} }};",
+                "  interface {} {{ metric {};{passive}{ipv6} }};",
                 device(&i.name)?,
                 i.metric
             );
