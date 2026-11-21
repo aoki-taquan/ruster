@@ -50,7 +50,7 @@ fn the_configuration_has_the_networks_the_neighbors_and_protocol_ruster() {
         "{HEADER}
 router id 198.51.100.1;
 protocol device {{}}
-protocol static ruster_networks_ipv4 {{
+{}protocol static ruster_networks_ipv4 {{
   ipv4;
   route 203.0.113.0/24 unreachable;
 }}
@@ -65,6 +65,7 @@ protocol bgp ruster_neighbor_198_51_100_10 {{
   ipv4 {{
     import all;
     export where proto = \"ruster_networks_ipv4\";
+    igp table ruster_tun4;
   }};
 }}
 protocol bgp ruster_neighbor_2001_db8_100__10 {{
@@ -73,6 +74,7 @@ protocol bgp ruster_neighbor_2001_db8_100__10 {{
   ipv6 {{
     import all;
     export where proto = \"ruster_networks_ipv6\";
+    igp table ruster_tun6;
     next hop prefer global;
     next hop link local fe80::ff:fe00:2;
   }};
@@ -84,7 +86,8 @@ protocol ruster {{
   ipv6 {{ export where source ~ [RTS_BGP, RTS_ISIS, RTS_OSPF, RTS_OSPF_IA, RTS_OSPF_EXT1, RTS_OSPF_EXT2]; }};
 }}
 # extra
-"
+",
+        ruster_bird::conf::NEXT_HOP_TABLES
     );
     assert_eq!(text, expected);
 }

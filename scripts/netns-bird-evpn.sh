@@ -151,7 +151,7 @@ wait_show() { # router dir, namespace, pattern, present (1) or gone (0)
 }
 pings() { nsx "$1" ping -c 1 -W 1 "$2" >/dev/null 2>&1; }
 
-config r1 02:00:00:00:01:01 02:00:00:00:01:02 10.0.0.1 10.0.0.2 '"10.0.0.0/24"'
+config r1 02:00:00:00:01:01 02:00:00:00:01:02 10.0.0.1 10.0.0.2 '"10.0.0.0/24", "203.0.113.0/24"'
 config r2 02:00:00:00:02:01 02:00:00:00:02:02 10.0.0.2 10.0.0.1 ""
 start r1 "$r1"
 start r2 "$r2"
@@ -195,6 +195,12 @@ echo "ok: the MAC addresses each FE learned reach the other's ribd (type 2)"
 learned=$(nsx "$r2" "$bird/birdc-rs" -s "$work/r2/bird.ctl" show route for 10.0.0.0/24 all 2>&1)
 grep -q "BGP" <<<"$learned" || fail "r2 has no BGP route to r1's network 10.0.0.0/24: $learned"
 echo "ok: a network that is a connected prefix is still announced with EVPN on"
+
+# r1's network 203.0.113.0/24 reaches r2's FE over the IBGP session: its next hop
+# 10.0.0.1 resolves through the TUN device's connected routes.
+wait_show r2 "$r2" "^route default 203.0.113.0/24 via 10.0.0.1 dev wan" 1 ||
+  fail "r2's FE has no BGP route to r1's 203.0.113.0/24: $(show r2 "$r2" | grep '^route')"
+echo "ok: an IBGP route's next hop resolves, and the route reaches the FE"
 
 kill "$bird_r2"
 wait_show r1 "$r1" "^evpn-flood vni 100 vtep 10.0.0.2" 0 ||

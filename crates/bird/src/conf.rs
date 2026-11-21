@@ -3,7 +3,9 @@
 //! `ruster-bird` writes the whole of bird-rs's configuration file, in this order:
 //!
 //! 1. `router id` (with `bgp`), and `protocol device`.
-//! 2. With `bgp`: a `protocol static` per address family that holds the configured
+//! 2. With `bgp`: the tables BGP's next hops resolve through ([`NEXT_HOP_TABLES`]:
+//!    the TUN device's connected routes and the IS-IS and OSPF routes), a
+//!    `protocol static` per address family that holds the configured
 //!    networks (as unreachable routes, so that they are announced whether or not a
 //!    route for them is known), and a `protocol bgp` per neighbor with the channel of
 //!    its family. Every neighbor takes every route and is sent only the networks of
@@ -27,9 +29,8 @@
 //! configuration before when it cannot read a file, so a refused part changes
 //! nothing.
 //!
-//! With a neighbor of `evpn = true`, also the EVPN parts: the router's addresses on
-//! the TUN device in tables of their own (`protocol direct ruster_tun`, which the
-//! EVPN channels resolve next hops through), the EVPN and Ethernet tables, the
+//! With a neighbor of `evpn = true`, also the EVPN parts: the EVPN and Ethernet
+//! tables (the EVPN channels resolve next hops through [`NEXT_HOP_TABLES`] too), the
 //! `protocol evpn` of the VNI, an `evpn` channel on those neighbors, and in
 //! `protocol ruster` the bridge's learned addresses (`eth`) and the EVPN routes of
 //! the VNI's route target (`evpn`). Turning EVPN on or off restarts `protocol
@@ -46,9 +47,9 @@
 //!   5.1.2.1: the route target is `<AS>:<VNI>`. RFC 9252 section 6: over SRv6 the
 //!   router's End.DT2U and End.DT2M SIDs.
 //!
-//! Deviations: none of BGP itself is here; bird-rs implements it. A remote VTEP
-//! resolves only on a connected prefix of the default VRF (the EVPN next hops are
-//! looked up in the TUN device's tables alone). Each VNI has a bridge of its own,
+//! Deviations: none of BGP itself is here; bird-rs implements it. A next hop (a
+//! remote VTEP too) resolves only on a connected prefix of the default VRF or
+//! through an IS-IS or OSPF route, not through a BGP route ([`NEXT_HOP_TABLES`]). Each VNI has a bridge of its own,
 //! and over SRv6 there is one VNI (`protocol ruster` takes one VNI in place of the
 //! label). A VNI above 65535 does not fit the RD's number and is refused.
 
@@ -98,6 +99,7 @@ pub fn config(routing: &Frr, include: &str, run_dir: &str) -> Result<String, Str
     let mut evpn = Vec::new();
     if let Some(bgp) = &routing.bgp {
         evpn = evpn_of(bgp, &routing.evpn)?;
+        out.push_str(NEXT_HOP_TABLES);
         write_evpn(&mut out, bgp, &evpn)?;
         write_bgp(&mut out, bgp, &routing.connected, &evpn)?;
     }
@@ -143,6 +145,18 @@ pub fn config(routing: &Frr, include: &str, run_dir: &str) -> Result<String, Str
     }
     Ok(out)
 }
+
+/// The tables BGP's next hops resolve through: the router's addresses on the
+/// default VRF's TUN device (confd puts them there) and the IS-IS and OSPF routes.
+/// They are kept out of the main tables, where the connected routes would take the
+/// place of the networks announced (and of learned routes): the main tables hold
+/// what goes to ribd.
+pub const NEXT_HOP_TABLES: &str = "ipv4 table ruster_tun4;
+ipv6 table ruster_tun6;
+protocol direct ruster_tun { ipv4 { table ruster_tun4; }; ipv6 { table ruster_tun6; }; interface \"rt-default\"; }
+protocol pipe ruster_igp4 { table master4; peer table ruster_tun4; import none; export where source ~ [RTS_ISIS, RTS_OSPF, RTS_OSPF_IA, RTS_OSPF_EXT1, RTS_OSPF_EXT2]; }
+protocol pipe ruster_igp6 { table master6; peer table ruster_tun6; import none; export where source ~ [RTS_ISIS, RTS_OSPF, RTS_OSPF_IA, RTS_OSPF_EXT1, RTS_OSPF_EXT2]; }
+";
 
 /// The sources of the routes given to ribd: BGP, IS-IS and OSPF (not the routes of
 /// the router's own interfaces, which confd gives). Those of protocols the include
@@ -240,14 +254,7 @@ fn write_evpn(out: &mut String, bgp: &Bgp, evpn: &[(u16, &EvpnVni)]) -> Result<(
     if evpn.is_empty() {
         return Ok(());
     }
-    out.push_str(
-        "ipv4 table ruster_tun4;\n\
-         ipv6 table ruster_tun6;\n\
-         protocol direct ruster_tun { ipv4 { table ruster_tun4; }; ipv6 { table ruster_tun6; }; \
-         interface \"rt-default\"; }\n\
-         evpn table ruster_evpn;\n\
-         eth table ruster_eth;\n",
-    );
+    out.push_str("evpn table ruster_evpn;\neth table ruster_eth;\n");
     for (vid, vni) in evpn {
         let n = vni.vni;
         let encapsulation = match (
@@ -337,9 +344,15 @@ fn write_bgp(
         } else {
             format!("where proto = \"ruster_networks_{channel}\"")
         };
+        // IBGP and multihop next hops resolve through the next-hop tables.
+        let tun = if address.is_ipv4() {
+            "ruster_tun4"
+        } else {
+            "ruster_tun6"
+        };
         let _ = write!(
             out,
-            "  {channel} {{\n    import all;\n    export {export};\n"
+            "  {channel} {{\n    import all;\n    export {export};\n    igp table {tun};\n"
         );
         if address.is_ipv6() {
             out.push_str("    next hop prefer global;\n");
