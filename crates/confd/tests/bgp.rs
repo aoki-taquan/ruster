@@ -158,6 +158,24 @@ fn the_frr_part_has_the_default_vrf_s_prefixes() {
     assert_eq!(Module::from_name("frr"), Some(Module::Frr));
 }
 
+#[test]
+fn the_routing_part_goes_to_the_bridge_of_the_routing_daemon_chosen() {
+    let frr = file::parse(&bgp("", PEER)).unwrap();
+    assert!(Module::Frr.configured(&frr));
+    assert!(!Module::Bird.configured(&frr));
+    let bird = file::parse(&format!("routing-daemon = \"bird-rs\"\n{}", bgp("", PEER))).unwrap();
+    assert!(!Module::Frr.configured(&bird));
+    assert!(Module::Bird.configured(&bird));
+    let part = ruster_config::parse_frr_part(&Module::Bird.part(&bird)).unwrap();
+    assert_eq!(part.bgp.as_ref(), bird.bgp.as_ref());
+    assert!(!part.connected.is_empty());
+    let none = ruster_config::parse_frr_part(&Module::Frr.part(&bird)).unwrap();
+    assert!(none.bgp.is_none() && none.connected.is_empty());
+    assert_eq!(Module::from_name("bird"), Some(Module::Bird));
+    let error = file::parse(&format!("routing-daemon = \"quagga\"\n{WAN}")).unwrap_err();
+    assert!(error.contains("routing-daemon"), "{error}");
+}
+
 /// What only the lock form can hold: more than one of a none-or-one list.
 #[test]
 fn lists_of_none_or_one_take_no_more() {

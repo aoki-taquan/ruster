@@ -1011,6 +1011,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         pppoe,
         dhcp_client,
         map_e_from,
+        routing_daemon: lock.routing_daemon,
         bgp,
         bridges,
         isis,

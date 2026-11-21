@@ -43,7 +43,8 @@
 //! | `ra` | `ruster-neighd` | [`ruster_config::ra_part`] |
 //! | `pppoe` | `ruster-pppoed` | [`ruster_config::pppoe_part`] |
 //! | `dhcpc` | `ruster-dhcpc` | [`ruster_config::dhcp_client_part`] |
-//! | `frr` | `ruster-frr` | [`ruster_config::frr_part`], with the prefixes of the default VRF's interfaces ([`crate::bgp::connected`]) |
+//! | `frr` | `ruster-frr` | [`ruster_config::frr_part`], with the prefixes of the default VRF's interfaces ([`crate::bgp::connected`]); empty unless `routing-daemon` is `frr` |
+//! | `bird` | `ruster-bird` | the same, for bird-rs; empty unless `routing-daemon` is `bird-rs` |
 //!
 //! [`Client`] is the process's side, and [`changes`] the text a process that runs
 //! one thing per entry answers a check with.
@@ -85,16 +86,18 @@ pub enum Module {
     Pppoe,
     Dhcpc,
     Frr,
+    Bird,
 }
 
 impl Module {
-    pub const ALL: [Module; 6] = [
+    pub const ALL: [Module; 7] = [
         Module::Dns,
         Module::Dhcp,
         Module::Ra,
         Module::Pppoe,
         Module::Dhcpc,
         Module::Frr,
+        Module::Bird,
     ];
 
     pub fn name(self) -> &'static str {
@@ -105,6 +108,7 @@ impl Module {
             Self::Pppoe => "pppoe",
             Self::Dhcpc => "dhcpc",
             Self::Frr => "frr",
+            Self::Bird => "bird",
         }
     }
 
@@ -117,6 +121,7 @@ impl Module {
             Self::Pppoe => "ruster-pppoed",
             Self::Dhcpc => "ruster-dhcpc",
             Self::Frr => "ruster-frr",
+            Self::Bird => "ruster-bird",
         }
     }
 
@@ -132,13 +137,21 @@ impl Module {
             Self::Ra => ruster_config::ra_part(&config.ra),
             Self::Pppoe => ruster_config::pppoe_part(&config.pppoe),
             Self::Dhcpc => ruster_config::dhcp_client_part(&config.dhcp_client),
-            Self::Frr => ruster_config::frr_part(&ruster_config::Frr {
-                bgp: config.bgp.clone(),
-                isis: config.isis.clone(),
-                ospf: config.ospf.clone(),
-                ospf6: config.ospf6.clone(),
-                connected: crate::bgp::connected(&config.interfaces),
-            }),
+            // The routing daemon's part goes to its bridge; the other's is empty.
+            Self::Frr | Self::Bird => {
+                let routing = if self.routes(config) {
+                    ruster_config::Frr {
+                        bgp: config.bgp.clone(),
+                        isis: config.isis.clone(),
+                        ospf: config.ospf.clone(),
+                        ospf6: config.ospf6.clone(),
+                        connected: crate::bgp::connected(&config.interfaces),
+                    }
+                } else {
+                    ruster_config::Frr::default()
+                };
+                ruster_config::frr_part(&routing)
+            }
         }
     }
 
@@ -150,12 +163,23 @@ impl Module {
             Self::Ra => !config.ra.is_empty(),
             Self::Pppoe => !config.pppoe.is_empty(),
             Self::Dhcpc => !config.dhcp_client.is_empty(),
-            Self::Frr => {
-                config.bgp.is_some()
-                    || config.isis.is_some()
-                    || config.ospf.is_some()
-                    || config.ospf6.is_some()
+            Self::Frr | Self::Bird => {
+                self.routes(config)
+                    && (config.bgp.is_some()
+                        || config.isis.is_some()
+                        || config.ospf.is_some()
+                        || config.ospf6.is_some())
             }
+        }
+    }
+
+    /// Whether this module is the bridge of the routing daemon `config` chooses
+    /// (always, for a module of something else).
+    fn routes(self, config: &Config) -> bool {
+        match self {
+            Self::Frr => config.routing_daemon == ruster_config::RoutingDaemon::Frr,
+            Self::Bird => config.routing_daemon == ruster_config::RoutingDaemon::BirdRs,
+            Self::Dns | Self::Dhcp | Self::Ra | Self::Pppoe | Self::Dhcpc => true,
         }
     }
 }

@@ -15,6 +15,10 @@
 //! # `ruster.toml`
 //!
 //! ```toml
+//! routing-daemon = "frr"       # optional, the default; or "bird-rs": the daemon
+//!                              # that runs [bgp], [isis], [ospf] and [ospf6]
+//!                              # (through ruster-frr or ruster-bird)
+//!
 //! firewall-filtering = "endpoint-independent"  # optional: who outside
 //!                              # may reach an inside host's UDP or TCP port that has a
 //!                              # flow out, where no rule decides; the default, or
@@ -619,7 +623,7 @@ pub const VERSION: u32 = 1;
 ///
 /// A new key also goes into `tests/data/every-key.lock` (the test reads it with every
 /// key required, and checks that every list in it has an item).
-pub const LOCK_SHAPE: u64 = 0x4dd6_8fd8_60f8_b7f4;
+pub const LOCK_SHAPE: u64 = 0x593a_a348_abb4_0d3a;
 
 /// A bridge's ageing time, in seconds (IEEE 802.1Q 8.8.3, the recommended value).
 pub const BRIDGE_AGING_TIME: u32 = 300;
@@ -707,11 +711,35 @@ pub const ICMP_ERRORS: IcmpErrors = IcmpErrors {
     ipv6_interval_ms: 10,
 };
 
+/// The routing daemon that runs `[bgp]`, `[isis]`, `[ospf]` and `[ospf6]`
+/// (`docs/design/router-box.md`, "bird-rs"): one per router.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RoutingDaemon {
+    /// FRR, through `ruster-frr`.
+    #[default]
+    #[serde(rename = "frr")]
+    Frr,
+    /// bird-rs, through `ruster-bird`.
+    #[serde(rename = "bird-rs")]
+    BirdRs,
+}
+
+impl RoutingDaemon {
+    fn is_frr(&self) -> bool {
+        *self == Self::Frr
+    }
+}
+
 /// The configuration with every parameter given.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Lock {
     pub version: u32,
+    /// The routing daemon that runs BGP, IS-IS and OSPF. A lock written before it
+    /// was added has none: FRR. Not written for FRR, so that a ruster from before
+    /// still reads the lock.
+    #[serde(default, skip_serializing_if = "RoutingDaemon::is_frr")]
+    pub routing_daemon: RoutingDaemon,
     pub firewall_filtering: String,
     pub firewall_outside: FirewallOutside,
     pub icmp_errors: IcmpErrors,

@@ -1,6 +1,6 @@
 //! Checks `[[isis]]`, `[[ospf]]` and `[[ospf6]]` of the lock form: IS-IS, OSPFv2 and
 //! OSPFv3 in the default VRF, which FRR speaks on the TAP device of each of their
-//! interfaces (`docs/design/overlay.md` section 6). confd hands them to `ruster-frr`
+//! interfaces (`docs/design/overlay.md` section 6). confd hands them to `ruster-frr` or `ruster-bird`
 //! in the `frr` part ([`crate::part`]).
 //!
 //! # Standards

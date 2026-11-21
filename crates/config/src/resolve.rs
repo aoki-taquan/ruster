@@ -46,6 +46,7 @@ struct File {
     ospf: Option<crate::ospf::OspfEntry>,
     ospf6: Option<crate::ospf::OspfEntry>,
     srv6: Option<crate::srv6::Srv6Entry>,
+    routing_daemon: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -647,8 +648,18 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
         .ospf6
         .map(|entry| crate::ospf::resolve("ospf6", entry, &interfaces))
         .transpose()?;
+    let routing_daemon = match file.routing_daemon.as_deref() {
+        None | Some("frr") => crate::RoutingDaemon::Frr,
+        Some("bird-rs") => crate::RoutingDaemon::BirdRs,
+        Some(other) => {
+            return Err(format!(
+                "routing-daemon {other:?}: give \"frr\" or \"bird-rs\""
+            ))
+        }
+    };
     Ok(Lock {
         version: VERSION,
+        routing_daemon,
         firewall_filtering: filtering(file.firewall_filtering),
         firewall_outside: match file.firewall_outside {
             None => FirewallOutside::Derive,

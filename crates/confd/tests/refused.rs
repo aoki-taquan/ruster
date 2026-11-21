@@ -64,6 +64,7 @@ fn config(mtu: u16) -> Config {
         dhcp_client: Vec::new(),
         map_e_from: None,
         dns_found: Vec::new(),
+        routing_daemon: Default::default(),
         bgp: None,
         bridges: Vec::new(),
         isis: None,

@@ -2,6 +2,7 @@
 # interface and route target. tests/lock.rs reads it to check the lock form's shape
 # against ruster_config::LOCK_SHAPE. It is not a configuration that makes sense.
 version = 1
+routing-daemon = "bird-rs"
 firewall-filtering = "endpoint-independent"
 firewall-outside = ["wan"]
 

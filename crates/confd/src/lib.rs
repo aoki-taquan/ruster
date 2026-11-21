@@ -8,7 +8,7 @@
 //! | FE | interfaces, addresses, the default VRF's firewall rules and NAT, and the punt classes that hand DHCP and DHCPv6 to `ruster-kea` and IS-IS and OSPF to the interfaces' TAP devices |
 //! | neighd | interfaces and addresses (to answer ARP and choose source addresses); the `ra` part on `confd/part/ra/part.sock` |
 //! | ribd | static routes out of usable interfaces and the connected routes of the addresses, as source `confd` |
-//! | a process for a module (`ruster-unbound` for `dns`, `ruster-kea` for `dhcp`, `ruster-pppoed` for `pppoe`, `ruster-frr` for `frr`, `ruster-dhcpc` for `dhcpc`) | that module's part of the lock form, on `confd/part/<module>/part.sock` ([`part`]) |
+//! | a process for a module (`ruster-unbound` for `dns`, `ruster-kea` for `dhcp`, `ruster-pppoed` for `pppoe`, `ruster-frr` for `frr`, `ruster-bird` for `bird`, `ruster-dhcpc` for `dhcpc`) | that module's part of the lock form, on `confd/part/<module>/part.sock` ([`part`]) |
 //!
 //! On every (re)connection confd sends everything between resync-begin and resync-end,
 //! so entries it no longer has are removed, and tells ribd `sync-done`. After that it
@@ -169,11 +169,13 @@ pub struct Config {
     /// and once each: a value found at run time ([`delegated`]), which confd hands
     /// `ruster-unbound` beside the `dns` part.
     pub dns_found: Vec<IpAddr>,
-    /// BGP, checked; confd hands it to `ruster-frr` ([`bgp`]).
+    /// The routing daemon that runs BGP, IS-IS and OSPF: its bridge takes them.
+    pub routing_daemon: ruster_config::RoutingDaemon,
+    /// BGP, checked; confd hands it to `ruster-frr` or `ruster-bird` ([`bgp`]).
     pub bgp: Option<ruster_config::Bgp>,
     /// The bridges, checked; their own interfaces are in `interfaces` ([`bridge`]).
     pub bridges: Vec<bridge::Bridge>,
-    /// IS-IS, OSPFv2 and OSPFv3, checked; confd hands them to `ruster-frr`
+    /// IS-IS, OSPFv2 and OSPFv3, checked; confd hands them to `ruster-frr` or `ruster-bird`
     /// ([`isis_ospf`]).
     pub isis: Option<ruster_config::Isis>,
     pub ospf: Option<ruster_config::Ospf>,
@@ -1233,6 +1235,7 @@ mod tests {
             dhcp_client: Vec::new(),
             map_e_from: None,
             dns_found: Vec::new(),
+            routing_daemon: Default::default(),
             bgp: None,
             isis: None,
             ospf: None,
@@ -1304,6 +1307,7 @@ mod tests {
             dhcp_client: Vec::new(),
             map_e_from: None,
             dns_found: Vec::new(),
+            routing_daemon: Default::default(),
             bgp: None,
             isis: None,
             ospf: None,
