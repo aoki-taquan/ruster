@@ -58,7 +58,8 @@ rusterで何を作り、何を作らないかを決める文書です。作業�
     FEの表を書くのはCEのプロセスだけで、運用者が直接書くことはない。
   - 既製のソフト（経路デーモンのFRRとbird-rs、DHCPのサーバのKea、DNSのサーバのUnbound）とrusterをつなぐ橋渡し役。ソフトごとに一つ置き、
     全体の設定から自分の担当の部分を読んで相手のソフトの設定に変え、相手から得た値をCEのプロセスへ渡す。
-    FRRで使うプロトコルは、BGP、IS-IS、OSPF（v2とv3）。bird-rsで使うのは、BGPとEVPN（`ruster-bird`）。
+    FRRで使うプロトコルは、BGP、IS-IS、OSPF（v2とv3）。bird-rsで使うのは、BGP、EVPN、IS-IS、OSPF（v2とv3）
+    （`ruster-bird`）。どちらの経路デーモンを使うかは、運用者が全体の設定で選ぶ。
   - 自作する制御: PPPoEの制御（Discovery、LCP、認証、IPCP、IPv6CP）、WAN側のDHCPクライアント
     （DHCPv4、DHCPv6とプレフィックスの委任）、LANへのRA。
 
