@@ -17,7 +17,9 @@
 //!   `stub`).
 //!
 //! Deviations: none of the protocols is here; bird-rs implements them. Only the
-//! default VRF.
+//! default VRF. IS-IS carries IPv6 on all of its interfaces or on none (bird-rs has
+//! no switch per interface): a mix of interfaces with and without an IPv6 prefix is
+//! refused. An OSPF with no interface is not written.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -36,7 +38,7 @@ fn device(name: &str) -> Result<String, String> {
     if name.is_empty()
         || !name
             .bytes()
-            .all(|b| b.is_ascii_graphic() && !b"/\"\\".contains(&b))
+            .all(|b| b.is_ascii_graphic() && !b"/\"\\*?".contains(&b))
     {
         return Err(format!("interface {name:?}: not a name bird-rs takes"));
     }
@@ -60,10 +62,27 @@ pub fn write(out: &mut String, routing: &Frr) -> Result<(), String> {
                 ))
             }
         };
+        // bird-rs carries IPv6 on every circuit or on none: FRR's bridge has it on
+        // those with an IPv6 prefix, so both agree only when all or none have one.
+        let with_ipv6 = isis
+            .interface
+            .iter()
+            .filter(|i| has_ipv6(&i.name, &routing.connected))
+            .count();
+        let ipv6 = match with_ipv6 {
+            0 => "",
+            n if n == isis.interface.len() => "  ipv6 { import all; export none; };\n",
+            _ => {
+                return Err(
+                    "isis: with bird-rs, give IPv6 to all of its interfaces or to none".into(),
+                )
+            }
+        };
+        // Quoted: bird-rs reads only one form of NET bare.
         let _ = write!(
             out,
-            "protocol isis ruster_isis {{\n  net {};\n  level {level};\n  \
-             ipv4 {{ import all; export none; }};\n  ipv6 {{ import all; export none; }};\n",
+            "protocol isis ruster_isis {{\n  net \"{}\";\n  level {level};\n  \
+             ipv4 {{ import all; export none; }};\n{ipv6}",
             isis.net
         );
         for i in &isis.interface {
@@ -89,6 +108,10 @@ pub fn write(out: &mut String, routing: &Frr) -> Result<(), String> {
 }
 
 fn write_ospf(out: &mut String, ospf: &Ospf, version: &str, channel: &str) -> Result<(), String> {
+    // bird-rs takes no OSPF without an area: with no interface it runs nothing.
+    if ospf.interface.is_empty() {
+        return Ok(());
+    }
     let word = if version == "v2" { "ospf" } else { "ospf6" };
     let id: Ipv4Addr = ospf
         .router_id
@@ -123,4 +146,21 @@ fn write_ospf(out: &mut String, ospf: &Ospf, version: &str, channel: &str) -> Re
     }
     out.push_str("}\n");
     Ok(())
+}
+
+/// Whether interface `name` has a global IPv6 prefix.
+fn has_ipv6(name: &str, connected: &[ruster_config::Connected]) -> bool {
+    connected
+        .iter()
+        .any(|c| c.interface == name && c.prefix.contains(':'))
+}
+
+/// A router ID for IS-IS alone: the last four octets of the NET's system ID (the
+/// six octets before the NSEL), so that it stays the same across restarts.
+pub fn isis_router_id(net: &str) -> Option<Ipv4Addr> {
+    let hex: String = net.chars().filter(|c| *c != '.').collect();
+    // ... system ID (12 hex digits), NSEL (2).
+    let system = hex.get(hex.len().checked_sub(14)?..hex.len() - 2)?;
+    let octet = |at: usize| u8::from_str_radix(system.get(at..at + 2)?, 16).ok();
+    Some(Ipv4Addr::new(octet(4)?, octet(6)?, octet(8)?, octet(10)?))
 }

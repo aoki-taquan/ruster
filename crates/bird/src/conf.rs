@@ -74,13 +74,19 @@ pub const INCLUDE_MAX: u64 = 1 << 20;
 /// or number again, so nothing else reaches the file but the include.
 pub fn config(routing: &Frr, include: &str, run_dir: &str) -> Result<String, String> {
     let mut out = format!("{HEADER}\n");
-    // BGP's router ID, else OSPF's: IS-IS alone needs none.
+    // BGP's router ID, else OSPF's, else one from IS-IS's NET: bird-rs needs one,
+    // and finds none by itself on a router without IPv4.
     let id = routing
         .bgp
         .as_ref()
-        .map(|b| &b.router_id)
-        .or(routing.ospf.as_ref().map(|o| &o.router_id))
-        .or(routing.ospf6.as_ref().map(|o| &o.router_id));
+        .map(|b| b.router_id.clone())
+        .or(routing.ospf.as_ref().map(|o| o.router_id.clone()))
+        .or(routing.ospf6.as_ref().map(|o| o.router_id.clone()))
+        .or(routing
+            .isis
+            .as_ref()
+            .and_then(|i| crate::igp::isis_router_id(&i.net))
+            .map(|id| id.to_string()));
     if let Some(id) = id {
         let id: std::net::Ipv4Addr = id
             .parse()
@@ -132,7 +138,8 @@ pub fn config(routing: &Frr, include: &str, run_dir: &str) -> Result<String, Str
 }
 
 /// The sources of the routes given to ribd: BGP, IS-IS and OSPF (not the routes of
-/// the router's own interfaces, which confd gives).
+/// the router's own interfaces, which confd gives). Those of protocols the include
+/// file adds go too.
 const ROUTED: &str = "RTS_BGP, RTS_ISIS, RTS_OSPF, RTS_OSPF_IA, RTS_OSPF_EXT1, RTS_OSPF_EXT2";
 
 /// The link-local address of the interface whose prefix holds `neighbor`.

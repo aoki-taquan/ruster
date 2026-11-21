@@ -286,6 +286,12 @@ fn an_evpn_neighbor_gets_the_vni_s_protocol_evpn_and_protocol_ruster_its_bridge(
 #[test]
 fn is_is_and_ospf_run_on_the_tap_devices_and_give_ribd_their_routes() {
     let mut part = routing(None);
+    // Both IS-IS interfaces have IPv6.
+    part.connected.push(Connected {
+        interface: "lan".into(),
+        prefix: "2001:db8:1::/64".into(),
+        link_local: "fe80::ff:fe00:1".into(),
+    });
     part.isis = Some(ruster_config::Isis {
         net: "49.0001.1921.6800.1001.00".into(),
         level: "level-2".into(),
@@ -320,7 +326,7 @@ fn is_is_and_ospf_run_on_the_tap_devices_and_give_ribd_their_routes() {
 router id 198.51.100.1;
 protocol device {{}}
 protocol isis ruster_isis {{
-  net 49.0001.1921.6800.1001.00;
+  net \"49.0001.1921.6800.1001.00\";
   level 2;
   ipv4 {{ import all; export none; }};
   ipv6 {{ import all; export none; }};
@@ -357,7 +363,54 @@ protocol ruster {{
     let mut bad = part.clone();
     bad.isis.as_mut().unwrap().level = "level-3".into();
     assert!(config(&bad, "", "/run/ruster").is_err());
-    let mut bad = part;
+    let mut bad = part.clone();
     bad.ospf.as_mut().unwrap().interface[0].network = "nbma".into();
     assert!(config(&bad, "", "/run/ruster").is_err());
+    let mut bad = part.clone();
+    bad.isis.as_mut().unwrap().interface[0].name = "r*".into();
+    assert!(config(&bad, "", "/run/ruster").is_err());
+}
+
+#[test]
+fn is_is_carries_ipv6_when_all_its_interfaces_have_it_and_alone_takes_its_id_from_the_net() {
+    let isis = |names: &[&str]| ruster_config::Isis {
+        net: "49.0001.1921.6800.1001.00".into(),
+        level: "level-1-2".into(),
+        interface: names
+            .iter()
+            .map(|n| ruster_config::IsisInterface {
+                name: (*n).into(),
+                metric: 10,
+                passive: false,
+            })
+            .collect(),
+    };
+    // wan has an IPv6 prefix (routing()'s connected): IPv6 on.
+    let mut part = routing(None);
+    part.isis = Some(isis(&["wan"]));
+    let text = config(&part, "", "/run/ruster").unwrap();
+    assert!(
+        text.contains("  ipv6 { import all; export none; };\n  interface"),
+        "{text}"
+    );
+    // The router ID from the system ID 1921.6800.1001: 0x68.0x00.0x10.0x01.
+    assert!(text.contains("router id 104.0.16.1;"), "{text}");
+    // lan has none: a mix is refused.
+    part.isis = Some(isis(&["wan", "lan"]));
+    let error = config(&part, "", "/run/ruster").unwrap_err();
+    assert!(
+        error.contains("all of its interfaces or to none"),
+        "{error}"
+    );
+    // None has one: IPv4 only.
+    part.isis = Some(isis(&["lan"]));
+    let text = config(&part, "", "/run/ruster").unwrap();
+    assert!(!text.contains("ipv6 { import all"), "{text}");
+    // An OSPF with no interface is not written.
+    part.ospf = Some(ruster_config::Ospf {
+        router_id: "198.51.100.1".into(),
+        interface: Vec::new(),
+    });
+    let text = config(&part, "", "/run/ruster").unwrap();
+    assert!(!text.contains("protocol ospf"), "{text}");
 }
