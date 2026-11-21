@@ -181,7 +181,8 @@ FRRの代わりに経路デーモンのbird-rsを使うときの橋渡し役。�
 - 経路はkernelに入れない（bird-rsの`protocol kernel`は使わない）。ルータ自身の通信は、confdが入れるTUN向けの
   default経路でFEへ渡り、FEがribdの選んだ経路で転送する。kernelにTAP向けの経路があると、ルータ自身の
   パケットがribdの選択を飛び越えるため（bird-rsの`docs/RUSTER.md`）。
-- 送り出しは`networks`だけにする（FRRと同じ、RFC 8212）。取り込みは全部受ける。
+- 送り出しは`networks`だけにする（FRRと同じ、RFC 8212）。取り込みは全部受ける。`networks`はbird-rsの中で
+  到達できない経路として持つので、同じプレフィックスを近隣から学んでも、ribdへは渡らない。
 - 反映: `ruster-bird`は`confd/part/bird/part.sock`でモジュール`bird`を受け取り、bird.confを全部作る。まず
   `birdc configure check "<新しいファイル>"`で確かめ、`8002`ならファイルを替えずに断る。通れば置き換えて
   `birdc configure`で読ませる。`0003`、`0004`（止めるprotocolを待っている）、`0019`は受け入れる。読めない
@@ -189,7 +190,8 @@ FRRの代わりに経路デーモンのbird-rsを使うときの橋渡し役。�
   そのまま残る。
 - bird-rsはsystemdが起動する（`-f`、`Type=simple`、kernelのnetnsで）。設定が読めないと起動しないので、
   `ruster-bird`の初回の反映より前は、unitの`ExecStartPre`で最小のbird.confを置く。制御のsocketは`-g`で
-  `ruster-bird`のグループに渡す。bird-rsはribdとFEのsocketが無いあいだ自分で繋ぎ直すので、起動の順番は問わない。
+  `ruster-bird`のグループに渡す（今のunitは両方rootで動かし、`-g`は付けていない）。bird-rsはribdとFEのsocketが
+  無いあいだ自分で繋ぎ直すので、起動の順番は問わない。`ruster-bird`のunitは、制御のsocketができるまで待つ。
 - BGPのTCPはkernelで終端する（TUN経由）。IPv6の近隣へ広告する次の転送先のlink-localは、近隣のいる
   インターフェースのもの（MACから作る）を`next hop link local`で渡す（bird-rsは近隣の見つかったデバイス、
   つまりTUNのlink-localを付けるが、FEはそれに答えない）。受けた経路はグローバルの次の転送先を使う

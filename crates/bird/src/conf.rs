@@ -55,6 +55,10 @@ pub const INCLUDE_MAX: u64 = 1 << 20;
 /// `run_dir` and the include file's text. Each value is read as an address, prefix
 /// or number again, so nothing else reaches the file but the include.
 pub fn config(routing: &Frr, include: &str, run_dir: &str) -> Result<String, String> {
+    // Refused rather than left out: the operator would believe they run.
+    if routing.isis.is_some() || routing.ospf.is_some() || routing.ospf6.is_some() {
+        return Err("isis, ospf and ospf6 are not run through ruster-bird yet".into());
+    }
     let mut out = format!("{HEADER}\n");
     if let Some(bgp) = &routing.bgp {
         let id: std::net::Ipv4Addr = bgp
@@ -119,15 +123,22 @@ fn write_bgp(out: &mut String, bgp: &Bgp, connected: &[Connected]) -> Result<(),
         }
         out.push_str("}\n");
     }
-    for (at, neighbor) in bgp.neighbor.iter().enumerate() {
+    for neighbor in &bgp.neighbor {
         let address: IpAddr = neighbor
             .address
             .parse()
             .map_err(|_| format!("neighbor {:?} is not an address", neighbor.address))?;
         let channel = if address.is_ipv4() { "ipv4" } else { "ipv6" };
+        // Named by its address: another neighbor's coming or going restarts no
+        // other session.
+        let name: String = address
+            .to_string()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
         let _ = writeln!(
             out,
-            "protocol bgp ruster_neighbor_{at} {{\n  local as {};\n  neighbor {address} as {};",
+            "protocol bgp ruster_neighbor_{name} {{\n  local as {};\n  neighbor {address} as {};",
             bgp.asn, neighbor.remote_as
         );
         for text in &neighbor.description {
@@ -151,9 +162,9 @@ fn write_bgp(out: &mut String, bgp: &Bgp, connected: &[Connected]) -> Result<(),
         );
         if address.is_ipv6() {
             out.push_str("    next hop prefer global;\n");
-            if let Some(link_local) = link_local_for(address, connected) {
-                let _ = writeln!(out, "    next hop link local {link_local};");
-            }
+            let link_local = link_local_for(address, connected)
+                .ok_or_else(|| format!("neighbor {address}: on no interface's prefix"))?;
+            let _ = writeln!(out, "    next hop link local {link_local};");
         }
         out.push_str("  };\n}\n");
     }
@@ -206,19 +217,22 @@ impl Bridge {
 
     /// What taking a `bird` part would change: the line diff of the file, or the
     /// reason it would be refused. Nothing is written, and bird-rs is not asked.
+    /// What follows a word of [`SECRET_WORDS`] on a line is not shown (the include
+    /// may hold passwords); a line whose secret changes shows as `(hidden, changed)`.
     pub fn check(&self, part: &str) -> Result<String, String> {
         let text = self.text(part)?;
         let before = self.before()?.unwrap_or_default();
         let name = self.path.display().to_string();
         Ok(ruster_confd::diff::lines(
-            &before,
-            &text,
+            &hide_secrets(&before, &before),
+            &hide_secrets(&text, &before),
             (&name, "candidate"),
         ))
     }
 
     /// Takes a `bird` part, or refuses it with the reason: bird-rs checks the new
-    /// file before it is put in place, and reads it then.
+    /// file before it is put in place, and reads it then. When bird-rs does not
+    /// take it after all, the file before is put back and read again.
     pub fn take(&mut self, part: &str) -> Result<(), String> {
         let text = self.text(part)?;
         let before = self.before()?;
@@ -227,9 +241,51 @@ impl Bridge {
         if self.took && before.as_deref() == Some(text.as_str()) {
             return Ok(());
         }
+        let next = self.next();
+        let quoted_next = quoted(&next)?;
+        let quoted_path = quoted(&self.path)?;
+        self.write_next(&text)?;
+        if let Err(error) = self.birdc(&["configure", "check", &quoted_next]) {
+            let _ = std::fs::remove_file(&next);
+            return Err(error);
+        }
+        if let Err(error) = std::fs::rename(&next, &self.path) {
+            let _ = std::fs::remove_file(&next);
+            return Err(format!("{}: {error}", self.path.display()));
+        }
+        if let Err(error) = self.birdc(&["configure", &quoted_path]) {
+            // bird-rs may hold the new file or the one before: it reads one again
+            // on the next part, even one the file already holds.
+            self.took = false;
+            let before = match before {
+                Some(before) => before,
+                None => config(&Frr::default(), "", &self.run_dir)?,
+            };
+            let put_back = self
+                .write_next(&before)
+                .and_then(|()| {
+                    std::fs::rename(&next, &self.path)
+                        .map_err(|e| format!("{}: {e}", self.path.display()))
+                })
+                .and_then(|()| self.birdc(&["configure", &quoted_path]).map(drop));
+            if let Err(again) = put_back {
+                eprintln!("ruster-bird: putting the file before back: {again}");
+            }
+            return Err(error);
+        }
+        self.took = true;
+        Ok(())
+    }
+
+    fn next(&self) -> PathBuf {
         let mut next = self.path.clone().into_os_string();
         next.push(".next");
-        let next = PathBuf::from(next);
+        PathBuf::from(next)
+    }
+
+    /// Writes `text` to the file beside it that is put in place after the check.
+    fn write_next(&self, text: &str) -> Result<(), String> {
+        let next = self.next();
         let at = |e: std::io::Error| format!("{}: {e}", next.display());
         // Not for everyone to read: the include may hold passwords.
         let mut file = std::fs::OpenOptions::new()
@@ -243,17 +299,7 @@ impl Bridge {
         if let Ok(old) = std::fs::metadata(&self.path) {
             std::os::unix::fs::chown(&next, Some(old.uid()), Some(old.gid())).map_err(at)?;
         }
-        file.write_all(text.as_bytes()).map_err(at)?;
-        drop(file);
-        let checked = self.birdc(&["configure", "check", &quoted(&next)?]);
-        if let Err(error) = checked {
-            let _ = std::fs::remove_file(&next);
-            return Err(error);
-        }
-        std::fs::rename(&next, &self.path).map_err(at)?;
-        self.birdc(&["configure", &quoted(&self.path)?])?;
-        self.took = true;
-        Ok(())
+        file.write_all(text.as_bytes()).map_err(at)
     }
 
     /// Runs `birdc` with `command`; its answer when it succeeds (exit status 0:
@@ -327,4 +373,31 @@ fn read_include(path: &str) -> Result<String, String> {
         return Err(format!("include {path}: larger than {INCLUDE_MAX} bytes"));
     }
     Ok(text)
+}
+
+/// The words after which bird-rs's configuration holds a secret.
+pub const SECRET_WORDS: [&str; 3] = ["password", "secret", "key"];
+
+/// `text` with what follows a word of [`SECRET_WORDS`] on each line replaced by
+/// `(hidden)`, or by `(hidden, changed)` when the line is not in `before`.
+fn hide_secrets(text: &str, before: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        match words.iter().position(|w| SECRET_WORDS.contains(w)) {
+            Some(at) => {
+                let indent = &line[..line.len() - line.trim_start().len()];
+                out.push_str(indent);
+                out.push_str(&words[..=at].join(" "));
+                if before.lines().any(|b| b == line) {
+                    out.push_str(" (hidden)");
+                } else {
+                    out.push_str(" (hidden, changed)");
+                }
+            }
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
 }

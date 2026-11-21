@@ -56,7 +56,7 @@ protocol static ruster_networks_ipv6 {{
   ipv6;
   route 2001:db8:5::/48 unreachable;
 }}
-protocol bgp ruster_neighbor_0 {{
+protocol bgp ruster_neighbor_198_51_100_10 {{
   local as 65001;
   neighbor 198.51.100.10 as 65002;
   description \"the ISP\";
@@ -65,7 +65,7 @@ protocol bgp ruster_neighbor_0 {{
     export where proto = \"ruster_networks_ipv4\";
   }};
 }}
-protocol bgp ruster_neighbor_1 {{
+protocol bgp ruster_neighbor_2001_db8_100__10 {{
   local as 65001;
   neighbor 2001:db8:100::10 as 65002;
   ipv6 {{
@@ -106,12 +106,23 @@ fn values_that_would_break_the_file_are_refused() {
         |b: &mut Bgp| b.neighbor[0].address = "x".into(),
         |b: &mut Bgp| b.router_id = "x".into(),
         |b: &mut Bgp| b.networks = vec!["203.0.113.0/33".into()],
+        // On no interface's prefix: no link-local to give as the next hop's.
+        |b: &mut Bgp| b.neighbor[1].address = "2001:db8:999::10".into(),
     ] {
         let mut bad = bgp();
         change(&mut bad);
         assert!(config(&routing(Some(bad)), "", "/run/ruster").is_err());
     }
     assert!(config(&routing(Some(bgp())), "", "/run/\"x").is_err());
+    // IS-IS and OSPF are refused until ruster-bird runs them.
+    let mut isis = routing(None);
+    isis.isis = Some(ruster_config::Isis {
+        net: "49.0001.1921.6800.1001.00".into(),
+        level: "level-1-2".into(),
+        interface: Vec::new(),
+    });
+    let error = config(&isis, "", "/run/ruster").unwrap_err();
+    assert!(error.contains("not run through ruster-bird"), "{error}");
 }
 
 fn dir(name: &str) -> PathBuf {
@@ -129,6 +140,7 @@ fn birdc(dir: &Path) -> Vec<String> {
         format!(
             "#!/bin/sh\necho \"$@\" >> {0}/ran\n\
              if [ \"$2\" = check ] && [ -e {0}/broken ]; then echo '8002 broken on purpose'; exit 1; fi\n\
+             if [ \"$2\" != check ] && [ -e {0}/stuck ]; then echo '8001 stuck on purpose'; exit 1; fi\n\
              echo '0003 Reconfigured'\n",
             dir.display()
         ),
@@ -165,7 +177,50 @@ fn the_bridge_checks_then_configures_and_a_refused_file_changes_nothing() {
     std::fs::remove_file(dir.join("broken")).unwrap();
     let before = std::fs::read_to_string(dir.join("ran")).unwrap();
     let diff = bridge.check(&frr_part(&routing(None))).unwrap();
-    assert!(diff.contains("-protocol bgp ruster_neighbor_0 {"), "{diff}");
+    assert!(
+        diff.contains("-protocol bgp ruster_neighbor_198_51_100_10 {"),
+        "{diff}"
+    );
     assert_eq!(std::fs::read_to_string(dir.join("ran")).unwrap(), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn when_bird_rs_does_not_take_the_file_the_one_before_is_put_back() {
+    let dir = dir("putback");
+    let file = dir.join("bird.conf");
+    let mut bridge = Bridge::new(file.clone(), birdc(&dir), "/run/ruster".into());
+    let part = frr_part(&routing(Some(bgp())));
+    bridge.take(&part).unwrap();
+    let written = std::fs::read_to_string(&file).unwrap();
+    // The check passes, the configure fails: the file before is back.
+    std::fs::write(dir.join("stuck"), "").unwrap();
+    let error = bridge.take(&frr_part(&routing(None))).unwrap_err();
+    assert!(error.contains("stuck on purpose"), "{error}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), written);
+    assert!(!dir.join("bird.conf.next").exists());
+    // The part it holds again is read again, though the file has it.
+    std::fs::remove_file(dir.join("stuck")).unwrap();
+    let before = std::fs::read_to_string(dir.join("ran")).unwrap();
+    bridge.take(&part).unwrap();
+    let ran = std::fs::read_to_string(dir.join("ran")).unwrap();
+    assert!(ran.len() > before.len(), "{ran}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_check_hides_the_secrets_of_the_include() {
+    let dir = dir("secrets");
+    let file = dir.join("bird.conf");
+    let include = dir.join("include.conf");
+    std::fs::write(&include, "protocol bgp x { password \"hunter2\"; }\n").unwrap();
+    let mut with_include = bgp();
+    with_include.include = vec![include.display().to_string()];
+    let bridge = Bridge::new(file, birdc(&dir), "/run/ruster".into());
+    let diff = bridge
+        .check(&frr_part(&routing(Some(with_include))))
+        .unwrap();
+    assert!(!diff.contains("hunter2"), "{diff}");
+    assert!(diff.contains("password (hidden, changed)"), "{diff}");
     let _ = std::fs::remove_dir_all(&dir);
 }
