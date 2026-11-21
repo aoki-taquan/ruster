@@ -41,7 +41,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use ruster_config::{Bgp, Connected, Frr};
+use ruster_config::{Bgp, Connected, EvpnVni, Frr};
 
 /// The first line of the file.
 pub const HEADER: &str =
@@ -69,16 +69,36 @@ pub fn config(routing: &Frr, include: &str, run_dir: &str) -> Result<String, Str
     }
     out.push_str("protocol device {}\n");
     if let Some(bgp) = &routing.bgp {
-        write_bgp(&mut out, bgp, &routing.connected)?;
+        let evpn = evpn_of(bgp, &routing.evpn)?;
+        if let Some(vni) = evpn {
+            write_evpn(&mut out, bgp, vni)?;
+        }
+        write_bgp(&mut out, bgp, &routing.connected, evpn)?;
         if run_dir.is_empty() || run_dir.contains(['"', '\\', '\n']) {
             return Err(format!("run directory {run_dir:?}"));
         }
-        let _ = writeln!(
+        let _ = write!(
             out,
             "protocol ruster {{\n  run dir \"{run_dir}\";\n  source \"{SOURCE}\";\n  \
              ipv4 {{ export where source = RTS_BGP; }};\n  \
-             ipv6 {{ export where source = RTS_BGP; }};\n}}"
+             ipv6 {{ export where source = RTS_BGP; }};\n"
         );
+        if let Some(vni) = evpn {
+            let n = vni.vni;
+            // Over SRv6 the label is a SID's function, not the VNI.
+            let by_label = if vni.encapsulation == "srv6" {
+                format!(" ruster vni {n};")
+            } else {
+                String::new()
+            };
+            let _ = write!(
+                out,
+                "  eth {{ table ruster_eth; export all; ruster bridge \"{}\"; }};\n  \
+                 evpn {{ table ruster_evpn; export where (rt, {}, {n}) ~ bgp_ext_community;{by_label} }};\n",
+                vni.bridge, bgp.asn
+            );
+        }
+        out.push_str("}\n");
     }
     out.push_str(include);
     if !out.ends_with('\n') {
@@ -100,7 +120,66 @@ fn link_local_for(neighbor: IpAddr, connected: &[Connected]) -> Option<Ipv6Addr>
     })
 }
 
-fn write_bgp(out: &mut String, bgp: &Bgp, connected: &[Connected]) -> Result<(), String> {
+/// The VNI of the EVPN sessions of `bgp`, when it has any: there is one (confd
+/// checks it), of a name and addresses that fit the file.
+fn evpn_of<'a>(bgp: &Bgp, vnis: &'a [EvpnVni]) -> Result<Option<&'a EvpnVni>, String> {
+    if !bgp.neighbor.iter().any(|n| n.evpn) {
+        return Ok(None);
+    }
+    let [vni] = vnis else {
+        return Err(format!("evpn takes one VNI, not {}", vnis.len()));
+    };
+    let name_fits = !vni.bridge.is_empty()
+        && vni
+            .bridge
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+    if !name_fits || !(1..=0x00ff_ffff).contains(&vni.vni) {
+        return Err(format!("evpn: bridge {:?}, VNI {}", vni.bridge, vni.vni));
+    }
+    vni.router_address
+        .parse::<IpAddr>()
+        .map_err(|_| format!("evpn: router address {:?}", vni.router_address))?;
+    for sid in vni.unicast_sid.iter().chain(&vni.multicast_sid) {
+        sid.parse::<Ipv6Addr>()
+            .map_err(|_| format!("evpn: SID {sid:?}"))?;
+    }
+    Ok(Some(vni))
+}
+
+/// The EVPN tables, the router's addresses on the TUN device (so that a remote
+/// VTEP's address resolves), and the `protocol evpn` of the VNI: RD
+/// `<router-id>:<VNI>` (RFC 7432 section 7.9, type 1), route target `<AS>:<VNI>`
+/// (RFC 8365 section 5.1.2.1), VXLAN from its local address or SRv6 with its SIDs.
+fn write_evpn(out: &mut String, bgp: &Bgp, vni: &EvpnVni) -> Result<(), String> {
+    let n = vni.vni;
+    let encapsulation = match (vni.encapsulation.as_str(), &vni.unicast_sid[..], &vni.multicast_sid[..]) {
+        ("vxlan", [], []) => format!("encapsulation vxlan {{ router address {}; }}", vni.router_address),
+        ("srv6", [unicast], [multicast]) => format!(
+            "encapsulation srv6 {{ unicast sid {unicast}; multicast sid {multicast}; router address {}; }}",
+            vni.router_address
+        ),
+        (other, ..) => return Err(format!("evpn: encapsulation {other:?}")),
+    };
+    let _ = writeln!(
+        out,
+        "protocol direct ruster_tun {{ ipv4; ipv6; interface \"rt-*\"; }}\n\
+         evpn table ruster_evpn;\n\
+         eth table ruster_eth;\n\
+         protocol evpn ruster_evpn_{n} {{\n  eth {{ table ruster_eth; }};\n  \
+         evpn {{ table ruster_evpn; }};\n  {encapsulation};\n  rd {}:{n};\n  \
+         route target (rt, {}, {n});\n  vni {n};\n}}",
+        bgp.router_id, bgp.asn
+    );
+    Ok(())
+}
+
+fn write_bgp(
+    out: &mut String,
+    bgp: &Bgp,
+    connected: &[Connected],
+    evpn: Option<&EvpnVni>,
+) -> Result<(), String> {
     let mut networks: [Vec<String>; 2] = Default::default();
     for text in &bgp.networks {
         let (address, len) = text
@@ -166,7 +245,17 @@ fn write_bgp(out: &mut String, bgp: &Bgp, connected: &[Connected]) -> Result<(),
                 .ok_or_else(|| format!("neighbor {address}: on no interface's prefix"))?;
             let _ = writeln!(out, "    next hop link local {link_local};");
         }
-        out.push_str("  };\n}\n");
+        out.push_str("  };\n");
+        // EVPN: everything taken, only this router's own routes sent.
+        if let Some(vni) = evpn.filter(|_| neighbor.evpn) {
+            let _ = writeln!(
+                out,
+                "  evpn {{\n    table ruster_evpn;\n    import all;\n    \
+                 export where proto = \"ruster_evpn_{}\";\n  }};",
+                vni.vni
+            );
+        }
+        out.push_str("}\n");
     }
     Ok(())
 }

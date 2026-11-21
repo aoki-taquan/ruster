@@ -187,8 +187,7 @@ backlogと同じく、使う場面が出たものから片付ける。
 bird-rsをribdの送り手とFEの状態の読み手につなぐ（bird-rsの`protocol ruster`）。FRRの橋渡し役と同じ形にし、
 IS-ISとOSPFはFRRと同じTAPで動かす。設計は`router-box.md`の「bird-rs（`ruster-bird`）」。次の順に作る。
 
-1. EVPN（VXLANとSRv6）。
-2. IS-IS、OSPFv2、OSPFv3（TAPの上）。
+1. IS-IS、OSPFv2、OSPFv3（TAPの上）。
 
 #### 経路や通信の数が増えたとき
 

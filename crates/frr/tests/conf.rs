@@ -40,11 +40,13 @@ fn bgp() -> Bgp {
                 address: "198.51.100.10".into(),
                 remote_as: 65002,
                 description: vec!["the ISP".into()],
+                evpn: false,
             },
             BgpNeighbor {
                 address: "2001:db8:100::10".into(),
                 remote_as: 65002,
                 description: Vec::new(),
+                evpn: false,
             },
         ],
     }

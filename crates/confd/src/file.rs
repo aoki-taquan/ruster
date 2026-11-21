@@ -974,6 +974,11 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         (srv6_l2, &bridges),
         link_mtu,
     )?;
+    crate::bgp::check_evpn(
+        bgp.as_ref(),
+        lock.routing_daemon,
+        &crate::bgp::evpn_vnis(&vxlan, &srv6, &bridges),
+    )?;
     // The FE takes at most this many punt classes besides its own.
     let routing = crate::isis_ospf::class_count(&Config {
         isis: isis.clone(),

@@ -204,3 +204,28 @@ fn lists_of_none_or_one_take_no_more() {
         parse(&twice)
     );
 }
+
+#[test]
+fn an_evpn_neighbor_needs_bird_rs_and_one_vni_and_the_bird_part_has_it() {
+    let evpn = |daemon: &str, extra: &str, members: &str| {
+        format!(
+            "routing-daemon = \"{daemon}\"\n{WAN}\n[[interface]]\nname = \"p1\"\nmac = \"02:00:00:00:09:01\"\n\n\
+             [[interface]]\nname = \"vx0\"\nvxlan = {{ vni = 100, local = \"198.51.100.1\" }}\n{extra}\n\
+             [[interface]]\nname = \"br0\"\nbridge = {{ members = [{members}] }}\n\n\
+             [bgp]\nas = 65001\n\n[[bgp.neighbor]]\naddress = \"198.51.100.10\"\nremote-as = 65002\nevpn = true\n"
+        )
+    };
+    let one = evpn("bird-rs", "", "\"p1\", \"vx0\"");
+    let config = file::parse(&one).unwrap();
+    let part = ruster_config::parse_frr_part(&Module::Bird.part(&config)).unwrap();
+    assert_eq!(part.evpn.len(), 1);
+    assert_eq!(part.evpn[0].vni, 100);
+    assert_eq!(part.evpn[0].bridge, "br0");
+    assert_eq!(part.evpn[0].router_address, "198.51.100.1");
+    let error = file::parse(&evpn("frr", "", "\"p1\", \"vx0\"")).unwrap_err();
+    assert!(error.contains("bird-rs"), "{error}");
+    // Two VNIs: more than one protocol ruster takes.
+    let vx1 = "\n[[interface]]\nname = \"vx1\"\nvxlan = { vni = 200, local = \"198.51.100.1\" }\n";
+    let error = file::parse(&evpn("bird-rs", vx1, "\"p1\", \"vx0\", \"vx1\"")).unwrap_err();
+    assert!(error.contains("one VXLAN or srv6-evpn"), "{error}");
+}

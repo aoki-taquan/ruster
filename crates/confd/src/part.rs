@@ -146,6 +146,11 @@ impl Module {
                         ospf: config.ospf.clone(),
                         ospf6: config.ospf6.clone(),
                         connected: crate::bgp::connected(&config.interfaces),
+                        evpn: if self == Self::Bird {
+                            crate::bgp::evpn_vnis(&config.vxlan, &config.srv6, &config.bridges)
+                        } else {
+                            Vec::new()
+                        },
                     }
                 } else {
                     ruster_config::Frr::default()
