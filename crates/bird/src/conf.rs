@@ -44,8 +44,9 @@
 //!   5.1.2.1: the route target is `<AS>:<VNI>`. RFC 9252 section 6: over SRv6 the
 //!   router's End.DT2U and End.DT2M SIDs.
 //!
-//! Deviations: none of BGP itself is here; bird-rs implements it. One EVPN
-//! instance (VNI) per router; a VNI above 65535 does not fit the RD's number and is
+//! Deviations: none of BGP itself is here; bird-rs implements it. A remote VTEP
+//! resolves only on a connected prefix of the default VRF (the EVPN next hops are
+//! looked up in the TUN device's tables alone). One EVPN instance (VNI) per router; a VNI above 65535 does not fit the RD's number and is
 //! refused, as is a route target of a four-octet AS with such a VNI.
 
 use std::fmt::Write as _;
