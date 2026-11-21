@@ -31,11 +31,13 @@ fn bgp() -> Bgp {
                 address: "198.51.100.10".into(),
                 remote_as: 65002,
                 description: vec!["the ISP".into()],
+                evpn: false,
             },
             BgpNeighbor {
                 address: "2001:db8:100::10".into(),
                 remote_as: 65002,
                 description: Vec::new(),
+                evpn: false,
             },
         ],
     }
@@ -223,4 +225,69 @@ fn a_check_hides_the_secrets_of_the_include() {
     assert!(!diff.contains("hunter2"), "{diff}");
     assert!(diff.contains("password (hidden, changed)"), "{diff}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn evpn_vni(encapsulation: &str) -> ruster_config::EvpnVni {
+    let srv6 = encapsulation == "srv6";
+    ruster_config::EvpnVni {
+        vni: 100,
+        bridge: "br0".into(),
+        encapsulation: encapsulation.into(),
+        router_address: if srv6 { "2001:db8::1" } else { "10.0.0.1" }.into(),
+        unicast_sid: if srv6 {
+            vec!["fc00:1::e".into()]
+        } else {
+            Vec::new()
+        },
+        multicast_sid: if srv6 {
+            vec!["fc00:1::f".into()]
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+#[test]
+fn an_evpn_neighbor_gets_the_vni_s_protocol_evpn_and_protocol_ruster_its_bridge() {
+    let mut with_evpn = bgp();
+    with_evpn.neighbor[0].evpn = true;
+    let mut part = routing(Some(with_evpn.clone()));
+    part.evpn = vec![evpn_vni("vxlan")];
+    let text = config(&part, "", "/run/ruster").unwrap();
+    for line in [
+        "ipv4 table ruster_tun4;",
+        "protocol direct ruster_tun { ipv4 { table ruster_tun4; }; ipv6 { table ruster_tun6; }; interface \"rt-default\"; }",
+        "    igp table ruster_tun4;",
+        "protocol evpn ruster_evpn_100 {",
+        "  encapsulation vxlan { router address 10.0.0.1; };",
+        "  rd 198.51.100.1:100;",
+        "  route target (rt, 65001, 100);",
+        "    export where proto = \"ruster_evpn_100\";",
+        "  eth { table ruster_eth; export all; ruster bridge \"br0\"; };",
+        "  evpn { table ruster_evpn; export where (rt, 65001, 100) ~ bgp_ext_community; };",
+    ] {
+        assert!(text.lines().any(|l| l == line), "{line}\n{text}");
+    }
+    // Only the EVPN neighbor carries EVPN.
+    assert_eq!(text.matches("    table ruster_evpn;").count(), 1, "{text}");
+    // Over SRv6: the SIDs, and the VNI not from the label.
+    part.evpn = vec![evpn_vni("srv6")];
+    let text = config(&part, "", "/run/ruster").unwrap();
+    assert!(text.contains("encapsulation srv6 { unicast sid fc00:1::e; multicast sid fc00:1::f; router address 2001:db8::1; };"), "{text}");
+    assert!(
+        text.contains("~ bgp_ext_community; ruster vni 100; };"),
+        "{text}"
+    );
+    // Without a VNI, or with a bridge name that would break the file: refused.
+    part.evpn.clear();
+    assert!(config(&part, "", "/run/ruster").is_err());
+    let mut bad = evpn_vni("vxlan");
+    bad.bridge = "br\"0".into();
+    part.evpn = vec![bad];
+    assert!(config(&part, "", "/run/ruster").is_err());
+    // A VNI the RD's two-octet number does not take.
+    let mut big = evpn_vni("vxlan");
+    big.vni = 70_000;
+    part.evpn = vec![big];
+    assert!(config(&part, "", "/run/ruster").is_err());
 }

@@ -276,6 +276,9 @@
 //!                              # the unicast routes of its family (IPv4 or IPv6)
 //! remote-as = 65002
 //! description = "upstream"     # optional
+//! evpn = true                  # optional: the session also carries EVPN (bird-rs
+//!                              # only; one VNI, from the bridge's VXLAN or
+//!                              # srv6-evpn member)
 //!
 //! [isis]                       # optional: IS-IS in the default VRF (FRR's isisd,
 //!                              # through ruster-frr, on the TAP rp-<interface>)
@@ -588,7 +591,9 @@ mod srv6;
 
 use serde::{Deserialize, Serialize};
 
-pub use bgp::{frr_part, parse_frr_part, tap_device, Bgp, BgpNeighbor, Connected, Frr, TAP_PREFIX};
+pub use bgp::{
+    frr_part, parse_frr_part, tap_device, Bgp, BgpNeighbor, Connected, EvpnVni, Frr, TAP_PREFIX,
+};
 pub use dhcp6::{link_local, Dhcp6, DHCP6_PREFERRED_LIFETIME, DHCP6_VALID_LIFETIME};
 pub use dhcp_client::{
     dhcp_client_part, parse_dhcp_client_part, DhcpClient, DHCP_CLIENT_PUNT_BURST,
@@ -623,7 +628,7 @@ pub const VERSION: u32 = 1;
 ///
 /// A new key also goes into `tests/data/every-key.lock` (the test reads it with every
 /// key required, and checks that every list in it has an item).
-pub const LOCK_SHAPE: u64 = 0x593a_a348_abb4_0d3a;
+pub const LOCK_SHAPE: u64 = 0x7bc1_2a5a_3248_1da2;
 
 /// A bridge's ageing time, in seconds (IEEE 802.1Q 8.8.3, the recommended value).
 pub const BRIDGE_AGING_TIME: u32 = 300;

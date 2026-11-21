@@ -220,3 +220,83 @@ pub fn connected(interfaces: &[InterfaceConfig]) -> Vec<Connected> {
     }
     out
 }
+
+/// The router's EVPN VNIs: its VXLAN and SRv6 EVPN interfaces that are bridge
+/// members, with their bridges (`docs/design/router-box.md`, "bird-rs").
+pub fn evpn_vnis(
+    vxlan: &[crate::vxlan::Vxlan],
+    srv6: &crate::srv6::Srv6,
+    bridges: &[crate::bridge::Bridge],
+) -> Vec<ruster_config::EvpnVni> {
+    let bridge_of = |name: &str| {
+        bridges
+            .iter()
+            .find(|b| b.members.iter().any(|m| m == name))
+            .map(|b| b.name.clone())
+    };
+    let mut out = Vec::new();
+    for v in vxlan {
+        if let Some(bridge) = bridge_of(&v.name) {
+            out.push(ruster_config::EvpnVni {
+                vni: v.vni,
+                bridge,
+                encapsulation: "vxlan".into(),
+                router_address: v.local.to_string(),
+                unicast_sid: Vec::new(),
+                multicast_sid: Vec::new(),
+            });
+        }
+    }
+    for (name, value) in &srv6.l2 {
+        if let ruster_proto::table::Value::Srv6Evpn {
+            source,
+            vni,
+            unicast,
+            multicast,
+        } = value
+        {
+            if let Some(bridge) = bridge_of(name) {
+                out.push(ruster_config::EvpnVni {
+                    vni: *vni,
+                    bridge,
+                    encapsulation: "srv6".into(),
+                    router_address: source.to_string(),
+                    unicast_sid: vec![unicast.to_string()],
+                    multicast_sid: vec![multicast.to_string()],
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Checks the EVPN sessions of `bgp`: bird-rs only, one VNI (bird-rs's `protocol
+/// ruster` reads one bridge's learned addresses), and a VNI of at most 65535: the
+/// RD `<router-id>:<VNI>` takes a two-octet number (RFC 4364 section 4.2, type 1),
+/// and so the route target `<AS>:<VNI>` fits a four-octet AS too (RFC 5668).
+pub(crate) fn check_evpn(
+    bgp: Option<&ruster_config::Bgp>,
+    daemon: ruster_config::RoutingDaemon,
+    vnis: &[ruster_config::EvpnVni],
+) -> Result<(), String> {
+    if !bgp.is_some_and(|b| b.neighbor.iter().any(|n| n.evpn)) {
+        return Ok(());
+    }
+    if daemon != ruster_config::RoutingDaemon::BirdRs {
+        return Err("bgp: a neighbor with evpn needs routing-daemon = \"bird-rs\"".into());
+    }
+    let [vni] = vnis else {
+        return Err(format!(
+            "bgp: evpn takes one VXLAN or srv6-evpn bridge member, not {}",
+            vnis.len()
+        ));
+    };
+    // The RD `<router-id>:<VNI>` (type 1) takes a two-octet number.
+    if vni.vni > 0xffff {
+        return Err(format!(
+            "bgp: evpn takes a VNI of at most 65535 (the RD's number), not {}",
+            vni.vni
+        ));
+    }
+    Ok(())
+}

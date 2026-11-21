@@ -169,8 +169,12 @@ FRRの代わりに経路デーモンのbird-rsを使うときの橋渡し役。�
 - 設定はFRRと同じ`[bgp]`（default VRFだけ）、`[isis]`、`[ospf]`、`[ospf6]`。`include`は選んだデーモンの書き方の
   ファイルで、bird.confの最後にそのまま足す。EVPNは`[[bgp.neighbor]]`の`evpn = true`で、その近隣にl2vpn evpnの
   チャネルを足す（bird-rsだけ。FRRのFPMはEVPNを運ばないので、confdは`routing-daemon = "frr"`では断る）。
-- EVPNのVNIは、ブリッジのメンバーのVXLANとSRv6 EVPNのインターフェースから作る。VNIごとにbird-rsの
-  `protocol evpn`を一つ置き、RDは`<router-id>:<VNI>`（RFC 7432の7.9のtype 1）、route targetは`<AS>:<VNI>`
+- EVPNのVNIは、ブリッジのメンバーのVXLANとSRv6 EVPNのインターフェースから作る（confdが部分`bird`の`evpn`に
+  入れる）。今は一台に一つまで（bird-rsの`protocol ruster`はethチャネルを一つしか持てず、二つの`protocol ruster`は
+  同じ送り手を使えない）。それを超えるとconfdは断る。route targetの`<AS>:<VNI>`が四オクテットのASと三オクテットの
+  VNIでは入らないので、そのときも断る。遠くのVTEP（SRv6では相手のアドレス）は、default VRFの直結のプレフィックスの
+  中にあるものだけ解決する（EVPNの次の転送先はTUNの直結の経路の表だけで引くため）。BGPで学んだループバックの
+  VTEPや、VXLANの`underlay-vrf`がdefaultでないものは、今は使えない。bird-rsの`protocol evpn`を一つ置き、RDは`<router-id>:<VNI>`（RFC 7432の7.9のtype 1）、route targetは`<AS>:<VNI>`
   （RFC 8365の5.1.2.1の自動の形）、VXLANは`router address`にインターフェースのlocalを、SRv6はその
   unicast-sidとmulticast-sidを書く。`protocol ruster`のethチャネルで、そのブリッジの名前（`ruster bridge`）に
   つなぐ。
@@ -201,7 +205,8 @@ FRRの代わりに経路デーモンのbird-rsを使うときの橋渡し役。�
 - 試験: netns `bird-bgp`は、BGPをbird-rsどうしで張り、経路がFEに入って届くこと、IPv6の近隣がFEのポートの
   link-localを受けること、読めない設定を断ること、取り下げた経路が消えることを確かめる。bird-rsと`birdc-rs`の
   ディレクトリを`BIRD_RS`で渡し、無ければ飛ばす（終了コード77、netns-allは`skip`と出す）。EVPN、IS-IS、
-  OSPFも同じ形で足す。
+  OSPFも同じ形で足す。netns `bird-evpn`は、ruster 2台にそれぞれbird-rsを付けてIBGP EVPNでつなぎ、VTEPを書かない
+  VXLANで、type-3のVTEPとtype-2のMACがribdに入って届くこと、片方のbird-rsを止めると消えることを確かめる。
 
 ### Kea（`ruster-kea`）
 

@@ -32,6 +32,31 @@ pub struct BgpNeighbor {
     pub remote_as: u32,
     /// None or one.
     pub description: Vec<String>,
+    /// The session also carries EVPN (l2vpn evpn, RFC 7432), with bird-rs only.
+    /// Not written when false, so that a ruster from before still reads the lock.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub evpn: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// An EVPN VNI of the router, which confd works out from the VXLAN and SRv6 EVPN
+/// interfaces that are bridge members, for the routing daemon's bridge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct EvpnVni {
+    pub vni: u32,
+    /// The bridge the interface is a member of.
+    pub bridge: String,
+    /// `vxlan` or `srv6`.
+    pub encapsulation: String,
+    /// The VXLAN interface's local address, or the SRv6 source address.
+    pub router_address: String,
+    /// None or one each, for `srv6`: the router's End.DT2U and End.DT2M SIDs.
+    pub unicast_sid: Vec<String>,
+    pub multicast_sid: Vec<String>,
 }
 
 /// A prefix of one of the default VRF's interfaces, which `ruster-frr` uses to find
@@ -67,6 +92,7 @@ struct NeighborEntry {
     address: String,
     remote_as: u32,
     description: Option<String>,
+    evpn: Option<bool>,
 }
 
 /// `[bgp]`: the router ID is the first IPv4 address of the default VRF's interfaces
@@ -89,6 +115,7 @@ pub(crate) fn resolve(entry: BgpEntry, interfaces: &[Interface]) -> Result<Bgp, 
                 address: n.address,
                 remote_as: n.remote_as,
                 description: n.description.into_iter().collect(),
+                evpn: n.evpn.unwrap_or(false),
             })
             .collect(),
     })
@@ -123,6 +150,8 @@ pub struct Frr {
     pub ospf: Option<Ospf>,
     pub ospf6: Option<Ospf>,
     pub connected: Vec<Connected>,
+    /// The router's EVPN VNIs (for `ruster-bird`; `ruster-frr` gets none).
+    pub evpn: Vec<EvpnVni>,
 }
 
 /// The part of the lock form that `ruster-frr` takes.
@@ -138,6 +167,8 @@ struct FrrPart {
     #[serde(default)]
     ospf6: Vec<Ospf>,
     connected: Vec<Connected>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    evpn: Vec<EvpnVni>,
 }
 
 /// `ruster-frr`'s part of the lock form as TOML text: `version = 1`, `bgp`, `isis`,
@@ -151,6 +182,7 @@ pub fn frr_part(frr: &Frr) -> String {
         ospf: frr.ospf.iter().cloned().collect(),
         ospf6: frr.ospf6.iter().cloned().collect(),
         connected: frr.connected.clone(),
+        evpn: frr.evpn.clone(),
     };
     toml::to_string(&part).expect("the lock form is plain TOML")
 }
@@ -171,5 +203,6 @@ pub fn parse_frr_part(text: &str) -> Result<Frr, String> {
         ospf: one("ospf", part.ospf)?,
         ospf6: one("ospf6", part.ospf6)?,
         connected: part.connected,
+        evpn: part.evpn,
     })
 }

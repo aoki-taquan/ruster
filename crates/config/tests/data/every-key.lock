@@ -269,6 +269,7 @@ include = ["/etc/ruster/frr.conf"]
 [[bgp.neighbor]]
 address = "198.51.100.10"
 remote-as = 65002
+evpn = true
 description = ["upstream"]
 
 [[isis]]

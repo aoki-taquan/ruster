@@ -95,7 +95,7 @@ protocol bgp v6 {
   ipv6 { import all; export where proto = "far6"; };
 }
 CONF
-nsx "$peer" "$bird/bird-rs" -f -c "$work/peer.conf" -s "$work/peer.ctl" >>"$work/peer-bird.log" 2>&1 &
+ip netns exec "$peer" "$bird/bird-rs" -f -c "$work/peer.conf" -s "$work/peer.ctl" >>"$work/peer-bird.log" 2>&1 &
 pids+=("$!")
 peerc() { nsx "$peer" "$bird/birdc-rs" -s "$work/peer.ctl" "$@"; }
 
@@ -148,7 +148,7 @@ start ruster-confd --kernel "$work/router.toml"
 for _ in $(seq 1 50); do nsx "$router" ip link show rt-default >/dev/null 2>&1 && break; sleep 0.1; done
 # bird-rs starts on a file of its own until ruster-bird writes one.
 echo "protocol device {}" >"$work/bird.conf"
-nsx "$router" "$bird/bird-rs" -f -c "$work/bird.conf" -s "$work/router.ctl" >>"$work/router-bird.log" 2>&1 &
+ip netns exec "$router" "$bird/bird-rs" -f -c "$work/bird.conf" -s "$work/router.ctl" >>"$work/router-bird.log" 2>&1 &
 pids+=("$!")
 for _ in $(seq 1 50); do [[ -S "$work/router.ctl" ]] && break; sleep 0.1; done
 start ruster-bird --birdc "$bird/birdc-rs -s $work/router.ctl" "$work/bird.conf"
