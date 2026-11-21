@@ -202,6 +202,22 @@ wait_show r2 "$r2" "^route default 203.0.113.0/24 via 10.0.0.1 dev wan" 1 ||
   fail "r2's FE has no BGP route to r1's 203.0.113.0/24: $(show r2 "$r2" | grep '^route')"
 echo "ok: an IBGP route's next hop resolves, and the route reaches the FE"
 
+# r2 drops VNI 200: r1's entries of it go, and r2's bird-rs keeps protocol ruster
+# (bird-rs 76f8105), so the BGP route from r1 stays in r2's FE.
+since() { nsx "$r2" "$bird/birdc-rs" -s "$work/r2/bird.ctl" show protocols ruster1 2>&1 | awk '$1 == "ruster1" { print $5 }'; }
+before=$(since)
+[[ -n "$before" ]] || fail "r2's protocol ruster has no start time: $(nsx "$r2" "$bird/birdc-rs" -s "$work/r2/bird.ctl" show protocols 2>&1)"
+awk 'BEGIN { RS = ""; ORS = "\n\n" } !/name = "vx1"/ && !/name = "br1"/' "$work/r2/router.toml" >"$work/r2/one-vni.toml"
+grep -q 'vx1' "$work/r2/one-vni.toml" && fail "the configuration without VNI 200 still has vx1"
+nsx "$r2" "$bin/ruster" --run-dir "$work/r2/run" apply "$work/r2/one-vni.toml" >/dev/null ||
+  fail "r2 does not take the configuration without VNI 200"
+wait_show r1 "$r1" "^evpn-flood vni 200 vtep 10.0.0.2" 0 || fail "r1 keeps r2's flood of VNI 200"
+show r2 "$r2" | grep -q "^route default 203.0.113.0/24 via 10.0.0.1 dev wan" ||
+  fail "r2's BGP route went with VNI 200"
+[[ "$(since)" == "$before" ]] || fail "r2's protocol ruster started again ($before, now $(since))"
+show r1 "$r1" | grep -q "^evpn-flood vni 100 vtep 10.0.0.2" || fail "VNI 100 went too"
+echo "ok: r2 drops VNI 200: r1's entries of it go, r2's protocol ruster and BGP route stay"
+
 kill "$bird_r2"
 wait_show r1 "$r1" "^evpn-flood vni 100 vtep 10.0.0.2" 0 ||
   fail "r1's ribd keeps the flood to r2: $(nsx "$r1" "$bird/birdc-rs" -s "$work/r1/bird.ctl" show protocols 2>&1); $(ps -p "$bird_r2" -o pid,stat,cmd 2>&1)"

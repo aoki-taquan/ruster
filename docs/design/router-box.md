@@ -174,7 +174,8 @@ FRRの代わりに経路デーモンのbird-rsを使うときの橋渡し役。�
   ごとに`ruster bridge "<名前>" vid N`でVLAN IDを付けて一つの表に入れる。bird-rs 374d143以降）。VLAN IDは
   4094までのVNIならVNIそのもの、それより大きいVNIには空いている番号を小さい順に割り当てる。ほかのVNIを足し引き
   してもずれないようにするため。VNIごとの`protocol evpn`は、そのVLAN IDのEthernetの経路だけを取る。VNIを足し引き
-  するとbird-rsは`protocol ruster`を作り直すので、そのあいだribdからbird-rsの経路が一度消えて戻る。SRv6では一つだけ
+  しても、bird-rs（76f8105以降）は`protocol ruster`を作り直さず、変わったブリッジのMACだけを出し直す。ribdへの
+  経路はそのまま残る（netns `bird-evpn`で、r2がVNI 200を外したときに確かめる）。SRv6では一つだけ
   （`protocol ruster`の`ruster vni`が一つのため）。RDの`<router-id>:<VNI>`の番号は2オクテットなので、65535を
   超えるVNIは断る。
 - BGPの次の転送先（IBGP、multihop、EVPNの遠くのVTEP）は、bird-rsの別の表（`ruster_tun4`、`ruster_tun6`）で
